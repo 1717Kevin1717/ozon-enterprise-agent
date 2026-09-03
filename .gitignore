@@ -1,0 +1,61 @@
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+secrets/
+credentials/
+
+# Python virtual environments and caches
+.venv/
+.venv-*/
+**/.venv/
+**/.venv-*/
+venv/
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime databases / backups
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+*.backup
+*.bak
+**/data/*.db
+**/data/*.sqlite*
+**/data/*pre_*.db
+
+# Runtime knowledge uploads (keep curated demo data under /demo-data instead)
+backend/data/knowledge/
+backend/data/uploads/
+
+# Logs / temporary files
+logs/
+**/logs/
+*.log
+tmp/
+temp/
+.cache/
+
+# Front-end dependencies/build output
+node_modules/
+dist/
+build/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local test artifacts / reports that may contain runtime data
+reports/local/
+artifacts/local/

@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Ozon 选品分析 Agent",
+  "version": "2.3.0",
+  "description": "在用户当前可见的 Ozon 商品页面采集独立品牌、类目、价格和页面证据；用户勾选当前可见相似商品或其他卖家价格后，自动回填同质竞品数、最低可见价并同步为中贸通 Python 企业后台的竞品证据。",
+  "permissions": ["storage", "activeTab", "scripting", "sidePanel", "downloads"],
+  "host_permissions": [
+    "https://www.ozon.ru/*",
+    "https://ozon.ru/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开 Ozon 选品分析 Agent"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.ozon.ru/*", "https://ozon.ru/*"],
+      "js": ["extractor.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

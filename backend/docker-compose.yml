@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: zmt_ozon
+      POSTGRES_USER: zmt
+      POSTGRES_PASSWORD: change-me-before-production
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zmt -d zmt_ozon"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+  backend:
+    build: .
+    environment:
+      APP_ENV: development
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      DATABASE_URL: postgresql+asyncpg://zmt:change-me-before-production@postgres:5432/zmt_ozon
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: "*"
+      DEFAULT_COMPANY_ID: local-zmt
+      DEFAULT_USER_ID: local-operator
+      DEFAULT_ROLE: company_admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8000:8000"
+volumes:
+  postgres_data:
+  redis_data:

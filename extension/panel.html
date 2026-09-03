@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ozon 选品分析 Agent</title>
+  <style>
+    :root{--ink:#19243b;--muted:#68758e;--line:#e5eaf1;--bg:#f6f8fc;--brand:#5c4bea;--good:#087f5b;--warn:#a96400;--bad:#b72e46}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 Inter,"Microsoft YaHei",Arial,sans-serif}.wrap{padding:14px;max-width:520px;margin:auto}header{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}h1{font-size:17px;margin:0}h2{font-size:14px;margin:0}.sub{margin:4px 0 0;color:var(--muted);font-size:11px}.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:13px;margin-top:11px;box-shadow:0 4px 15px #19243b08}.actions{display:flex;gap:8px;margin-top:10px}button{border:0;border-radius:8px;padding:9px 10px;font:inherit;font-weight:750;cursor:pointer;background:var(--brand);color:#fff}button:hover{filter:brightness(.95)}button.secondary{color:#3b4963;background:#edf0f7}button.danger{color:#a22338;background:#fff0f2}button:disabled{opacity:.5;cursor:not-allowed}.notice{display:none;margin-top:10px;padding:9px;border-radius:8px;font-size:12px}.notice.error{display:block;background:#fff0f2;color:#9d253a;border:1px solid #f0cad0}.notice.success{display:block;background:#eaf8f0;color:#087655;border:1px solid #c8ead6}.source{margin-top:8px;color:#66748d;font-size:10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.grid.one{grid-template-columns:1fr}label{display:block;color:#4d5b73;font-size:11px;font-weight:750}input,select{display:block;width:100%;height:32px;margin-top:4px;padding:6px 8px;border:1px solid #d9e0ea;border-radius:7px;color:var(--ink);background:#fff;font:inherit}input:focus,select:focus{outline:2px solid #5c4bea22;border-color:var(--brand)}.section{margin:15px 0 8px;color:#4e5d75;font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:10px}.metric{padding:8px;border-radius:8px;background:#f6f8fc}.metric span{display:block;color:#6d7890;font-size:10px}.metric b{display:block;margin-top:3px;font-size:13px}.score{display:flex;align-items:center;gap:10px;padding:10px;border-radius:9px;background:linear-gradient(135deg,#f0efff,#f4fbff)}.score b{font-size:25px;color:#5042cc}.score p{margin:0;font-size:11px;color:#56647e}.tag{display:inline-block;margin-top:3px;border-radius:10px;padding:2px 6px;font-size:10px;font-weight:800}.优先进入{background:#e5f7ed;color:var(--good)}.建议验证{background:#e8f4ff;color:#226797}.谨慎进入{background:#fff0dd;color:var(--warn)}.暂不建议{background:#ffedf0;color:var(--bad)}.lists{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:9px}.lists h3{font-size:11px;margin:0 0 4px}.lists ul{margin:0;padding-left:15px;color:#596780;font-size:10px;line-height:1.55}.candidate{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 0;border-top:1px solid #edf0f4;cursor:pointer}.candidate:first-child{border-top:0}.candidate:hover{background:#fafaff}.candidate .title{font-weight:750;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:230px}.candidate small{display:block;color:#71809a;font-size:10px}.candidate .right{text-align:right}.empty{padding:15px 3px;color:#718099;font-size:12px;line-height:1.6}.footnote{margin-top:9px;color:#718099;font-size:10px;line-height:1.55}.competitor-list{margin-top:8px;border:1px dashed #cbd4e4;border-radius:8px;max-height:170px;overflow:auto}.competitor-item{display:flex;gap:7px;padding:7px;border-top:1px solid #eef1f6;align-items:flex-start}.competitor-item:first-child{border-top:0}.competitor-item small{color:#68758e;display:block}.competitor-item input{width:auto;height:auto;margin-top:3px}.comp-empty{padding:9px;color:#718099;font-size:11px}@media(max-width:340px){.grid,.metric-grid,.lists{grid-template-columns:1fr}.actions{flex-wrap:wrap}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header><div><h1>Ozon 选品分析 Agent</h1><p class="sub">本地计算 · 可解释评分 · 不绕过页面限制</p></div><button id="captureBtn" title="读取你当前已打开页面中的可见商品信息">采集当前页</button></header>
+    <div id="notice" class="notice"></div>
+
+    <section class="card">
+      <h2>商品与市场数据</h2>
+      <p class="sub">先采集当前页，再确认标题、类目路径和价格。公开商品页不提供可靠销量，销量仅能来自卖家统计、授权接口或人工证据。</p>
+      <div class="section">已采集字段</div>
+      <div class="grid"><label>商品标题<input id="title" placeholder="采集或手工填写" /></label><label>Ozon 商品 ID<input id="ozonProductId" placeholder="从商品链接或页面提取" /></label></div>
+      <div class="grid"><label>品牌<input id="brand" placeholder="从 Ozon 品牌字段提取或企业确认" /></label><label>品牌来源<input id="brandSource" readonly placeholder="待确认" /></label></div>
+      <div class="grid one"><label>Ozon 类目路径<input id="category" placeholder="例如：鞋类 > 鞋配件 > 后跟垫" /></label></div>
+      <div class="grid"><label>当前展示价（RUB）<input id="priceRub" type="number" min="0" step="1" /></label><label>常规 / 划线价（RUB）<input id="regularPriceRub" type="number" min="0" step="1" /></label></div>
+      <div class="grid"><label>评分（0–5）<input id="rating" type="number" min="0" max="5" step="0.1" /></label><label>评论量<input id="reviewCount" type="number" min="0" step="1" /></label></div>
+      <input id="categorySource" type="hidden" /><input id="priceSource" type="hidden" /><input id="imageUrl" type="hidden" />
+      <div id="sourceInfo" class="source">尚未从当前页面采集数据。</div>
+
+      <div class="section">业务补充字段</div>
+      <div class="grid"><label>近 30 天销量<input id="monthlySales" type="number" min="0" step="1" placeholder="卖家统计或人工核验" /></label><label>销量来源<select id="salesSource"><option>未提供</option><option>Ozon Seller 已授权统计</option><option>Ozon Statistics API 已授权数据</option><option>企业人工核验</option></select></label></div>
+      <div class="grid one"><label>销量证据说明<input id="salesEvidence" placeholder="填写报表日期、商品 ID 或核验依据；无证据则不要填写销量" /></label></div>
+      <div class="grid"><label>销量环比（%）<input id="salesGrowthRate" type="number" step="0.1" placeholder="有同口径历史销量时填写" /></label><label>上架状态<select id="listingStatus"><option>候选</option><option>已上架</option><option>暂停</option><option>已放弃</option></select></label></div>
+      <div class="grid"><label>同质竞品数<input id="competitorCount" type="number" min="0" step="1" placeholder="人工核验后填写" /></label><label>竞争证据备注<input id="competitionEvidence" placeholder="例如：价格带和差异化说明" /></label></div>
+      <div class="grid"><label>当前可见最低竞品价（RUB）<input id="visibleLowestCompetitorPrice" type="number" min="0" readonly placeholder="从已选当前可见条目填入" /></label><label>低价基准来源<input value="仅当前可见 Ozon 页面，非全站最低价" readonly /></label></div>
+      <div class="grid one"><label>当前可见相似商品 / 其他卖家价格（可选后写入）</label></div>
+      <div class="actions"><button id="captureCompetitorsBtn" type="button" class="secondary">读取当前可见竞品</button><button id="applyCompetitorsBtn" type="button" class="secondary">将已选条目写入竞品集合</button></div>
+      <div id="visibleCompetitorList" class="competitor-list"><div class="comp-empty">点击“读取当前可见竞品”后，仅展示当前页面可见的相似商品和其他卖家价格提示。</div></div>
+      <div class="grid one"><label>合规状态<select id="complianceStatus"><option>待核验</option><option>通过</option><option>未通过</option></select></label></div>
+      <div class="grid one"><label>合规核验证据<input id="complianceEvidence" placeholder="认证、标签、知识产权、运输或禁限售核验依据" /></label></div>
+      <div class="section">企业商品知识与关系</div>
+      <div class="grid one"><label>业务标签<input id="tags" placeholder="用逗号分隔，例如：鞋垫,女鞋配件,硅胶" /></label></div>
+      <div class="grid"><label>关联类型<select id="relationshipType"><option>无</option><option>同品牌变体</option><option>升级款</option><option>替代品</option><option>公司历史相似品</option><option>竞品</option></select></label><label>关联商品 Ozon ID<input id="relatedProductId" placeholder="关联公司商品或竞品的商品 ID" /></label></div>
+      <div class="grid one"><label>关系或放弃原因说明<input id="relationshipEvidence" placeholder="说明关联依据；已放弃商品应记录失败/放弃原因" /></label></div>
+      <div class="grid"><label>采购 / 到仓成本（RUB）<input id="estimatedCostRub" type="number" min="0" step="1" placeholder="必填" /></label><label>物流履约成本（RUB）<input id="shippingCostRub" type="number" min="0" step="1" value="0" /></label></div>
+      <div class="grid"><label>广告摊销（RUB）<input id="adCostRub" type="number" min="0" step="1" value="0" /></label><label>平台佣金（%）<input id="commissionRate" type="number" min="0" max="89" step="1" value="18" /></label></div>
+      <div class="grid"><label>目标净利率（%）<input id="targetMargin" type="number" min="1" max="79" step="1" value="30" /></label><label>当前页 URL<input id="url" readonly /></label></div>
+      <div class="actions"><button id="analyzeBtn">保存并分析</button><button id="syncBtn" class="secondary">同步到企业后台</button><button id="newBtn" class="secondary">清空当前表单</button></div>
+      <p class="footnote">建议售价会同时参考你的成本、目标净利率和本地候选池的价格带。单个商品只能得到中性相对分，积累同类候选商品后比较更有意义。</p>
+    </section>
+
+    <section id="analysisCard" class="card" hidden>
+      <div class="score"><b id="score">—</b><div><h2 id="decision">等待计算</h2><p id="scoreText">评分由需求、利润价格带、合规和竞争组成；合规未通过或证据缺失会阻断推荐。</p></div></div>
+      <div class="metric-grid"><div class="metric"><span>单位净利润</span><b id="unitProfit">—</b></div><div class="metric"><span>预计净利率</span><b id="netMargin">—</b></div><div class="metric"><span>建议售价</span><b id="recommendedPrice">—</b></div><div class="metric"><span>保本价</span><b id="breakEvenPrice">—</b></div><div class="metric"><span>市场中位价</span><b id="marketMedian">—</b></div><div class="metric"><span>价格竞争力</span><b id="priceScore">—</b></div></div>
+      <div class="metric-grid"><div class="metric"><span>需求评分</span><b id="demandScore">—</b></div><div class="metric"><span>利润价格带</span><b id="financialScore">—</b></div><div class="metric"><span>合规评分</span><b id="complianceScore">—</b></div><div class="metric"><span>竞争评分</span><b id="competitionScore">—</b></div></div>
+      <div class="lists"><div><h3>优势</h3><ul id="strengths"></ul></div><div><h3>风险与待验证</h3><ul id="risks"></ul></div></div>
+    </section>
+
+    <section class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><div><h2>本地候选池</h2><p class="sub" id="poolSummary">尚未保存候选商品。</p></div><div class="actions" style="margin:0"><button id="handoffBtn" class="secondary">导出企业交接包</button><button id="exportBtn" class="secondary">导出 CSV</button><button id="clearBtn" class="danger">清空</button></div></div>
+      <div id="candidateList" class="empty">采集当前页并保存后，商品会在这里按综合选品分排序。</div>
+    </section>
+    <section class="card">
+      <h2>企业后台连接</h2>
+      <p class="sub">默认连接本机 Python 企业后台。同步时会将当前表单的 V2 商品主档发送到后端，由后端计算四维评分和风险；插件前端不作为最终评分依据。</p>
+      <div class="grid one"><label>后台地址<input id="backendUrl" value="http://127.0.0.1:8000" /></label></div>
+      <div class="actions"><button id="saveBackendBtn" class="secondary">保存后台地址</button><button id="openBackendBtn" class="secondary">打开企业后台</button></div>
+    </section>
+  </main>
+  <script src="engine.js"></script>
+  <script src="panel.js"></script>
+</body>
+</html>
