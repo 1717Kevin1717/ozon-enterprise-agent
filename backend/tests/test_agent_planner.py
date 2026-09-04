@@ -10,27 +10,27 @@ HEADERS = {"X-Company-ID": "agent-v2-company", "X-User-ID": "agent-analyst", "X-
 
 def test_generic_product_question_has_no_single_category_hardcode():
     intent, plan = plan_query("分析这个厨房收纳商品是否值得测试", 1)
-    assert intent == "single_product_decision"
-    assert [step["tool"] for step in plan] == ["search_products", "get_product", "calculate_profit", "get_sales_trend", "analyze_competition", "find_historical_failures"]
+    assert intent == "product_detail"
+    assert [step["tool"] for step in plan] == ["get_product"]
 
 
 def test_price_question_creates_minimal_simulation_plan():
     parsed = parse_intent("如果售价调整到 139 RUB，净利润和风险如何变化？", ["product-1"])
-    assert parsed.name == "price_simulation"
+    assert parsed.name == "product_detail"
     assert parsed.proposed_price == 139
     assert [step["tool"] for step in parsed.plan] == ["get_product", "simulate_price_change"]
 
 
 def test_explicit_selected_products_drive_comparison_plan():
     parsed = parse_intent("比较这两个商品", ["product-1", "product-2"])
-    assert parsed.name == "comparison"
+    assert parsed.name == "product_comparison"
     assert parsed.selected_product_ids == ("product-1", "product-2")
-    assert [step["tool"] for step in parsed.plan] == ["compare_products", "calculate_profit", "analyze_competition"]
+    assert [step["tool"] for step in parsed.plan] == ["compare_products"]
 
 
 def test_business_constraints_are_parsed_as_backend_filters():
     parsed = parse_intent("找利润率30%以上，竞争低于40的商品")
-    assert parsed.name == "constraint_filter"
+    assert parsed.name == "product_filter"
     assert parsed.filters["min_margin_rate"] == 0.30
     assert parsed.filters["max_market_saturation"] == 40
 
@@ -76,4 +76,4 @@ def test_session_memory_resolves_follow_up_reference_without_guessing(monkeypatc
     assert {item["id"] for item in second["products"]} == set(selected)
     saved = next(item for item in sessions if item["id"] == first["session_id"])
     assert set(saved["last_product_ids"]) == set(selected)
-    assert saved["state"]["last_intent"] == "comparison"
+    assert saved["state"]["last_intent"] == "product_comparison"

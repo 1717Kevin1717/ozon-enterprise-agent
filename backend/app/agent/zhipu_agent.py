@@ -7,11 +7,15 @@ from pydantic import ValidationError
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.entity_resolution import resolve_query_entities
+from app.agent.intent_engine import parse_intent
+from app.agent.runtime import AgentRunState
 from app.agent.tool_registry import TOOL_REGISTRY
 from app.agent.tools import (
     analyze_competition,
     calculate_profit,
     compare_products,
+    count_products,
     event,
     filter_products,
     find_historical_failures,
@@ -28,6 +32,7 @@ from app.db.models import ConversationMessage, ConversationSession
 from app.repositories.products import ProductRepository
 
 ZHIPU_TOOL_NAMES = (
+    "count_products",
     "filter_products",
     "search_products",
     "get_product",
@@ -82,7 +87,7 @@ def _error_code(exc: Exception) -> str:
             return "PROVIDER_UNAVAILABLE"
     if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
         return "NETWORK_TIMEOUT"
-    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, ValidationError)):
+    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, ValidationError, ValueError)):
         return "INVALID_RESPONSE"
     message = str(exc).lower()
     if "401" in message or "unauthorized" in message or "authentication" in message:
@@ -102,29 +107,50 @@ def _merge_usage(total: dict[str, int], usage: dict[str, Any]) -> None:
             total[target] = total.get(target, 0) + int(value)
 
 
-async def _execute_tool(session: AsyncSession, company_id: str, role: str, name: str, arguments: dict) -> dict:
+async def _execute_tool(session: AsyncSession, company_id: str, role: str, name: str, arguments: dict, run_state: AgentRunState | None = None) -> tuple[dict, bool] | dict:
+    owns_state = run_state is None
     spec = TOOL_REGISTRY.get(name)
     if spec is None:
-        return {"tool": name, "success": False, "error_code": "TOOL_NOT_ALLOWED"}
+        result = {"tool": name, "success": False, "error_code": "TOOL_NOT_ALLOWED", "message": "模型请求了未登记的工具，后端已拒绝。"}
+        if run_state is not None:
+            run_state.record_rejection(name, arguments, result, "rejected")
+        return result if owns_state else (result, False)
     if not spec.allows(role):
-        return {"tool": name, "success": False, "error_code": "FORBIDDEN", "message": "当前角色无权执行该工具。"}
+        result = {"tool": name, "success": False, "error_code": "FORBIDDEN", "message": "当前角色无权执行该工具。"}
+        if run_state is not None:
+            run_state.record_rejection(name, arguments, result, "forbidden")
+        return result if owns_state else (result, False)
     try:
         validated = spec.input_schema.model_validate(arguments).model_dump()
     except ValidationError as exc:
-        return {"tool": name, "success": False, "error_code": "INVALID_ARGUMENTS", "message": "工具参数不符合后端 Schema。", "details": exc.errors(include_url=False)}
-    try:
-        result = await asyncio.wait_for(_dispatch_tool(session, company_id, role, name, validated), timeout=spec.timeout_seconds)
-    except TimeoutError:
-        return {"tool": name, "success": False, "error_code": "TOOL_TIMEOUT", "message": "工具执行超过后端规定时限。"}
-    try:
-        spec.output_schema.model_validate(result)
-    except ValidationError:
-        return {"tool": name, "success": False, "error_code": "INVALID_TOOL_RESULT", "message": "工具返回结果未通过后端 Schema 校验。"}
-    return result
+        result = {"tool": name, "success": False, "error_code": "INVALID_ARGUMENTS", "message": "工具参数不符合后端 Schema。", "details": exc.errors(include_url=False)}
+        if run_state is not None:
+            run_state.record_rejection(name, arguments, result, "invalid")
+        return result if owns_state else (result, False)
+
+    if run_state is None:
+        from app.agent.intent_engine import IntentPolicy
+        run_state = AgentRunState(IntentPolicy((name,), 1, ("compatibility",)))
+
+    async def runner() -> dict:
+        try:
+            result = await asyncio.wait_for(_dispatch_tool(session, company_id, role, name, validated), timeout=spec.timeout_seconds)
+        except TimeoutError:
+            return {"tool": name, "success": False, "error_code": "TOOL_TIMEOUT", "message": "工具执行超过后端规定时限。"}
+        try:
+            spec.output_schema.model_validate(result)
+        except ValidationError:
+            return {"tool": name, "success": False, "error_code": "INVALID_TOOL_RESULT", "message": "工具返回结果未通过后端 Schema 校验。"}
+        return result
+
+    result, reused = await run_state.execute(name, validated, runner)
+    return result if owns_state else (result, reused)
 
 
 async def _dispatch_tool(session: AsyncSession, company_id: str, role: str, name: str, arguments: dict) -> dict:
     repo = ProductRepository(session, company_id)
+    if name == "count_products":
+        return await count_products(repo, role)
     if name == "filter_products":
         return await filter_products(repo, role, **arguments)
     if name == "search_products":
@@ -158,8 +184,18 @@ async def _conversation_messages(session: AsyncSession, company_id: str, session
 
 
 async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, role: str, query: str, session_id: str | None, selected_product_ids: list[str] | None = None) -> dict:
+    parsed = parse_intent(query, selected_product_ids)
+    run_state = AgentRunState(parsed.policy)
+    if parsed.policy.fast_path:
+        return await rule_agent_ask(
+            session, company_id, user_id, role, query, session_id,
+            selected_product_ids=selected_product_ids,
+            response_mode="rule_engine",
+            provider_notice="该问题已由确定性快速路径完成，无需调用外部模型。",
+            run_state=run_state,
+        )
     if not settings.zhipu_api_key:
-        return await rule_agent_ask(session, company_id, user_id, role, query, session_id, selected_product_ids=selected_product_ids, response_mode="deterministic_fallback", fallback_reason="KEY_MISSING", provider_notice=SAFE_ERROR_MESSAGES["KEY_MISSING"])
+        return await rule_agent_ask(session, company_id, user_id, role, query, session_id, selected_product_ids=selected_product_ids, response_mode="deterministic_fallback", fallback_reason="KEY_MISSING", provider_notice=SAFE_ERROR_MESSAGES["KEY_MISSING"], run_state=run_state)
     conversation = await session.get(ConversationSession, session_id) if session_id else None
     if not conversation or conversation.company_id != company_id:
         conversation = ConversationSession(company_id=company_id, user_id=user_id, title=query[:80], goal_summary=query[:300])
@@ -169,7 +205,17 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
     history = await _conversation_messages(session, company_id, session_id)
     session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"provider": "zhipu", "selected_product_ids": selected_product_ids or []}))
     await session.flush()
-    context_note = f"明确选择的商品 ID：{selected_product_ids}" if selected_product_ids else "本轮没有显式选择商品 ID；遇到指代必须要求后端会话解析。"
+    repo = ProductRepository(session, company_id)
+    resolution = resolve_query_entities(await repo.list(limit=500), query, 10)
+    resolved_ids = [item.id for item in resolution.products]
+    effective_ids = resolved_ids or list(parsed.selected_product_ids)
+    if resolution.ambiguous and not effective_ids:
+        return await rule_agent_ask(
+            session, company_id, user_id, role, query, session_id,
+            selected_product_ids=selected_product_ids, record_user_message=False,
+            response_mode="rule_engine", provider_notice="商品名称存在歧义，未调用外部模型。", run_state=run_state,
+        )
+    context_note = f"本轮已由后端解析的商品 ID：{effective_ids}" if effective_ids else "本轮没有已解析商品 ID；不得猜测商品身份。"
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": f"{query}\n\n受控上下文：{context_note}"}]
     endpoint = f"{settings.zhipu_base_url.rstrip('/')}/chat/completions"
     trace: list[dict[str, Any]] = []
@@ -179,7 +225,7 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
         async with httpx.AsyncClient(timeout=settings.zhipu_timeout_seconds) as client:
             for round_index in range(settings.zhipu_max_tool_rounds):
                 event(trace, "llm_request", "zhipu", f"请求 GLM 进行第 {round_index + 1} 轮受控工具规划。")
-                response = await client.post(endpoint, headers={"Authorization": f"Bearer {settings.zhipu_api_key}", "Content-Type": "application/json"}, json={"model": settings.zhipu_model, "messages": messages, "tools": ZHIPU_TOOLS, "tool_choice": "auto", "temperature": 0.1, "max_tokens": 1600})
+                response = await client.post(endpoint, headers={"Authorization": f"Bearer {settings.zhipu_api_key}", "Content-Type": "application/json"}, json={"model": settings.zhipu_model, "messages": messages, "tools": TOOL_REGISTRY.llm_tools(parsed.policy.allowed_tools), "tool_choice": "auto", "temperature": 0.1, "max_tokens": 1600})
                 response.raise_for_status()
                 payload = response.json()
                 _merge_usage(token_usage, payload.get("usage") or {})
@@ -199,16 +245,15 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
                         arguments = {}
                     if not isinstance(arguments, dict):
                         arguments = {}
-                    event(trace, "tool_started", name, "GLM 请求执行受控企业工具。")
-                    result = await _execute_tool(session, company_id, role, name, arguments)
-                    event(trace, "tool_finished", name, "后端工具已返回经过校验的数据。", success=result.get("success", False))
+                    result, reused = await _execute_tool(session, company_id, role, name, arguments, run_state)
+                    event(trace, "tool_reused" if reused else "tool_finished", name, "已复用本轮结果。" if reused else "后端工具已返回经过校验的数据。", success=result.get("success", False))
                     messages.append(_tool_message(call_id, result))
             if not final_content:
                 raise ValueError("provider returned no final summary")
     except Exception as exc:
         code = _error_code(exc)
         event(trace, "llm_error", "zhipu", SAFE_ERROR_MESSAGES[code], error_code=code)
-        return await rule_agent_ask(session, company_id, user_id, role, query, session_id, selected_product_ids=selected_product_ids, record_user_message=False, response_mode="deterministic_fallback", fallback_reason=code, provider_notice=SAFE_ERROR_MESSAGES[code], trace_prefix=trace)
+        return await rule_agent_ask(session, company_id, user_id, role, query, session_id, selected_product_ids=selected_product_ids, record_user_message=False, response_mode="deterministic_fallback", fallback_reason=code, provider_notice=SAFE_ERROR_MESSAGES[code], trace_prefix=trace, run_state=run_state)
     return await rule_agent_ask(
         session,
         company_id,
@@ -223,5 +268,6 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
         trace_prefix=trace,
         active_model_override=settings.zhipu_model,
         token_usage_override=token_usage,
-        model_summary=final_content,
+        model_summary="",
+        run_state=run_state,
     )

@@ -11,7 +11,7 @@ from app.db.models import AgentEvaluation, AgentRun
 from app.repositories.products import ProductRepository
 
 
-EVAL_SUITE_VERSION = "enterprise-selection-v1"
+EVAL_SUITE_VERSION = "enterprise-selection-stability-v1"
 
 
 @dataclass(frozen=True)
@@ -63,7 +63,7 @@ async def run_deterministic_suite(session: AsyncSession, company_id: str, user_i
         expected_ids = [str(item["id"]) for item in expected_result.get("data", [])]
         actual = await rule_agent_ask(session, company_id, user_id, role, case.query, None, [], response_mode="rule_engine", provider_notice="本次为离线确定性回归评测，不调用外部模型。")
         actual_ids = [str(item["id"]) for item in actual.get("products", [])]
-        tools = [str(item.get("tool")) for item in actual.get("trace", []) if item.get("event") == "tool_started"]
+        tools = [str(item.get("tool")) for item in actual.get("trace", []) if item.get("event") == "tool_finished" and item.get("success")]
         answer_accuracy = _accuracy(expected_ids, actual_ids)
         task_success = 1.0 if expected_ids == actual_ids and actual.get("matched_count") == len(expected_ids) else 0.0
         tool_accuracy = 1.0 if case.expected_tool in tools else 0.0
@@ -77,7 +77,7 @@ async def run_deterministic_suite(session: AsyncSession, company_id: str, user_i
             task_name=case.name,
             task_input={"query": case.query, "suite_version": EVAL_SUITE_VERSION},
             expected_output={"product_ids": expected_ids, "expected_tool": case.expected_tool},
-            actual_output={"product_ids": actual_ids, "matched_count": actual.get("matched_count"), "tools": tools, "response_mode": actual.get("response_mode")},
+            actual_output={"product_ids": actual_ids, "matched_count": actual.get("matched_count"), "tools": tools, "tool_call_count": actual.get("tool_call_count"), "response_mode": actual.get("response_mode")},
             task_success_rate=task_success,
             answer_accuracy=answer_accuracy,
             tool_calling_accuracy=tool_accuracy,

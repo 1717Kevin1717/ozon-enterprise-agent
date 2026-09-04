@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -8,6 +9,66 @@ ResponseMode = Literal[
     "deterministic_fallback",
     "rule_engine",
 ]
+
+ResponseType = Literal[
+    "simple_fact",
+    "product_detail",
+    "filter_result",
+    "comparison_result",
+    "decision_report",
+    "policy_answer",
+    "insufficient_data",
+    "clarification",
+    "error",
+]
+
+
+class AgentEntity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entity_type: Literal["product"] = "product"
+    product_id: str
+    name: str
+    resolution_method: Literal["query_entity", "explicit_selection", "session_reference"]
+
+
+class AgentToolResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    normalized_args: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentFact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: Any
+    unit: str = ""
+    product_id: str = ""
+    currency: str = ""
+    source: str
+    timestamp: datetime | None = None
+
+
+class DataSufficiencyResult(BaseModel):
+    """Keep reported metrics separate from trends observed from saved snapshots."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["SUFFICIENT", "INSUFFICIENT_DATA"]
+    observed_trend: Literal["GROWING", "DECLINING", "FLAT", "INSUFFICIENT_DATA"]
+    snapshot_count: int = Field(ge=0)
+    valid_sales_snapshot_count: int = Field(ge=0)
+    minimum_required: int = Field(ge=2)
+    available: int = Field(ge=0)
+    latest_snapshot_at: datetime | None = None
+    stale: bool = False
+    reported_metric: float | None = None
+    reported_metric_source: str = "not_provided"
+    notice: str = ""
 
 
 class AgentProduct(BaseModel):
@@ -20,6 +81,7 @@ class AgentProduct(BaseModel):
     category_path: str = ""
     score: float
     recommendation_grade: str = "C"
+    decision_status: str = "REVIEW_REQUIRED"
     profit_score: float = 0
     demand_score: float = 0
     competition_score: float = 0
@@ -28,8 +90,12 @@ class AgentProduct(BaseModel):
     confidence: float = Field(ge=0, le=1)
     completeness: int = Field(ge=0, le=100)
     risk_level: str
+    compliance_status: str = "pending"
     lifecycle_status: str
     current_price: float = 0
+    currency: str = "RUB"
+    price_source: str = "company_product_database"
+    updated_at: datetime | None = None
     current_margin_rate: float = 0
     net_profit: float = 0
     roi: float = 0
@@ -48,20 +114,31 @@ class AgentEvidence(BaseModel):
     url: str = ""
 
 
-class AgentAnswer(BaseModel):
+class AgentRunResult(BaseModel):
     """Stable response contract shared by GLM and deterministic fallback."""
 
     model_config = ConfigDict(extra="forbid")
 
+    run_id: str
     session_id: str
+    response_type: ResponseType
     answer: str
     matched_count: int = Field(ge=0)
+    total_count: int = Field(ge=0)
+    displayed_count: int = Field(ge=0)
+    entities: list[AgentEntity] = Field(default_factory=list)
+    product_ids: list[str] = Field(default_factory=list)
+    filter_criteria: dict[str, Any] = Field(default_factory=dict)
+    fact: AgentFact | None = None
     products: list[AgentProduct] = Field(default_factory=list)
+    tool_results: list[AgentToolResult] = Field(default_factory=list)
     evidence: list[AgentEvidence] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     missing_data: list[dict[str, Any]] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
-    requires_human_review: bool = True
+    requires_human_review: bool = False
+    human_review_required: bool = False
     tool_trace_summary: list[str] = Field(default_factory=list)
     response_mode: ResponseMode
     source_badge: str
@@ -71,6 +148,16 @@ class AgentAnswer(BaseModel):
     latency_ms: int = Field(ge=0)
     token_usage: dict[str, Any] = Field(default_factory=dict)
     intent: str
+    task_completed: bool = True
+    fallback_used: bool = False
+    tool_call_count: int = Field(default=0, ge=0)
+    duplicate_tool_execution: int = Field(default=0, ge=0)
+    requested_dimensions: list[str] = Field(default_factory=list)
+    display_scope: list[str] = Field(default_factory=list)
+    selection_source: str = "none"
+    decision_status: str = "NOT_APPLICABLE"
+    decision_summary: dict[str, Any] = Field(default_factory=dict)
+    data_sufficiency: DataSufficiencyResult | None = None
 
     # Compatibility fields retained for the existing API and UI during V2 migration.
     mode: str
@@ -83,4 +170,9 @@ class AgentAnswer(BaseModel):
 
 
 def validate_agent_answer(payload: dict[str, Any]) -> dict[str, Any]:
-    return AgentAnswer.model_validate(payload).model_dump(mode="json")
+    return AgentRunResult.model_validate(payload).model_dump(mode="json")
+
+
+# V2 compatibility alias: existing API imports continue to work while every
+# consumer now receives the single AgentRunResult business truth.
+AgentAnswer = AgentRunResult

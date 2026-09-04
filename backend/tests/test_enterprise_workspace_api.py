@@ -118,13 +118,72 @@ def test_zhipu_failure_is_audited_and_dashboard_reports_safe_fallback(monkeypatc
         answer = client.post(
             "/api/v1/agent/ask",
             headers=headers,
-            json={"query": "连接验证"},
+            json={"query": "比较商品A和商品B"},
         )
         overview = client.get("/api/v1/dashboard/overview", headers=headers)
 
     assert answer.status_code == 200
-    assert answer.json()["data"]["mode"] == "agent_v1_deterministic_fallback"
+    assert answer.json()["data"]["mode"] == "agent_v3_deterministic_fallback"
+    assert answer.json()["data"]["response_mode"] == "deterministic_fallback"
+    assert answer.json()["data"]["source_badge"] == "确定性 Planner 回退"
+    assert answer.json()["data"]["fallback_reason"] == "AUTHENTICATION_FAILED"
     agent = overview.json()["data"]["agent"]
     assert agent["status"] == "error"
     assert agent["status_code"] == "AUTHENTICATION_FAILED"
     assert "安全回退" in agent["notice"]
+
+
+def test_deterministic_fast_path_skips_external_model(monkeypatch):
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class MockAsyncClient:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            self.__class__.calls += 1
+            if self.__class__.calls == 1:
+                return FakeResponse({
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 20, "total_tokens": 140},
+                    "choices": [{"message": {"content": "", "tool_calls": [{"id": "call-1", "function": {"name": "filter_products", "arguments": '{"min_score":60,"sort_by":"recommendation_score","sort_direction":"desc","limit":100}'}}]}}],
+                })
+            return FakeResponse({
+                "usage": {"prompt_tokens": 50, "completion_tokens": 40, "total_tokens": 90},
+                "choices": [{"message": {"content": "已完成企业候选筛选，精确数量以后台结构化结果为准。"}}],
+            })
+
+    headers = {**ADMIN_HEADERS, "X-Company-ID": "provider-success-company"}
+    monkeypatch.setattr(zhipu_module.httpx, "AsyncClient", MockAsyncClient)
+    monkeypatch.setattr(zhipu_module.settings, "llm_provider", "zhipu")
+    monkeypatch.setattr(zhipu_module.settings, "zhipu_api_key", "mock-key-never-sent")
+    with TestClient(app) as client:
+        client.post("/api/v1/demo/seed", headers=headers, json={"replace_demo": False})
+        answer = client.post("/api/v1/agent/ask", headers=headers, json={"query": "企业有哪些商品分数达到60以上？"})
+        status = client.get("/api/v1/agent/status", headers=headers)
+
+    payload = answer.json()["data"]
+    assert answer.status_code == 200
+    assert payload["response_mode"] == "rule_engine"
+    assert payload["source_badge"] == "规则引擎结果"
+    assert payload["active_provider"] == "deterministic_planner"
+    assert payload["token_usage"] == {}
+    assert payload["model_summary"] == ""
+    assert MockAsyncClient.calls == 0
+    assert payload["matched_count"] == len(payload["products"])
+    assert status.json()["data"]["last_call_success"] is None

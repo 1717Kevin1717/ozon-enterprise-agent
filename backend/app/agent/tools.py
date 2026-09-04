@@ -1,27 +1,31 @@
-import re
 import time
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Awaitable, Callable
 
-from sqlalchemy import select
+from pydantic import ValidationError
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.entity_resolution import EntityResolution, resolve_query_entities
 from app.agent.intent_engine import ParsedIntent, parse_intent
+from app.agent.runtime import AgentRunState
 from app.agent.tool_registry import TOOL_REGISTRY
-from app.db.models import AgentRun, ConversationMessage, ConversationSession, Memory, Product
+from app.db.models import AgentRun, ConversationMessage, ConversationSession, Memory, Product, uid
 from app.repositories.products import ProductRepository, product_view
 from app.schemas.agent import validate_agent_answer
-from app.services.decision_engine import analyze, simulate_price, to_dict
+from app.services.decision_engine import analyze, recommendation_gate_status, simulate_price, to_dict
 from app.services.knowledge_base import search_documents
+
 
 TOOL_POLICY = {spec.tool_name: list(spec.allowed_roles) for spec in TOOL_REGISTRY.all()}
 BUSINESS_TOOL_LABELS = {
+    "count_products": "统计企业商品总数",
     "filter_products": "筛选企业商品库",
     "search_products": "检索企业商品库",
     "get_product": "读取商品主档与证据",
     "compare_products": "建立商品决策对比",
     "calculate_profit": "分析利润模型",
-    "get_sales_trend": "核验销量趋势",
+    "get_sales_trend": "核验销量快照趋势",
     "get_price_trend": "核验价格趋势",
     "analyze_competition": "分析竞争情况",
     "simulate_price_change": "执行价格情景模拟",
@@ -44,6 +48,13 @@ def event(trace: list[dict], status: str, tool: str, summary: str, **extra: Any)
     trace.append({"event": status, "tool": tool, "business_label": BUSINESS_TOOL_LABELS.get(tool, tool), "summary": summary, **extra})
 
 
+async def count_products(repo: ProductRepository, role: str) -> dict:
+    if not allow("count_products", role):
+        return tool_error("count_products", "FORBIDDEN")
+    total = await repo.session.scalar(select(func.count(Product.id)).where(Product.company_id == repo.company_id))
+    return {"tool": "count_products", "success": True, "data": {"count": int(total or 0)}}
+
+
 async def search_products(repo: ProductRepository, keyword: str, role: str) -> dict:
     if not allow("search_products", role):
         return tool_error("search_products", "FORBIDDEN")
@@ -54,8 +65,9 @@ async def search_products(repo: ProductRepository, keyword: str, role: str) -> d
 async def filter_products(repo: ProductRepository, role: str, **filters: Any) -> dict:
     if not allow("filter_products", role):
         return tool_error("filter_products", "FORBIDDEN")
-    keyword = str(filters.get("keyword") or "")
-    limit = max(1, min(100, int(filters.get("limit") or 20)))
+    criteria = TOOL_REGISTRY.require("filter_products").input_schema.model_validate(filters).model_dump()
+    keyword = str(criteria.get("keyword") or "")
+    limit = int(criteria["limit"])
     views: list[dict[str, Any]] = []
     for product in await repo.list(keyword, limit=500):
         latest = await repo.latest_analysis(product.id)
@@ -65,29 +77,34 @@ async def filter_products(repo: ProductRepository, role: str, **filters: Any) ->
         analysis = view.get("analysis") or {}
         score_value = float(analysis.get("recommendation_score") or 0)
         completeness_grade = (analysis.get("evidence_completeness") or {}).get("grade")
-        if filters.get("min_score") is not None and score_value < float(filters["min_score"]):
+        if criteria.get("min_score") is not None and score_value < float(criteria["min_score"]):
             continue
-        if filters.get("max_score") is not None and score_value > float(filters["max_score"]):
+        if criteria.get("max_score") is not None and score_value > float(criteria["max_score"]):
             continue
-        if filters.get("min_margin_rate") is not None and float(view.get("current_margin_rate") or analysis.get("net_margin") or 0) < float(filters["min_margin_rate"]):
+        if criteria.get("min_margin_rate") is not None and float(view.get("current_margin_rate") or analysis.get("net_margin") or 0) < float(criteria["min_margin_rate"]):
             continue
-        if filters.get("min_roi") is not None and float(analysis.get("roi") or 0) < float(filters["min_roi"]):
+        if criteria.get("min_roi") is not None and float(analysis.get("roi") or 0) < float(criteria["min_roi"]):
             continue
-        if filters.get("max_market_saturation") is not None and float(view.get("market_saturation") or 0) > float(filters["max_market_saturation"]):
+        if criteria.get("max_market_saturation") is not None and float(view.get("market_saturation") or 0) > float(criteria["max_market_saturation"]):
             continue
-        if filters.get("brand") and str(filters["brand"]).casefold() not in str(view.get("brand") or "").casefold():
+        if criteria.get("brand") and str(criteria["brand"]).casefold() not in str(view.get("brand") or "").casefold():
             continue
-        if filters.get("category") and str(filters["category"]).casefold() not in str(view.get("category_path") or "").casefold():
+        if criteria.get("category") and str(criteria["category"]).casefold() not in str(view.get("category_path") or "").casefold():
             continue
-        if filters.get("lifecycle_status") and view.get("lifecycle_status") != filters["lifecycle_status"]:
+        if criteria.get("lifecycle_status") and view.get("lifecycle_status") != criteria["lifecycle_status"]:
             continue
-        if filters.get("risk_level") and analysis.get("risk_level") != filters["risk_level"]:
+        if criteria.get("risk_level") and str(analysis.get("risk_level") or "").casefold() != criteria["risk_level"]:
             continue
-        if filters.get("completeness") == "complete" and completeness_grade != "complete":
+        if criteria.get("compliance_status"):
+            compliance = str(view.get("compliance_status") or "").casefold()
+            expected = criteria["compliance_status"]
+            if not ((expected == "approved" and compliance in {"approved", "通过"}) or compliance == expected):
+                continue
+        if criteria.get("completeness") == "complete" and completeness_grade != "complete":
             continue
-        if filters.get("completeness") == "incomplete" and completeness_grade == "complete":
+        if criteria.get("completeness") == "incomplete" and completeness_grade == "complete":
             continue
-        updated_since = filters.get("updated_since")
+        updated_since = criteria.get("updated_since")
         if updated_since:
             threshold = updated_since.replace(tzinfo=None) if updated_since.tzinfo else updated_since
             if not view.get("updated_at") or view["updated_at"] < threshold:
@@ -100,12 +117,22 @@ async def filter_products(repo: ProductRepository, role: str, **filters: Any) ->
             "recommendation_score": float(analysis.get("recommendation_score") or 0),
             "completeness": float((analysis.get("evidence_completeness") or {}).get("percent") or 0),
             "updated_at": item.get("updated_at") or datetime.min,
-            "margin_rate": float(item.get("current_margin_rate") or 0),
+            "margin_rate": float(item.get("current_margin_rate") or analysis.get("net_margin") or 0),
         }
-        return mapping.get(str(filters.get("sort_by") or "recommendation_score"), mapping["recommendation_score"])
+        return mapping.get(str(criteria.get("sort_by") or "recommendation_score"), mapping["recommendation_score"])
 
-    views.sort(key=sort_value, reverse=filters.get("sort_direction", "desc") != "asc")
-    return {"tool": "filter_products", "success": True, "data": views[:limit], "message": "筛选、计数和排序均由后端确定性执行。"}
+    views.sort(key=sort_value, reverse=criteria.get("sort_direction", "desc") != "asc")
+    displayed = views[:limit]
+    return {
+        "tool": "filter_products",
+        "success": True,
+        "data": displayed,
+        "criteria": criteria,
+        "total_count": len(views),
+        "matched_count": len(views),
+        "displayed_count": len(displayed),
+        "message": "全部显式条件已由后端按 AND 语义执行；筛选、计数和排序共享同一结果。",
+    }
 
 
 async def get_product(repo: ProductRepository, product_id: str, role: str) -> dict:
@@ -114,7 +141,10 @@ async def get_product(repo: ProductRepository, product_id: str, role: str) -> di
     product = await repo.get(product_id)
     if not product:
         return tool_error("get_product", "NOT_FOUND", "商品不存在或不属于当前企业。")
-    return {"tool": "get_product", "success": True, "data": product_view(product, await repo.latest_analysis(product.id))}
+    view = product_view(product, await repo.latest_analysis(product.id))
+    if not view.get("analysis"):
+        view["analysis"] = to_dict(analyze(product))
+    return {"tool": "get_product", "success": True, "data": view}
 
 
 async def compare_products(repo: ProductRepository, product_ids: list[str], role: str) -> dict:
@@ -124,7 +154,10 @@ async def compare_products(repo: ProductRepository, product_ids: list[str], role
     for product_id in dict.fromkeys(product_ids):
         product = await repo.get(product_id)
         if product:
-            rows.append(product_view(product, await repo.latest_analysis(product.id)))
+            view = product_view(product, await repo.latest_analysis(product.id))
+            if not view.get("analysis"):
+                view["analysis"] = to_dict(analyze(product))
+            rows.append(view)
     return {"tool": "compare_products", "success": True, "data": rows, "warning": "仅比较已保存的本企业数据；缺失证据不会被补造。"}
 
 
@@ -159,13 +192,74 @@ async def analyze_competition(repo: ProductRepository, product_id: str, role: st
     return {"tool": "analyze_competition", "success": True, "data": {"score": result.competition_score, "competitor_count": product.competitor_count, "competitor_price_min": product.competitor_price_min, "competitor_price_avg": product.competitor_price_avg, "price_position": result.price_position, "market_saturation": product.market_saturation, "evidence": product.competition_evidence, "complete": result.evidence_completeness["groups"]["competition"]["ready"]}}
 
 
+SALES_SNAPSHOT_MINIMUM = 2
+SALES_SNAPSHOT_FRESHNESS_DAYS = 30
+
+
+def sales_data_sufficiency(
+    rows: list[dict[str, Any]],
+    reported_metric: float | None,
+    reported_metric_source: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Evaluate observed snapshots without promoting a reported metric into a trend."""
+
+    current_time = (now or datetime.now(UTC)).replace(tzinfo=None)
+    valid_rows = [item for item in rows if float(item.get("sales_30d") or 0) > 0]
+    captured = [item.get("captured_at") for item in rows if isinstance(item.get("captured_at"), datetime)]
+    latest = max(captured) if captured else None
+    stale = bool(latest and current_time - latest.replace(tzinfo=None) > timedelta(days=SALES_SNAPSHOT_FRESHNESS_DAYS))
+    sufficient = len(valid_rows) >= SALES_SNAPSHOT_MINIMUM and not stale
+    if not sufficient:
+        observed_trend = "INSUFFICIENT_DATA"
+    else:
+        first = float(valid_rows[0]["sales_30d"])
+        last = float(valid_rows[-1]["sales_30d"])
+        observed_trend = "GROWING" if last > first else "DECLINING" if last < first else "FLAT"
+    return {
+        "status": "SUFFICIENT" if sufficient else "INSUFFICIENT_DATA",
+        "observed_trend": observed_trend,
+        "snapshot_count": len(rows),
+        "valid_sales_snapshot_count": len(valid_rows),
+        "minimum_required": SALES_SNAPSHOT_MINIMUM,
+        "available": len(valid_rows),
+        "latest_snapshot_at": latest,
+        "stale": stale,
+        "reported_metric": reported_metric,
+        "reported_metric_source": reported_metric_source or "not_provided",
+        "notice": "快照趋势只基于有效且未过期的已保存快照；企业报告增速是独立来源，不能替代快照趋势。",
+    }
+
+
 async def get_sales_trend(repo: ProductRepository, product_id: str, role: str) -> dict:
     if not allow("get_sales_trend", role):
         return tool_error("get_sales_trend", "FORBIDDEN")
-    rows = (await get_product_history(repo, product_id, role)).get("data", [])
-    values = [item["sales_30d"] for item in rows if item["sales_30d"] > 0]
-    trend = "insufficient" if len(values) < 2 else "growing" if values[-1] > values[0] else "declining" if values[-1] < values[0] else "flat"
-    return {"tool": "get_sales_trend", "success": True, "data": {"points": rows, "trend": trend, "notice": "趋势只基于已保存快照，不对缺失期间作推断。"}}
+    product = await repo.get(product_id)
+    if not product:
+        return tool_error("get_sales_trend", "NOT_FOUND")
+    history = await get_product_history(repo, product_id, role)
+    rows = history.get("data", [])
+    lineage_value = (product.field_lineage or {}).get("sales_growth_rate")
+    reported_source = _source_name(lineage_value, str(product.sales_source or "not_provided"))
+    has_reported_metric = bool(lineage_value) or reported_source not in {"", "not_provided", "未提供"}
+    reported_metric = float(product.sales_growth_rate) if has_reported_metric else None
+    sufficiency = sales_data_sufficiency(rows, reported_metric, reported_source)
+    return {
+        "tool": "get_sales_trend",
+        "success": True,
+        "data": {
+            "points": rows,
+            "snapshot_count": sufficiency["snapshot_count"],
+            "valid_sales_snapshot_count": sufficiency["valid_sales_snapshot_count"],
+            "snapshot_trend": sufficiency["observed_trend"],
+            "trend": sufficiency["observed_trend"].lower(),
+            "data_sufficiency": sufficiency,
+            "static_sales_growth_rate": reported_metric,
+            "static_sales_growth_source": reported_source,
+            "notice": "快照趋势只基于已保存快照；主档销量增速单独展示，不等同于快照趋势。",
+        },
+    }
 
 
 async def get_price_trend(repo: ProductRepository, product_id: str, role: str) -> dict:
@@ -175,7 +269,7 @@ async def get_price_trend(repo: ProductRepository, product_id: str, role: str) -
     if not history.get("success"):
         return tool_error("get_price_trend", history.get("error_code", "TOOL_FAILED"), history.get("message", ""))
     rows = history.get("data", [])
-    values = [item["price"] for item in rows if item["price"] > 0]
+    values = [item["price"] for item in rows if float(item.get("price") or 0) > 0]
     trend = "insufficient" if len(values) < 2 else "rising" if values[-1] > values[0] else "falling" if values[-1] < values[0] else "flat"
     return {"tool": "get_price_trend", "success": True, "data": {"points": rows, "trend": trend, "notice": "趋势只基于已保存价格快照，不对缺失期间作推断。"}}
 
@@ -221,73 +315,55 @@ async def rank_products(repo: ProductRepository, keyword: str, role: str) -> dic
     return await filter_products(repo, role, keyword=keyword, sort_by="recommendation_score", sort_direction="desc", limit=100)
 
 
-def _entity_score(product: Product, query: str) -> int:
-    lowered = query.casefold()
-    title = (product.title or "").casefold()
-    brand = (product.brand or "").casefold()
-    if title and title in lowered:
-        return 100
-    if brand and brand in lowered:
-        return 80
-    score = 0
-    for size in range(6, 1, -1):
-        if any(fragment in title for fragment in (lowered[index:index + size] for index in range(max(0, len(lowered) - size + 1)))):
-            score = size
-            break
-    return score
-
-
 def select_targets(products: list[Product], query: str, selected_product_ids: list[str] | None = None, limit: int = 5) -> list[Product]:
+    """Compatibility wrapper with query entities taking priority over UI state."""
+    resolved = resolve_query_entities(products, query, limit)
+    if resolved.products:
+        return resolved.products
     by_id = {product.id: product for product in products}
-    explicit = [by_id[item] for item in dict.fromkeys(selected_product_ids or []) if item in by_id]
-    if explicit:
-        return explicit[:limit]
-    ranked = [(product, _entity_score(product, query)) for product in products]
-    ranked = [item for item in ranked if item[1] >= 2]
-    ranked.sort(key=lambda item: item[1], reverse=True)
-    return [item[0] for item in ranked[:limit]]
+    return [by_id[item] for item in dict.fromkeys(selected_product_ids or []) if item in by_id][:limit]
 
 
 def plan_query(query: str, target_count: int) -> tuple[str, list[dict[str, str]]]:
-    selected = [f"selected-{index}" for index in range(target_count)]
-    parsed = parse_intent(query, selected)
+    parsed = parse_intent(query, [f"selected-{index}" for index in range(target_count)])
     return parsed.name, list(parsed.plan)
 
 
 def _agent_product(view: dict[str, Any]) -> dict[str, Any]:
     analysis = view.get("analysis") or {}
     completeness = analysis.get("evidence_completeness") or {}
+    margin = float(view.get("current_margin_rate") or analysis.get("net_margin") or 0)
+    decision_status = recommendation_gate_status(
+        compliance_status=str(view.get("compliance_status") or ""),
+        decision_ready=bool(completeness.get("decision_ready", False)),
+        net_margin=margin,
+        target_margin=float(view.get("target_margin_rate") or 0.30),
+        risk_level=str(analysis.get("risk_level") or "unknown"),
+        recommendation=str(analysis.get("recommendation") or "review_required"),
+    )
+    lineage = view.get("field_lineage") or {}
+    price_lineage = lineage.get("current_price") or lineage.get("currentPriceRub") or "company_product_database"
+    price_source = price_lineage.get("source", "company_product_database") if isinstance(price_lineage, dict) else str(price_lineage)
     return {
-        "id": str(view.get("id") or ""),
-        "external_product_id": str(view.get("external_product_id") or ""),
-        "title": str(view.get("title") or ""),
-        "brand": str(view.get("brand") or ""),
-        "category_path": str(view.get("category_path") or ""),
-        "score": float(analysis.get("recommendation_score") or 0),
-        "recommendation_grade": str(analysis.get("recommendation_grade") or "C"),
-        "profit_score": float(analysis.get("profit_score") or 0),
-        "demand_score": float(analysis.get("demand_score") or 0),
-        "competition_score": float(analysis.get("competition_score") or 0),
-        "compliance_score": float(analysis.get("compliance_score") or 0),
-        "risk_score": float(analysis.get("risk_score") or 0),
-        "confidence": float(analysis.get("data_confidence") or 0),
-        "completeness": int(completeness.get("percent") or analysis.get("data_completeness") or 0),
-        "risk_level": str(analysis.get("risk_level") or "unknown"),
+        "id": str(view.get("id") or ""), "external_product_id": str(view.get("external_product_id") or ""), "title": str(view.get("title") or ""),
+        "brand": str(view.get("brand") or ""), "category_path": str(view.get("category_path") or ""), "score": float(analysis.get("recommendation_score") or 0),
+        "recommendation_grade": str(analysis.get("recommendation_grade") or "C"), "decision_status": decision_status,
+        "profit_score": float(analysis.get("profit_score") or 0), "demand_score": float(analysis.get("demand_score") or 0),
+        "competition_score": float(analysis.get("competition_score") or 0), "compliance_score": float(analysis.get("compliance_score") or 0), "risk_score": float(analysis.get("risk_score") or 0),
+        "confidence": float(analysis.get("data_confidence") or 0), "completeness": int(completeness.get("percent") or analysis.get("data_completeness") or 0),
+        "risk_level": str(analysis.get("risk_level") or "unknown"), "compliance_status": str(view.get("compliance_status") or "pending"),
         "lifecycle_status": str(view.get("lifecycle_status") or "candidate"),
-        "current_price": float(view.get("current_price") or 0),
-        "current_margin_rate": float(view.get("current_margin_rate") or analysis.get("net_margin") or 0),
-        "net_profit": float(analysis.get("net_profit") or 0),
-        "roi": float(analysis.get("roi") or 0),
-        "missing_fields": list(analysis.get("missing_fields") or []),
-        "url": str(view.get("url") or ""),
-        "main_image_url": str(view.get("main_image_url") or ""),
+        "current_price": float(view.get("current_price") or 0), "currency": str(view.get("currency") or "RUB"), "price_source": price_source,
+        "updated_at": view.get("updated_at"), "current_margin_rate": margin,
+        "net_profit": float(analysis.get("net_profit") or 0), "roi": float(analysis.get("roi") or 0), "missing_fields": list(analysis.get("missing_fields") or []),
+        "url": str(view.get("url") or ""), "main_image_url": str(view.get("main_image_url") or ""),
     }
 
 
 def _trace_summary(trace: list[dict[str, Any]]) -> list[str]:
     labels = []
     for item in trace:
-        if item.get("event") == "tool_finished":
+        if item.get("event") in {"tool_finished", "tool_reused"}:
             label = str(item.get("business_label") or item.get("tool") or "")
             if label and label not in labels:
                 labels.append(label)
@@ -296,6 +372,107 @@ def _trace_summary(trace: list[dict[str, Any]]) -> list[str]:
 
 def _unique(items: list[str], limit: int = 8) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))[:limit]
+
+
+def _response_type(parsed: ParsedIntent, ambiguity: list[dict[str, Any]], products: list[dict[str, Any]], data_sufficiency: dict[str, Any] | None) -> str:
+    if parsed.name in {"company_product_count", "product_price"}:
+        return "simple_fact" if parsed.name == "company_product_count" or products else "clarification"
+    if parsed.name in {"compliance_policy", "recommendation_policy"}:
+        return "policy_answer"
+    if parsed.name == "product_filter":
+        return "filter_result"
+    if ambiguity and not products:
+        return "clarification"
+    if parsed.name in {"profit_comparison", "product_comparison"}:
+        return "comparison_result" if len(products) >= 2 else "clarification"
+    if parsed.name == "selection_recommendation":
+        return "decision_report"
+    if data_sufficiency and data_sufficiency.get("status") == "INSUFFICIENT_DATA":
+        return "insufficient_data"
+    return "product_detail" if products else "clarification"
+
+
+def _display_scope(response_type: str, dimensions: tuple[str, ...]) -> list[str]:
+    if response_type == "simple_fact":
+        return ["answer", "fact", "source", "timestamp"]
+    if response_type == "policy_answer":
+        return ["answer", "policy", "source"]
+    if response_type == "clarification":
+        return ["answer"]
+    if response_type == "insufficient_data":
+        return ["answer", "product", "data_sufficiency", "evidence", "warnings", "source", "tool_summary"]
+    if response_type == "filter_result":
+        return ["answer", "filter_criteria", "products", *dimensions, "evidence", "source", "tool_summary"]
+    if response_type == "comparison_result":
+        return ["answer", "products", *dimensions, "hard_gates", "evidence", "warnings", "source", "tool_summary"]
+    if response_type == "decision_report":
+        return ["answer", "products", "recommendation", "decision", "evidence", "warnings", "missing_data", "next_actions", "human_review", "source", "tool_summary"]
+    return ["answer", "product", *dimensions, "evidence", "warnings", "missing_data", "next_actions", "human_review", "source", "tool_summary"]
+
+
+def _source_name(lineage_value: Any, fallback: str) -> str:
+    if isinstance(lineage_value, dict):
+        return str(lineage_value.get("source") or fallback)
+    return str(lineage_value or fallback)
+
+
+def _scoped_risk_message(view: dict[str, Any], item: dict[str, Any]) -> str:
+    code = str(item.get("code") or "")
+    message = str(item.get("message") or "")
+    if code in {"STATIC_SALES_GROWTH_DECLINE", "DECLINING_DEMAND"} or "销量趋势明显下降" in message:
+        lineage = view.get("field_lineage") or {}
+        source = _source_name(lineage.get("sales_growth_rate"), str(view.get("sales_source") or "product_master"))
+        return f"{view.get('title')}：企业报告记录销量增速 {float(view.get('sales_growth_rate') or 0):.1f}%（来源：{source}）；该指标不是系统快照趋势。"
+    return f"{view.get('title')}：{message}"
+
+
+def _tool_result_contract(executions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    contracted: list[dict[str, Any]] = []
+    for item in executions:
+        raw = item.get("result") or {}
+        data = raw.get("data")
+        if isinstance(data, list):
+            summary: dict[str, Any] = {
+                "success": bool(raw.get("success")),
+                "matched_count": int(raw.get("matched_count", len(data))),
+                "displayed_count": int(raw.get("displayed_count", len(data))),
+                "product_ids": [str(row.get("id") or row.get("product_id")) for row in data if isinstance(row, dict) and (row.get("id") or row.get("product_id"))],
+            }
+        elif isinstance(data, dict):
+            summary = {"success": bool(raw.get("success"))}
+            for key in ("count", "product_id", "snapshot_count", "snapshot_trend", "data_sufficiency"):
+                if key in data:
+                    summary[key] = data[key]
+            if "id" in data:
+                summary["product_id"] = data["id"]
+        else:
+            summary = {"success": bool(raw.get("success"))}
+        if raw.get("error_code"):
+            summary["error_code"] = raw["error_code"]
+        contracted.append({
+            "tool_name": str(item.get("tool_name") or ""),
+            "normalized_args": item.get("normalized_args") or {},
+            "status": str(item.get("status") or "unknown"),
+            "result": summary,
+        })
+    return contracted
+
+
+def _overall_decision_status(intent: str, products: list[dict[str, Any]]) -> str:
+    if intent == "compliance_policy":
+        return "BLOCKED"
+    if intent == "recommendation_policy":
+        return "POLICY_ONLY"
+    if not products:
+        return "NOT_APPLICABLE"
+    statuses = [str(item.get("decision_status") or "REVIEW_REQUIRED") for item in products]
+    if len(set(statuses)) == 1:
+        return statuses[0]
+    if "BLOCKED" in statuses:
+        return "MIXED_WITH_BLOCKED"
+    if "RECOMMENDED" in statuses:
+        return "MIXED"
+    return "REVIEW_REQUIRED"
 
 
 async def _ensure_conversation(session: AsyncSession, company_id: str, user_id: str, query: str, session_id: str | None) -> ConversationSession:
@@ -308,179 +485,298 @@ async def _ensure_conversation(session: AsyncSession, company_id: str, user_id: 
 
 
 async def agent_v1_ask(
-    session: AsyncSession,
-    company_id: str,
-    user_id: str,
-    role: str,
-    query: str,
-    session_id: str | None,
-    selected_product_ids: list[str] | None = None,
-    record_user_message: bool = True,
-    response_mode: str = "rule_engine",
-    fallback_reason: str | None = None,
-    provider_notice: str = "",
-    trace_prefix: list[dict[str, Any]] | None = None,
-    active_model_override: str | None = None,
-    token_usage_override: dict[str, Any] | None = None,
-    model_summary: str = "",
+    session: AsyncSession, company_id: str, user_id: str, role: str, query: str, session_id: str | None,
+    selected_product_ids: list[str] | None = None, record_user_message: bool = True, response_mode: str = "rule_engine",
+    fallback_reason: str | None = None, provider_notice: str = "", trace_prefix: list[dict[str, Any]] | None = None,
+    active_model_override: str | None = None, token_usage_override: dict[str, Any] | None = None, model_summary: str = "",
+    run_state: AgentRunState | None = None,
 ) -> dict:
     started = time.perf_counter()
+    run_id = uid()
     repo = ProductRepository(session, company_id)
     trace: list[dict[str, Any]] = list(trace_prefix or [])
     conversation = await _ensure_conversation(session, company_id, user_id, query, session_id)
     session_id = conversation.id
     if record_user_message:
         session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"selected_product_ids": selected_product_ids or []}))
+
+    parsed = parse_intent(query, selected_product_ids)
+    state = run_state or AgentRunState(parsed.policy)
     all_products = await repo.list(limit=500)
-    explicit_ids = list(dict.fromkeys(selected_product_ids or []))
-    if not explicit_ids and any(token in query for token in ("刚才", "那个", "它", "这两个", "相比")):
-        explicit_ids = list(conversation.last_product_ids or [])
-    matched_targets = select_targets(all_products, query, explicit_ids, limit=10)
-    parsed: ParsedIntent = parse_intent(query, [item.id for item in matched_targets] if matched_targets else explicit_ids)
-    event(trace, "planning_finished", "planner", f"已识别业务意图：{parsed.name}。", plan=list(parsed.plan))
+    resolution: EntityResolution = resolve_query_entities(all_products, query, 10)
+    target_source = "query_entity" if resolution.products else "none"
+    targets = resolution.products
+    if not targets and parsed.selected_product_ids:
+        by_id = {item.id: item for item in all_products}
+        targets = [by_id[item] for item in parsed.selected_product_ids if item in by_id]
+        target_source = "explicit_selection" if targets else "none"
+    if not targets and parsed.policy.selection_mode != "ignore" and any(token in query for token in ("刚才", "那个", "它", "这两个", "这几个", "这4个", "这四个", "相比")):
+        by_id = {item.id: item for item in all_products}
+        targets = [by_id[item] for item in conversation.last_product_ids or [] if item in by_id]
+        target_source = "session_reference" if targets else "none"
+
+    event(trace, "planning_finished", "planner", f"已识别业务意图：{parsed.name}。", plan=list(parsed.plan), requested_dimensions=list(parsed.policy.requested_dimensions), selection_source=target_source)
+
+    async def execute(tool_name: str, arguments: dict[str, Any], runner: Callable[[], Awaitable[dict[str, Any]]], summary: str) -> dict:
+        spec = TOOL_REGISTRY.require(tool_name)
+        normalized = spec.input_schema.model_validate(arguments).model_dump()
+
+        async def validated_runner() -> dict[str, Any]:
+            raw = await runner()
+            try:
+                return spec.output_schema.model_validate(raw).model_dump(mode="python")
+            except ValidationError:
+                return tool_error(tool_name, "INVALID_TOOL_RESULT", "工具返回结果未通过后端 Schema 校验。")
+
+        result, reused = await state.execute(tool_name, normalized, validated_runner)
+        if reused:
+            event(trace, "tool_reused", tool_name, f"复用本次任务已完成结果：{summary}", success=result.get("success", False))
+        else:
+            event(trace, "tool_finished", tool_name, summary, success=result.get("success", False), error_code=result.get("error_code"))
+        return result
 
     views: list[dict[str, Any]] = []
     simulation: dict[str, Any] | None = None
+    data_sufficiency: dict[str, Any] | None = None
     historical_matches: list[dict[str, Any]] = []
-    if parsed.name in {"score_filter", "constraint_filter", "top_selection", "incomplete_products", "portfolio_overview"}:
-        event(trace, "tool_started", "filter_products", "按业务条件筛选企业候选。")
-        result = await filter_products(repo, role, **parsed.filters, limit=parsed.limit)
+    matched_count_override: int | None = None
+    total_count_override: int | None = None
+    displayed_count_override: int | None = None
+    filter_criteria: dict[str, Any] = {}
+    ambiguity = resolution.ambiguous
+
+    if ambiguity and not targets and parsed.name not in {"company_product_count", "product_filter", "compliance_policy", "recommendation_policy", "selection_recommendation"}:
+        event(trace, "entity_ambiguous", "entity_resolver", "商品名称存在真实歧义，需要用户确认。", candidates=ambiguity)
+    elif parsed.name == "company_product_count":
+        result = await execute("count_products", {}, lambda: count_products(repo, role), "已统计当前企业商品主档总数。")
+        matched_count_override = int((result.get("data") or {}).get("count") or 0)
+    elif parsed.name in {"compliance_policy", "recommendation_policy"}:
+        pass
+    elif parsed.name == "product_filter":
+        args = {**parsed.filters, "limit": parsed.limit}
+        result = await execute("filter_products", args, lambda: filter_products(repo, role, **args), "已按用户明确条件完成确定性筛选。")
         views = result.get("data", []) if result.get("success") else []
-        event(trace, "tool_finished", "filter_products", f"筛选得到 {len(views)} 个商品。")
-    elif parsed.name == "comparison":
-        ids = [item.id for item in matched_targets]
-        if len(ids) >= 2:
-            event(trace, "tool_started", "compare_products", "读取明确选择的商品进行横向比较。")
-            compared = await compare_products(repo, ids[:10], role)
-            views = compared.get("data", []) if compared.get("success") else []
-            event(trace, "tool_finished", "compare_products", f"已比较 {len(views)} 个商品。")
-            for view in views:
-                product_id = view["id"]
-                event(trace, "tool_started", "calculate_profit", f"核算 {view['title']} 的利润。", product_id=product_id)
-                await calculate_profit(repo, product_id, role)
-                event(trace, "tool_finished", "calculate_profit", f"已核算 {view['title']} 的利润。", product_id=product_id)
-                event(trace, "tool_started", "analyze_competition", f"核验 {view['title']} 的竞争证据。", product_id=product_id)
-                await analyze_competition(repo, product_id, role)
-                event(trace, "tool_finished", "analyze_competition", f"已核验 {view['title']} 的竞争证据。", product_id=product_id)
+        if result.get("success"):
+            filter_criteria = result.get("criteria") or {}
+            matched_count_override = int(result.get("matched_count", len(views)))
+            total_count_override = int(result.get("total_count", matched_count_override))
+            displayed_count_override = int(result.get("displayed_count", len(views)))
+    elif parsed.name == "selection_recommendation":
+        if targets:
+            ids = [item.id for item in targets[:10]]
+            selected_result = await execute("compare_products", {"product_ids": ids}, lambda: compare_products(repo, ids, role), "已读取明确选择的候选并进行确定性排序。")
+            views = selected_result.get("data", []) if selected_result.get("success") else []
             views.sort(key=lambda item: float((item.get("analysis") or {}).get("recommendation_score") or 0), reverse=True)
-    elif parsed.name == "price_simulation":
-        target = matched_targets[0] if matched_targets else None
+            views = views[:parsed.limit]
+        else:
+            args = {**parsed.filters, "limit": parsed.limit}
+            result = await execute("filter_products", args, lambda: filter_products(repo, role, **args), "已生成当前候选的确定性优先级。")
+            views = result.get("data", []) if result.get("success") else []
+            if result.get("success"):
+                filter_criteria = result.get("criteria") or {}
+                total_count_override = int(result.get("total_count", len(views)))
+    elif parsed.name in {"profit_comparison", "product_comparison"}:
+        ids = [item.id for item in targets][:parsed.limit]
+        if len(ids) >= 2:
+            result = await execute("compare_products", {"product_ids": ids}, lambda: compare_products(repo, ids, role), "已读取明确解析的比较商品。")
+            views = result.get("data", []) if result.get("success") else []
+            if parsed.name == "profit_comparison":
+                for view in views:
+                    product_id = str(view["id"])
+                    await execute("calculate_profit", {"product_id": product_id}, lambda product_id=product_id: calculate_profit(repo, product_id, role), f"已核算 {view['title']} 的利润与 ROI。")
+            views.sort(key=lambda item: float((item.get("analysis") or {}).get("recommendation_score") or 0), reverse=True)
+    elif parsed.name == "product_price":
+        if len(targets) == 1:
+            target = targets[0]
+            result = await execute("get_product", {"product_id": target.id}, lambda: get_product(repo, target.id, role), f"已读取 {target.title} 的价格。")
+            if result.get("success"):
+                views = [result["data"]]
+    else:
+        target = targets[0] if len(targets) == 1 else None
         if target and parsed.proposed_price is not None:
-            detail = await get_product(repo, target.id, role)
+            detail = await execute("get_product", {"product_id": target.id}, lambda: get_product(repo, target.id, role), f"已读取 {target.title}。")
             if detail.get("success"):
                 views = [detail["data"]]
-            event(trace, "tool_started", "simulate_price_change", f"按 {parsed.proposed_price:g} RUB 重算利润与风险。", product_id=target.id)
-            result = await simulate_price_change(repo, target.id, parsed.proposed_price, role)
+            result = await execute("simulate_price_change", {"product_id": target.id, "proposed_price": parsed.proposed_price}, lambda: simulate_price_change(repo, target.id, float(parsed.proposed_price), role), "价格情景模拟完成。")
             simulation = result.get("data") if result.get("success") else None
-            event(trace, "tool_finished", "simulate_price_change", "价格情景模拟完成。", product_id=target.id)
-    elif parsed.name == "historical_failure":
-        targets = matched_targets or select_targets(all_products, query, conversation.last_product_ids or [], limit=3)
-        for target in targets:
+        elif target and "sales_snapshot" in parsed.policy.requested_dimensions:
+            detail = await execute("get_product", {"product_id": target.id}, lambda: get_product(repo, target.id, role), f"已读取 {target.title}。")
+            if detail.get("success"):
+                views = [detail["data"]]
+            trend = await execute("get_sales_trend", {"product_id": target.id}, lambda: get_sales_trend(repo, target.id, role), "已核验销量快照数量与趋势充分性。")
+            data_sufficiency = (trend.get("data") or {}).get("data_sufficiency") if trend.get("success") else None
+        elif target and "history" in parsed.policy.requested_dimensions:
             view = product_view(target, await repo.latest_analysis(target.id))
-            views.append(view)
-            event(trace, "tool_started", "find_historical_failures", f"查询 {target.title} 的相似失败案例。", product_id=target.id)
-            result = await find_historical_failures(session, company_id, target, role)
+            if not view.get("analysis"):
+                view["analysis"] = to_dict(analyze(target))
+            views = [view]
+            result = await execute("find_historical_failures", {"product_id": target.id}, lambda: find_historical_failures(session, company_id, target, role), f"已查询 {target.title} 的相似失败案例。")
             historical_matches.extend(result.get("data", []))
-            event(trace, "tool_finished", "find_historical_failures", f"找到 {len(result.get('data', []))} 条相似失败记录。", product_id=target.id)
-        event(trace, "tool_started", "search_company_memory", "检索企业保存的失败原因。")
-        memory_result = await search_company_memory(session, company_id, query, role)
-        event(trace, "tool_finished", "search_company_memory", f"检索到 {len(memory_result.get('data', []))} 条企业记忆。")
-    else:
-        targets = matched_targets[:1]
-        if targets:
-            target = targets[0]
-            for tool_name, call in [
-                ("get_product", lambda: get_product(repo, target.id, role)),
-                ("calculate_profit", lambda: calculate_profit(repo, target.id, role)),
-                ("get_sales_trend", lambda: get_sales_trend(repo, target.id, role)),
-                ("analyze_competition", lambda: analyze_competition(repo, target.id, role)),
-            ]:
-                event(trace, "tool_started", tool_name, f"处理 {target.title}。", product_id=target.id)
-                result = await call()
-                event(trace, "tool_finished", tool_name, f"已完成 {BUSINESS_TOOL_LABELS[tool_name]}。", product_id=target.id)
-                if tool_name == "get_product" and result.get("success"):
-                    views = [result["data"]]
-        else:
-            event(trace, "tool_started", "filter_products", "读取当前最高优先级候选。")
-            result = await filter_products(repo, role, sort_by="recommendation_score", sort_direction="desc", limit=5)
-            views = result.get("data", []) if result.get("success") else []
-            event(trace, "tool_finished", "filter_products", f"读取到 {len(views)} 个候选。")
+            memory = await execute("search_company_memory", {"query": query}, lambda: search_company_memory(session, company_id, query, role), "已检索企业保存的失败原因。")
+            historical_matches.extend({"title": "企业记忆", "reason": item.get("content", "")} for item in memory.get("data", []))
+        elif target:
+            detail = await execute("get_product", {"product_id": target.id}, lambda: get_product(repo, target.id, role), f"已读取 {target.title}。")
+            if detail.get("success"):
+                views = [detail["data"]]
+            if "profit" in parsed.policy.requested_dimensions:
+                await execute("calculate_profit", {"product_id": target.id}, lambda: calculate_profit(repo, target.id, role), f"已核算 {target.title} 的利润与 ROI。")
 
     products = [_agent_product(view) for view in views]
-    missing_data = []
-    risk_messages: list[str] = []
+    response_type = _response_type(parsed, ambiguity, products, data_sufficiency)
+    display_scope = _display_scope(response_type, parsed.policy.requested_dimensions)
+    missing_data: list[dict[str, Any]] = []
+    warning_messages: list[str] = []
     actions: list[str] = []
-    evidence = []
-    for view in views:
+    evidence: list[dict[str, Any]] = []
+    for view, product in zip(views, products):
         analysis = view.get("analysis") or {}
+        requested = set(parsed.policy.requested_dimensions)
+        include_all_decision_evidence = response_type == "decision_report" or "detail" in requested
         for item in analysis.get("missing_data") or []:
-            missing_data.append({"product_id": view.get("id"), "title": view.get("title"), **item})
-            actions.append(str(item.get("action") or ""))
-        for item in analysis.get("risks") or []:
-            risk_messages.append(f"{view.get('title')}：{item.get('message')}")
-        evidence.append({"product_id": str(view.get("id") or ""), "title": str(view.get("title") or ""), "source": "company_product_database", "summary": f"推荐度 {float(analysis.get('recommendation_score') or 0):.1f}，完整度 {int((analysis.get('evidence_completeness') or {}).get('percent') or 0)}%，风险 {analysis.get('risk_level', 'unknown')}。", "url": str(view.get("url") or "")})
+            dimension = str(item.get("dimension") or "")
+            if include_all_decision_evidence or dimension in requested or (dimension == "profit" and "roi" in requested):
+                missing_data.append({"product_id": view.get("id"), "title": view.get("title"), **item})
+                actions.append(str(item.get("action") or ""))
 
-    if parsed.name == "score_filter":
-        threshold = float(parsed.filters.get("min_score") or 0)
-        answer = f"企业内共有 {len(products)} 个商品的动态推荐度达到 {threshold:g} 分以上，已按分数从高到低排列。"
-    elif parsed.name == "constraint_filter":
-        margin = float(parsed.filters.get("min_margin_rate") or 0)
-        saturation = parsed.filters.get("max_market_saturation")
-        constraint = f"净利率不低于 {margin:.0%}" + (f"、市场饱和度不高于 {float(saturation):g}" if saturation is not None else "")
-        answer = f"企业内共有 {len(products)} 个商品满足{constraint}，筛选和计算均由后端完成。"
-    elif parsed.name == "top_selection":
-        answer = f"已从企业候选池选出最值得测试的 {len(products)} 个商品；第一名是 {products[0]['title']}（{products[0]['score']:.1f} 分）。" if products else "当前没有满足条件的可测试商品。"
-    elif parsed.name == "incomplete_products":
-        answer = f"共有 {len(products)} 个商品因关键证据不完整，当前不能进入最终审核。"
-    elif parsed.name == "comparison":
-        answer = f"已完成 {len(products)} 个商品的利润、需求、竞争、合规和风险对比；当前综合领先的是 {products[0]['title']}。" if products else "需要明确选择至少两个本企业商品后才能比较。"
-    elif parsed.name == "price_simulation":
-        answer = f"售价调整为 {simulation['proposed_price']:g} RUB 后，单件净利润为 {simulation['net_profit']:.2f} RUB，净利率为 {simulation['margin_rate']:.1%}，推荐等级为 {simulation['recommendation_grade']}。" if simulation else "需要明确选择一个商品并给出目标售价后才能模拟。"
-    elif parsed.name == "historical_failure":
-        answer = f"企业历史中找到 {len(historical_matches)} 条相似失败商品记录；失败原因必须由人工结合当前证据复核。"
-        risk_messages.extend(f"历史案例 {item['title']}：{item['reason']}" for item in historical_matches[:5])
+        if response_type == "simple_fact" and parsed.name == "product_price":
+            evidence.append({
+                "product_id": product["id"], "title": product["title"], "source": product["price_source"],
+                "summary": f"当前售价 {product['current_price']:g} {product['currency']}，来自商品主档价格字段。", "url": product["url"],
+            })
+        elif response_type == "filter_result":
+            conditions = []
+            if filter_criteria.get("min_margin_rate") is not None: conditions.append(f"净利率 {product['current_margin_rate']:.1%}")
+            if filter_criteria.get("risk_level"): conditions.append(f"风险 {product['risk_level']}")
+            if filter_criteria.get("compliance_status"): conditions.append(f"合规 {view.get('compliance_status')}")
+            if filter_criteria.get("min_score") is not None: conditions.append(f"推荐度 {product['score']:.1f}")
+            evidence.append({
+                "product_id": product["id"], "title": product["title"], "source": "deterministic_filter_result",
+                "summary": "；".join(conditions) or "符合本次结构化筛选条件。", "url": product["url"],
+            })
+        elif response_type == "comparison_result" and parsed.name == "profit_comparison":
+            evidence.append({
+                "product_id": product["id"], "title": product["title"], "source": "deterministic_profit_engine",
+                "summary": f"净利润 {product['net_profit']:.2f} {product['currency']}，净利率 {product['current_margin_rate']:.1%}，ROI {product['roi']:.1%}。", "url": product["url"],
+            })
+            if product["decision_status"] == "BLOCKED":
+                warning_messages.append(f"{product['title']}：合规未通过，任何利润排名都不能绕过上架阻断。")
+        elif response_type == "insufficient_data":
+            evidence.append({
+                "product_id": product["id"], "title": product["title"], "source": "product_snapshot_repository",
+                "summary": f"已保存 {int((data_sufficiency or {}).get('snapshot_count', 0))} 次销量快照，其中有效 {int((data_sufficiency or {}).get('valid_sales_snapshot_count', 0))} 次。", "url": product["url"],
+            })
+        else:
+            evidence.append({
+                "product_id": product["id"], "title": product["title"], "source": "company_product_database",
+                "summary": f"推荐度 {product['score']:.1f}，完整度 {product['completeness']}%，风险 {product['risk_level']}。", "url": product["url"],
+            })
+            if response_type in {"decision_report", "product_detail"} and (include_all_decision_evidence or "risk" in requested):
+                warning_messages.extend(_scoped_risk_message(view, item) for item in analysis.get("risks") or [])
+
+    if data_sufficiency and data_sufficiency.get("status") == "INSUFFICIENT_DATA":
+        reported = data_sufficiency.get("reported_metric")
+        source = data_sufficiency.get("reported_metric_source") or "not_provided"
+        snapshot_count = int(data_sufficiency.get("snapshot_count") or 0)
+        if reported is not None and source != "not_provided":
+            warning_messages.append(f"企业报告记录销量增速 {float(reported):.1f}%（来源：{source}），但当前只有 {snapshot_count} 次销量快照，无法据此验证快照趋势。")
+        if data_sufficiency.get("stale"):
+            warning_messages.append("最近一次销量快照已超过 30 天，不能代表当前销量趋势。")
+
+    recommended = [item for item in products if item["decision_status"] == "RECOMMENDED"]
+    decision_summary = {
+        "ranked_count": len(products), "recommended_count": len(recommended),
+        "blocked_count": sum(item["decision_status"] == "BLOCKED" for item in products),
+        "formal_recommendation": "AVAILABLE" if recommended else "NONE",
+        "statuses": {item["id"]: item["decision_status"] for item in products},
+    }
+    if ambiguity and not targets:
+        candidates = [item["title"] for group in ambiguity for item in group.get("candidates", [])]
+        answer = f"商品名称存在歧义，请确认具体商品：{'、'.join(_unique(candidates))}。"
+    elif parsed.name == "company_product_count":
+        answer = f"目前公司商品主档一共有 {matched_count_override or 0} 个。"
+    elif parsed.name == "compliance_policy":
+        answer = "不能直接上架。合规未通过属于硬性阻断（BLOCKED），必须补齐材料并由人工重新审核通过后，才可进入上架流程。"
+    elif parsed.name == "recommendation_policy":
+        answer = "不是。相对排名第一只表示候选集中表现最好，不代表达到正式推荐标准。评分、相对排名、正式推荐状态和最终上架决策彼此独立；合规失败、证据不足或高风险均不能被‘必须推荐一个’绕过。"
+    elif parsed.name == "product_filter":
+        answer = f"符合全部条件的商品共有 {matched_count_override or 0} 个，清单与数量来自同一次后端 AND 筛选结果。"
+    elif parsed.name == "selection_recommendation":
+        if not products:
+            answer = "当前没有符合筛选条件的候选商品。"
+        elif recommended:
+            answer = f"正式达到推荐标准的商品有 {len(recommended)} 个；当前第一名是 {products[0]['title']}（{products[0]['score']:.1f} 分）。"
+        else:
+            answer = f"相对排名第一的是 {products[0]['title']}（{products[0]['score']:.1f} 分），但当前无商品达到正式推荐标准。"
+    elif parsed.name in {"profit_comparison", "product_comparison"}:
+        dimension = "利润与 ROI" if parsed.name == "profit_comparison" else "利润、需求、竞争、合规与风险"
+        answer = f"已完成 {len(products)} 个明确商品的{dimension}对比；相对排名第一的是 {products[0]['title']}。" if products else "需要明确选择或点名至少两个本企业商品后才能比较。"
+    elif parsed.name == "product_price":
+        answer = f"{products[0]['title']} 当前售价为 {products[0]['current_price']:g} RUB。" if products else "没有唯一识别到该商品，请补充完整商品名称。"
+    elif simulation:
+        answer = f"售价调整为 {simulation['proposed_price']:g} RUB 后，单件净利润为 {simulation['net_profit']:.2f} RUB，净利率为 {simulation['margin_rate']:.1%}，推荐等级为 {simulation['recommendation_grade']}。"
+    elif data_sufficiency:
+        status = data_sufficiency.get("status")
+        count = int(data_sufficiency.get("snapshot_count") or 0)
+        observed = str(data_sufficiency.get("observed_trend") or "INSUFFICIENT_DATA")
+        labels = {"GROWING": "上涨", "DECLINING": "下降", "FLAT": "持平"}
+        answer = f"{products[0]['title']} 当前有 {count} 次销量快照，证据不足，无法判断上涨或下降；快照趋势状态为 INSUFFICIENT_DATA。" if products and status == "INSUFFICIENT_DATA" else f"{products[0]['title']} 当前有 {count} 次销量快照，系统观察到的快照趋势为{labels.get(observed, observed)}（{observed}）。"
+    elif historical_matches:
+        answer = f"企业历史中找到 {len(historical_matches)} 条相关失败记录，失败原因需结合当前证据人工复核。"
+        warning_messages.extend(f"历史案例 {item.get('title', '')}：{item.get('reason', '')}" for item in historical_matches[:5])
+    elif products and "profit" in parsed.policy.requested_dimensions:
+        answer = f"{products[0]['title']} 单件净利润为 {products[0]['net_profit']:.2f} RUB，净利率 {products[0]['current_margin_rate']:.1%}，ROI {products[0]['roi']:.1%}。"
     elif products:
-        answer = f"{products[0]['title']} 当前动态推荐度为 {products[0]['score']:.1f}，等级 {('S' if products[0]['score'] >= 85 else 'A' if products[0]['score'] >= 75 else 'B' if products[0]['score'] >= 60 else 'C')}；结论仍需人工审核。"
+        answer = f"{products[0]['title']} 当前动态推荐度为 {products[0]['score']:.1f}，决策状态为 {products[0]['decision_status']}；最终动作仍需人工审核。"
     else:
-        answer = "当前企业数据中没有识别到可分析商品，请选择商品或补充更明确的名称。"
+        answer = "当前企业数据中没有唯一识别到可分析商品，请补充完整商品名称或明确选择商品。"
 
     source_badge = "GLM 实际调用成功" if response_mode == "glm_success" else "确定性 Planner 回退" if response_mode == "deterministic_fallback" else "规则引擎结果"
     latency_ms = round((time.perf_counter() - started) * 1000)
+    matched_count = matched_count_override if matched_count_override is not None else len(products)
+    total_count = total_count_override if total_count_override is not None else matched_count
+    displayed_count = displayed_count_override if displayed_count_override is not None else len(products)
+    fact = None
+    if parsed.name == "company_product_count":
+        fact = {"name": "company_product_count", "value": matched_count, "unit": "products", "source": "company_product_database"}
+    elif parsed.name == "product_price" and products:
+        product = products[0]
+        fact = {"name": "product_price", "value": product["current_price"], "unit": "price", "product_id": product["id"], "currency": product["currency"], "source": product["price_source"], "timestamp": product["updated_at"]}
+    entities = [{"product_id": item.id, "name": item.title, "resolution_method": target_source} for item in targets if target_source != "none"]
+    decision_status = _overall_decision_status(parsed.name, products)
+    human_review_required = (
+        parsed.name == "compliance_policy"
+        or response_type == "decision_report"
+        or (response_type == "product_detail" and decision_status in {"BLOCKED", "INSUFFICIENT_DATA", "HUMAN_REVIEW_REQUIRED", "REVIEW_REQUIRED"})
+    )
+    scoped_actions = _unique(actions)
+    if response_type == "decision_report" and not scoped_actions:
+        scoped_actions = ["查看商品证据后，由企业审核人决定是否进入下一阶段。"]
     payload = {
-        "session_id": session_id,
-        "answer": answer,
-        "matched_count": len(products),
-        "products": products,
-        "evidence": evidence,
-        "risks": _unique(risk_messages),
-        "missing_data": missing_data,
-        "next_actions": _unique(actions) or ["查看商品证据后，由企业审核人决定是否进入下一阶段。"],
-        "requires_human_review": True,
-        "tool_trace_summary": _trace_summary(trace),
-        "response_mode": response_mode,
-        "source_badge": source_badge,
-        "active_provider": "deterministic_planner" if response_mode != "glm_success" else "zhipu",
-        "active_model": active_model_override or ("agent-v2-rule-planner" if response_mode != "glm_success" else "glm"),
-        "fallback_reason": fallback_reason,
-        "latency_ms": latency_ms,
-        "token_usage": token_usage_override or {},
-        "intent": parsed.name,
-        "mode": "zhipu_controlled_function_calling" if response_mode == "glm_success" else "agent_v2_deterministic_fallback" if response_mode == "deterministic_fallback" else "agent_v2_rule_engine",
-        "conclusion": answer,
-        "trace": trace,
-        "simulation": simulation,
-        "data_completeness": (views[0].get("analysis") or {}).get("evidence_completeness") if views else None,
-        "provider_notice": provider_notice,
-        "model_summary": model_summary,
+        "run_id": run_id, "session_id": session_id, "response_type": response_type, "answer": answer,
+        "matched_count": matched_count, "total_count": total_count, "displayed_count": displayed_count,
+        "entities": entities, "product_ids": [item["id"] for item in products], "filter_criteria": filter_criteria, "fact": fact,
+        "products": products, "tool_results": _tool_result_contract(state.executions), "evidence": evidence,
+        "risks": _unique(warning_messages), "warnings": _unique(warning_messages), "missing_data": missing_data, "next_actions": scoped_actions,
+        "requires_human_review": human_review_required, "human_review_required": human_review_required,
+        "tool_trace_summary": _trace_summary(trace), "response_mode": response_mode, "source_badge": source_badge,
+        "active_provider": "deterministic_planner" if response_mode != "glm_success" else "zhipu", "active_model": active_model_override or ("agent-v3-rule-planner" if response_mode != "glm_success" else "glm"),
+        "fallback_reason": fallback_reason, "latency_ms": latency_ms, "token_usage": token_usage_override or {}, "intent": parsed.name,
+        "task_completed": response_type not in {"clarification", "error"}, "fallback_used": response_mode == "deterministic_fallback", "tool_call_count": state.actual_tool_calls,
+        "duplicate_tool_execution": state.duplicate_tool_execution, "requested_dimensions": list(parsed.policy.requested_dimensions), "display_scope": display_scope, "selection_source": target_source,
+        "decision_status": decision_status, "decision_summary": decision_summary, "data_sufficiency": data_sufficiency,
+        "mode": "zhipu_controlled_function_calling" if response_mode == "glm_success" else "agent_v3_deterministic_fallback" if response_mode == "deterministic_fallback" else "agent_v3_rule_engine",
+        "conclusion": answer, "trace": trace, "simulation": simulation, "data_completeness": (views[0].get("analysis") or {}).get("evidence_completeness") if views else None,
+        "provider_notice": provider_notice, "model_summary": model_summary,
     }
     validated = validate_agent_answer(payload)
     conversation.last_product_ids = [item["id"] for item in products[:10]]
     conversation.conclusion_summary = answer[:1000]
-    conversation.state_json = {"last_intent": parsed.name, "last_product_ids": conversation.last_product_ids, "last_tool_summary": validated["tool_trace_summary"], "response_mode": response_mode}
+    conversation.state_json = {"last_intent": parsed.name, "last_product_ids": conversation.last_product_ids, "last_tool_summary": validated["tool_trace_summary"], "response_mode": response_mode, "requested_dimensions": list(parsed.policy.requested_dimensions)}
     if not conversation.goal_summary:
         conversation.goal_summary = query[:300]
-    session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="assistant", content=answer, metadata_json={"response_mode": response_mode, "selected_product_ids": conversation.last_product_ids, "tool_trace_summary": validated["tool_trace_summary"], "missing_data": missing_data, "model_summary": model_summary}))
-    session.add(AgentRun(company_id=company_id, user_id=user_id, session_id=session_id, query=query, model=validated["active_model"], active_provider=validated["active_provider"], response_mode=response_mode, fallback_reason=fallback_reason or "", intent=parsed.name, prompt_version="agent-answer-v2", tool_registry_version="v2", tools_used=[item["tool"] for item in trace if item["event"] == "tool_started"], trace_json=trace, answer=answer, latency_ms=latency_ms, token_usage=token_usage_override or {}))
+    execution_log = state.executions
+    session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="assistant", content=answer, metadata_json={"run_id": run_id, "response_type": response_type, "response_mode": response_mode, "selected_product_ids": conversation.last_product_ids, "tool_trace_summary": validated["tool_trace_summary"], "missing_data": missing_data, "warnings": validated["warnings"], "decision_summary": decision_summary}))
+    session.add(AgentRun(id=run_id, company_id=company_id, user_id=user_id, session_id=session_id, query=query, model=validated["active_model"], active_provider=validated["active_provider"], response_mode=response_mode, fallback_reason=fallback_reason or "", intent=parsed.name, prompt_version="agent-run-result-v2", tool_registry_version="v3", tools_used=[item["tool_name"] for item in execution_log if item["status"] in {"success", "failed"}], trace_json=[*trace, {"event": "run_execution_state", "executions": execution_log}], answer=answer, latency_ms=latency_ms, token_usage=token_usage_override or {}))
     await session.commit()
     return validated
 

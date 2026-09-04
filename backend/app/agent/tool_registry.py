@@ -40,7 +40,8 @@ class FilterProductsInput(ToolInput):
     brand: str = Field(default="", max_length=255)
     category: str = Field(default="", max_length=500)
     lifecycle_status: str = Field(default="", max_length=32)
-    risk_level: str = Field(default="", max_length=32)
+    risk_level: Literal["", "low", "medium", "high"] = ""
+    compliance_status: Literal["", "approved", "pending", "rejected"] = ""
     completeness: Literal["all", "complete", "incomplete"] = "all"
     updated_since: datetime | None = None
     sort_by: Literal["recommendation_score", "completeness", "updated_at", "margin_rate"] = "recommendation_score"
@@ -79,6 +80,13 @@ class DictToolOutput(ToolOutput):
 
 class ListToolOutput(ToolOutput):
     data: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FilterProductsOutput(ListToolOutput):
+    criteria: FilterProductsInput
+    total_count: int = Field(ge=0)
+    matched_count: int = Field(ge=0)
+    displayed_count: int = Field(ge=0)
 
 
 class CompareProductsOutput(ListToolOutput):
@@ -217,6 +225,14 @@ def _spec(
 TOOL_REGISTRY = ToolRegistry(
     (
         _spec(
+            "count_products",
+            "确定性统计当前企业商品主档总数，不受当前对比选择影响。",
+            EmptyInput,
+            DictToolOutput,
+            "product.read",
+            READ_ROLES,
+        ),
+        _spec(
             "search_products",
             "在当前企业已保存的商品主档中按标题、品牌或类目检索，不能搜索 Ozon 外网。",
             SearchProductsInput,
@@ -228,7 +244,7 @@ TOOL_REGISTRY = ToolRegistry(
             "filter_products",
             "在当前企业商品库中按分数阈值、品牌、类目、生命周期、风险、完整度和更新时间确定性筛选排序。",
             FilterProductsInput,
-            ListToolOutput,
+            FilterProductsOutput,
             "product.analyze",
             ANALYSIS_ROLES,
         ),

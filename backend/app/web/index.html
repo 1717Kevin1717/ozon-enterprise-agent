@@ -6,7 +6,7 @@
   <meta name="description" content="面向 Ozon 跨境电商团队的企业级 AI 选品与商品决策工作台">
   <title>OZON 商机智选 · 企业选品工作台</title>
   <link rel="stylesheet" href="/static/styles.css?v=20260902-1">
-  <link rel="stylesheet" href="/static/agent-report.css?v=20260902-1">
+  <link rel="stylesheet" href="/static/agent-report.css?v=20260903-2">
 </head>
 <body>
   <svg class="svg-sprite" aria-hidden="true">
@@ -134,6 +134,6 @@
 
   <div id="decisionModal" class="modal hidden"><div class="modal-mask" onclick="closeDecisionModal()"></div><section class="modal-card"><header><div><span class="eyebrow">HUMAN DECISION</span><h2 id="decisionTitle">提交审核结论</h2></div><button class="icon-button" onclick="closeDecisionModal()"><svg><use href="#i-x"/></svg></button></header><div class="decision-options"><button data-action="approve" onclick="chooseDecision('approve',this)"><i class="green">✓</i><span><b>批准进入</b><small>仅在全部闸门通过时可用</small></span></button><button data-action="needs_more_data" onclick="chooseDecision('needs_more_data',this)"><i class="orange">!</i><span><b>退回补数</b><small>保留候选并明确下一步</small></span></button><button data-action="reject" onclick="chooseDecision('reject',this)"><i class="red">×</i><span><b>驳回候选</b><small>记录为企业失败记忆</small></span></button></div><label class="decision-reason">审核原因<textarea id="decisionReason" placeholder="说明判断依据、缺失证据或驳回原因"></textarea></label><footer><button class="secondary-button" onclick="closeDecisionModal()">取消</button><button class="primary-button" id="decisionSubmit" onclick="submitDecision()">提交并留痕</button></footer></section></div>
 
-  <script src="/static/app.js?v=20260902-1"></script>
+  <script src="/static/app.js?v=20260903-2"></script>
 </body>
 </html>

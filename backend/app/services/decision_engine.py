@@ -200,7 +200,12 @@ def analyze(product: Product, strategy_factor: float = 1.0, historical_risk_fact
     if price and net_margin < target_margin:
         risk("MARGIN_BELOW_TARGET", "medium", f"净利率 {net_margin:.1%} 低于目标 {target_margin:.1%}。", "复核成本、广告或调整价格。")
     if _number(product.sales_growth_rate) < -5:
-        risk("DECLINING_DEMAND", "medium", "近30天销量趋势明显下降。", "核对季节性、搜索趋势和转化率。")
+        risk(
+            "STATIC_SALES_GROWTH_DECLINE",
+            "medium",
+            "商品主档记录的外部销量增速为负；这不是多快照计算出的趋势。",
+            "核对该字段来源；至少积累 2 个有效销量快照后再判断快照趋势。",
+        )
     if saturation >= 75:
         risk("MARKET_SATURATION_HIGH", "medium", f"市场饱和度 {saturation:.0f}/100。", "验证差异化卖点和获客成本。")
     if historical_risk_factor < 1:
@@ -220,7 +225,7 @@ def analyze(product: Product, strategy_factor: float = 1.0, historical_risk_fact
 
     score_explanations = {
         "profit": {"score": scores["profit"], "drivers": [f"净利率 {net_margin:.1%}（目标 {target_margin:.1%}）", f"单件净利润 {net_profit:.2f} {product.currency}", f"ROI {roi:.1%}"], "formula": "45%净利率达成 + 35% ROI + 20%利润缓冲"},
-        "demand": {"score": scores["demand"], "drivers": [f"近30天销量 {_number(product.latest_30d_sales):.0f}", f"销量增速 {_number(product.sales_growth_rate):.1f}%", f"评分 {_number(product.rating):.1f} / 评论 {_number(product.review_count):.0f}", f"搜索量 {_number(product.search_volume):.0f}"], "formula": "销量30% + 增速18% + 评分14% + 评论14% + 搜索14% + 趋势10%"},
+        "demand": {"score": scores["demand"], "drivers": [f"近30天销量 {_number(product.latest_30d_sales):.0f}", f"主档外部销量增速 {_number(product.sales_growth_rate):.1f}%（不等同于快照趋势）", f"评分 {_number(product.rating):.1f} / 评论 {_number(product.review_count):.0f}", f"搜索量 {_number(product.search_volume):.0f}"], "formula": "销量30% + 外部增速18% + 评分14% + 评论14% + 搜索14% + 主档趋势分10%"},
         "competition": {"score": scores["competition"], "drivers": [f"竞品 {_number(product.competitor_count):.0f} 个", f"市场饱和度 {saturation:.0f}/100", f"价格位置 {price_position}"], "formula": "竞品数量40% + 价格压力25% + 饱和度25% + 价格位置10%（高分代表竞争更友好）"},
         "compliance": {"score": scores["compliance"], "drivers": [f"合规状态 {product.compliance_status}", f"证书 {len(product.certificates or [])} 项"], "formula": "人工合规状态与证据闸门"},
         "risk": {"score": scores["risk"], "drivers": [f"安全余量 {risk_score:.1f}/100", f"风险项 {len(risks)} 个"], "formula": "100 - 合规/利润/趋势/饱和度/缺失数据扣分（高分代表更安全）"},
@@ -242,6 +247,30 @@ def analyze(product: Product, strategy_factor: float = 1.0, historical_risk_fact
         current_margin_rate=net_margin, expected_profit=net_profit, break_even_price=round(break_even_price, 2), target_price=round(target_price, 2), price_position=price_position,
         strategy_factor=strategy_factor, historical_risk_factor=historical_risk_factor,
     )
+
+
+def recommendation_gate_status(
+    *,
+    compliance_status: str,
+    decision_ready: bool,
+    net_margin: float,
+    target_margin: float,
+    risk_level: str,
+    recommendation: str,
+) -> str:
+    """Return the decision gate status independently from score and relative rank."""
+
+    if compliance_status.casefold() in {"rejected", "未通过"}:
+        return "BLOCKED"
+    if not decision_ready:
+        return "INSUFFICIENT_DATA"
+    if net_margin < target_margin:
+        return "NOT_RECOMMENDED"
+    if risk_level.casefold() == "high":
+        return "HUMAN_REVIEW_REQUIRED"
+    if recommendation == "recommended":
+        return "RECOMMENDED"
+    return "REVIEW_REQUIRED"
 
 
 def simulate_price(product: Product, proposed_price: float) -> dict[str, Any]:

@@ -1,6 +1,21 @@
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+from app.agent.tool_registry import FilterProductsInput
+
+
+SelectionMode = Literal["ignore", "query_first", "selection_required"]
+
+
+@dataclass(frozen=True)
+class IntentPolicy:
+    allowed_tools: tuple[str, ...]
+    max_tool_calls: int
+    requested_dimensions: tuple[str, ...]
+    selection_mode: SelectionMode = "ignore"
+    forbidden_tools: tuple[str, ...] = ()
+    fast_path: bool = False
 
 
 @dataclass(frozen=True)
@@ -11,6 +26,7 @@ class ParsedIntent:
     proposed_price: float | None = None
     selected_product_ids: tuple[str, ...] = ()
     plan: tuple[dict[str, str], ...] = ()
+    policy: IntentPolicy = field(default_factory=lambda: IntentPolicy(("filter_products",), 1, ("recommendation",), fast_path=True))
 
 
 def _number_after(patterns: list[str], query: str) -> float | None:
@@ -21,128 +37,112 @@ def _number_after(patterns: list[str], query: str) -> float | None:
     return None
 
 
+def _policy(tools: tuple[str, ...], max_calls: int, dimensions: tuple[str, ...], *, selection: SelectionMode = "ignore", fast: bool = False) -> IntentPolicy:
+    known = {
+        "count_products", "filter_products", "search_products", "get_product", "compare_products", "calculate_profit",
+        "get_sales_trend", "get_price_trend", "analyze_competition", "simulate_price_change",
+        "find_historical_failures", "search_company_memory", "search_company_knowledge",
+    }
+    return IntentPolicy(tools, max_calls, dimensions, selection, tuple(sorted(known - set(tools))), fast)
+
+
+def _category_filter(query: str) -> str:
+    matches = re.findall(r"[\u4e00-\u9fff]{2,8}(?:用品|产品)", query)
+    for match in matches:
+        cleaned = re.sub(r"^(?:推荐|筛选|选择|找出|找|几个|个|款)+", "", match)
+        if len(cleaned) >= 4:
+            return cleaned
+    return ""
+
+
+def _validated_filters(**values: Any) -> dict[str, Any]:
+    """Use the callable tool schema as the single FilterCriteria contract."""
+
+    return FilterProductsInput.model_validate(values).model_dump(exclude_defaults=True)
+
+
 def parse_intent(query: str, selected_product_ids: list[str] | None = None) -> ParsedIntent:
-    """Parse business intent and deterministic filters without category hard-coding."""
+    """Route explicit query semantics before considering stale UI selection state."""
 
     normalized = " ".join(query.strip().split())
     lowered = normalized.casefold()
     selected = tuple(dict.fromkeys(selected_product_ids or []))[:10]
-    score_threshold = _number_after(
-        [
-            r"(?:分数|评分|推荐度).*?(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上|达到|大于|>=)",
-            r"(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上)",
-        ],
-        normalized,
-    )
-    proposed_price = _number_after(
-        [
-            r"(?:售价|价格|定价).*?(?:到|为|=)\s*(\d+(?:\.\d+)?)",
-            r"(\d+(?:\.\d+)?)\s*(?:rub|卢布)",
-        ],
-        normalized,
-    )
-    top_limit = _number_after(
-        [
-            r"(?:最值得|优先|前|top)\s*(\d+)\s*(?:个|件|款)?",
-            r"选出.*?(\d+)\s*(?:个|件|款)",
-        ],
-        normalized,
-    )
+    comparison_words = any(token in lowered for token in ("比较", "对比", "哪个更", "这两个", "这几个", "这4个", "这四个"))
+    reference_words = any(token in lowered for token in ("刚才", "这个", "那个", "它", "对比中心", "这两个", "这几个", "这4个", "这四个"))
+    profit_only = comparison_words and any(token in lowered for token in ("只看利润", "只比较利润", "仅看利润", "只看roi", "仅看roi", "利润对比"))
+    count_question = bool(re.search(r"(?:公司|企业|商品库)?.*?(?:一共|总共|共有|总数).*?(?:多少|几).*?(?:商品|候选)|(?:公司|企业).*?(?:多少|几).*?(?:商品|候选)", normalized))
+    compliance_policy = "合规" in lowered and any(token in lowered for token in ("能上架", "可以上架", "能不能上架", "没通过", "未通过"))
+    price_lookup = any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "卖多少钱", "现在售价")) and not any(token in lowered for token in ("调整", "改为", "模拟"))
+    snapshot_question = any(token in lowered for token in ("销量快照", "上涨还是下降", "未来销量趋势", "销量趋势"))
+    score_threshold = _number_after([r"(?:分数|评分|推荐度).*?(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上|达到|大于|>=)", r"(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上)"], normalized)
+    proposed_price = _number_after([r"(?:售价|价格|定价).*?(?:到|为|=)\s*(\d+(?:\.\d+)?)", r"(\d+(?:\.\d+)?)\s*(?:rub|卢布)"], normalized)
+    top_limit = _number_after([r"(?:最值得|优先|前|top|推荐)\s*(\d+)\s*(?:个|件|款)?", r"选出.*?(\d+)\s*(?:个|件|款)"], normalized)
     limit = max(1, min(20, int(top_limit or 10)))
-    min_margin_percent = _number_after(
-        [
-            r"(?:净?利润(?:率)?|毛利率).*?(\d+(?:\.\d+)?)\s*%\s*(?:以上|及以上|大于|>=)?",
-            r"(?:净?利润(?:率)?|毛利率).*?(?:达到|大于|>=)\s*(\d+(?:\.\d+)?)",
-        ],
-        normalized,
+    min_margin_percent = _number_after([r"(?:净?利润(?:率)?|毛利率).*?(\d+(?:\.\d+)?)\s*%\s*(?:以上|及以上|大于|≥|>=)?", r"(?:净?利润(?:率)?|毛利率).*?(?:达到|大于|≥|>=)\s*(\d+(?:\.\d+)?)"], normalized)
+    max_saturation = _number_after([r"(?:竞争|饱和度).*?(?:低于|小于|不超过|≤|<=)\s*(\d+(?:\.\d+)?)", r"(?:竞争|饱和度).*?(\d+(?:\.\d+)?)\s*(?:以下|以内)"], normalized)
+    category = _category_filter(normalized)
+    risk_level = (
+        "low" if any(token in lowered for token in ("低风险", "风险低", "风险为低", "风险等级低"))
+        else "medium" if any(token in lowered for token in ("中风险", "风险中等", "风险为中"))
+        else "high" if any(token in lowered for token in ("高风险", "风险高", "风险为高", "风险等级高"))
+        else ""
     )
-    max_saturation = _number_after(
-        [
-            r"(?:竞争|饱和度).*?(?:低于|小于|不超过|<=)\s*(\d+(?:\.\d+)?)",
-            r"(?:竞争|饱和度).*?(\d+(?:\.\d+)?)\s*(?:以下|以内)",
-        ],
-        normalized,
+    compliance_status = "approved" if "合规" in lowered and any(
+        token in lowered for token in ("已通过", "通过商品", "合规通过", "合规状态通过", "状态为通过", "状态已通过")
+    ) else ""
+    ranking_policy = (
+        any(token in lowered for token in ("排名第一", "第一名", "相对排名", "排在第一"))
+        and any(token in lowered for token in ("推荐", "上架"))
+        and any(token in lowered for token in ("代表", "是不是", "是否", "意味着", "等于"))
+    )
+    recommendation_gate_policy = (
+        any(token in lowered for token in ("评分", "分数", "综合分", "必须推荐"))
+        and any(token in lowered for token in ("推荐", "上架"))
+        and any(token in lowered for token in ("证据不足", "数据不足", "高风险", "风险高", "必须推荐"))
     )
 
+    if count_question:
+        return ParsedIntent("company_product_count", plan=({"tool": "count_products", "purpose": "确定性统计当前企业商品总数"},), policy=_policy(("count_products",), 1, ("count",), fast=True))
+    if compliance_policy:
+        return ParsedIntent("compliance_policy", plan=(), policy=_policy((), 0, ("compliance", "decision"), fast=True))
+    if ranking_policy or recommendation_gate_policy:
+        return ParsedIntent("recommendation_policy", plan=(), policy=_policy((), 0, ("recommendation_policy", "decision"), fast=True))
+    if price_lookup:
+        return ParsedIntent("product_price", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一解析商品的价格字段"},), policy=_policy(("get_product",), 1, ("price",), selection="query_first", fast=True))
     if proposed_price is not None and any(token in lowered for token in ("价格", "售价", "定价", "rub", "卢布")):
-        return ParsedIntent(
-            "price_simulation",
-            limit=1,
-            proposed_price=proposed_price,
-            selected_product_ids=selected,
-            plan=(
-                {"tool": "get_product", "purpose": "读取明确选择或问题中匹配的商品"},
-                {"tool": "simulate_price_change", "purpose": "由后端按目标售价重算利润与风险"},
-            ),
-        )
-    if any(token in lowered for token in ("失败", "放弃", "历史案例", "历史上")):
-        return ParsedIntent(
-            "historical_failure",
-            selected_product_ids=selected,
-            plan=(
-                {"tool": "find_historical_failures", "purpose": "匹配本企业历史放弃商品"},
-                {"tool": "search_company_memory", "purpose": "检索已保存的失败原因"},
-            ),
-        )
-    if len(selected) >= 2 or any(token in lowered for token in ("比较", "对比", "哪个更", "这两个", "这些商品")):
-        return ParsedIntent(
-            "comparison",
-            limit=max(2, min(10, len(selected) or 5)),
-            selected_product_ids=selected,
-            plan=(
-                {"tool": "compare_products", "purpose": "读取同一商品主档下的四维分析"},
-                {"tool": "calculate_profit", "purpose": "由后端核算每个商品利润"},
-                {"tool": "analyze_competition", "purpose": "核对竞争证据完整度"},
-            ),
-        )
+        return ParsedIntent("product_detail", proposed_price=proposed_price, selected_product_ids=selected, plan=({"tool": "get_product", "purpose": "读取目标商品"}, {"tool": "simulate_price_change", "purpose": "按目标售价重算利润与风险"}), policy=_policy(("get_product", "simulate_price_change"), 2, ("price", "profit", "risk"), selection="query_first"))
+    if snapshot_question:
+        return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一商品主档"}, {"tool": "get_sales_trend", "purpose": "核验快照数量与趋势充分性"}), policy=_policy(("get_product", "get_sales_trend"), 2, ("sales_snapshot", "data_sufficiency"), selection="query_first", fast=True))
     if any(token in lowered for token in ("数据不完整", "缺数据", "缺失", "不能进入最终审核", "不能审核")):
-        return ParsedIntent(
-            "incomplete_products",
-            filters={"completeness": "incomplete", "sort_by": "completeness", "sort_direction": "asc"},
-            limit=100,
-            selected_product_ids=selected,
-            plan=({"tool": "filter_products", "purpose": "筛选证据不完整且不能进入最终审核的商品"},),
-        )
-    if score_threshold is not None and min_margin_percent is None:
-        return ParsedIntent(
-            "score_filter",
-            filters={"min_score": score_threshold, "sort_by": "recommendation_score", "sort_direction": "desc"},
-            limit=100,
-            selected_product_ids=selected,
-            plan=({"tool": "filter_products", "purpose": "由后端按分数阈值精确筛选并排序"},),
-        )
-    if min_margin_percent is not None or max_saturation is not None:
-        filters: dict[str, Any] = {"sort_by": "margin_rate", "sort_direction": "desc"}
-        if min_margin_percent is not None:
-            filters["min_margin_rate"] = min_margin_percent / 100
-        if max_saturation is not None:
-            filters["max_market_saturation"] = max_saturation
-        return ParsedIntent(
-            "constraint_filter",
-            filters=filters,
-            limit=100,
-            selected_product_ids=selected,
-            plan=({"tool": "filter_products", "purpose": "按利润率和市场竞争约束筛选企业商品"},),
-        )
-    if top_limit is not None or any(token in lowered for token in ("最值得", "优先测试", "高潜", "推荐几个")):
-        return ParsedIntent(
-            "top_selection",
-            filters={"sort_by": "recommendation_score", "sort_direction": "desc"},
-            limit=limit,
-            selected_product_ids=selected,
-            plan=({"tool": "filter_products", "purpose": "按动态推荐度筛选最值得验证的候选"},),
-        )
-    return ParsedIntent(
-        "single_product_decision" if len(selected) == 1 or any(token in lowered for token in ("值得", "要不要", "可以吗", "分析")) else "portfolio_overview",
-        filters={"sort_by": "recommendation_score", "sort_direction": "desc"},
-        limit=1 if len(selected) == 1 else 5,
-        selected_product_ids=selected,
-        plan=(
-            {"tool": "search_products", "purpose": "定位问题中的商品或候选范围"},
-            {"tool": "get_product", "purpose": "读取商品主档和四维分析"},
-            {"tool": "calculate_profit", "purpose": "核对利润口径"},
-            {"tool": "get_sales_trend", "purpose": "读取已保存的销量趋势"},
-            {"tool": "analyze_competition", "purpose": "检查竞争证据"},
-            {"tool": "find_historical_failures", "purpose": "检查历史失败特征"},
-        ),
-    )
+        filters = _validated_filters(completeness="incomplete", sort_by="completeness", sort_direction="asc")
+        return ParsedIntent("product_filter", filters=filters, limit=100, plan=({"tool": "filter_products", "purpose": "筛选证据不完整商品"},), policy=_policy(("filter_products",), 1, ("data_completeness",), fast=True))
+    if score_threshold is not None or min_margin_percent is not None or max_saturation is not None or risk_level or compliance_status:
+        raw_filters: dict[str, Any] = {"sort_by": "margin_rate" if min_margin_percent is not None else "recommendation_score", "sort_direction": "desc"}
+        if score_threshold is not None: raw_filters["min_score"] = score_threshold
+        if min_margin_percent is not None: raw_filters["min_margin_rate"] = min_margin_percent / 100
+        if max_saturation is not None: raw_filters["max_market_saturation"] = max_saturation
+        if risk_level: raw_filters["risk_level"] = risk_level
+        if compliance_status: raw_filters["compliance_status"] = compliance_status
+        if category: raw_filters["category"] = category
+        filters = _validated_filters(**raw_filters)
+        dimensions = ["filters"]
+        if min_margin_percent is not None: dimensions.append("profit")
+        if risk_level: dimensions.append("risk")
+        if compliance_status: dimensions.append("compliance")
+        if max_saturation is not None: dimensions.append("competition")
+        if score_threshold is not None: dimensions.append("recommendation_score")
+        return ParsedIntent("product_filter", filters=filters, limit=100, plan=({"tool": "filter_products", "purpose": "按用户明确条件确定性筛选"},), policy=_policy(("filter_products",), 1, tuple(dimensions), fast=True))
+    if top_limit is not None or any(token in lowered for token in ("最值得上架", "最值得测试", "优先测试", "高潜", "推荐几个", "好的商品", "推荐商品")):
+        filters = {"sort_by": "recommendation_score", "sort_direction": "desc"}
+        if category: filters["category"] = category
+        filters = _validated_filters(**filters)
+        return ParsedIntent("selection_recommendation", filters=filters, limit=limit if top_limit else 5, selected_product_ids=selected if reference_words else (), plan=({"tool": "filter_products", "purpose": "筛选候选池；已有明确选择时改为读取所选商品"},), policy=_policy(("filter_products", "compare_products"), 1, ("recommendation", "decision"), selection="query_first", fast=True))
+    if profit_only:
+        return ParsedIntent("profit_comparison", selected_product_ids=selected if reference_words else (), limit=max(2, min(10, len(selected) or 10)), plan=({"tool": "compare_products", "purpose": "读取已解析商品"}, {"tool": "calculate_profit", "purpose": "仅计算利润与 ROI"}), policy=_policy(("compare_products", "calculate_profit"), 11, ("profit", "roi"), selection="query_first"))
+    if comparison_words:
+        return ParsedIntent("product_comparison", selected_product_ids=selected if reference_words else (), limit=max(2, min(10, len(selected) or 10)), plan=({"tool": "compare_products", "purpose": "比较明确解析或当前引用的商品"},), policy=_policy(("compare_products",), 1, ("profit", "demand", "competition", "compliance", "risk"), selection="query_first"))
+    if any(token in lowered for token in ("失败", "放弃", "历史案例", "历史上")):
+        return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "find_historical_failures", "purpose": "匹配本企业历史放弃商品"}, {"tool": "search_company_memory", "purpose": "检索失败原因"}), policy=_policy(("find_historical_failures", "search_company_memory"), 4, ("history",), selection="query_first"))
+    if any(token in lowered for token in ("利润怎么样", "roi", "利润如何")):
+        return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一商品"}, {"tool": "calculate_profit", "purpose": "核算利润与 ROI"}), policy=_policy(("get_product", "calculate_profit"), 2, ("profit", "roi"), selection="query_first", fast=True))
+    return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一商品主档与分析"},), policy=_policy(("get_product",), 1, ("detail",), selection="query_first", fast=True))
