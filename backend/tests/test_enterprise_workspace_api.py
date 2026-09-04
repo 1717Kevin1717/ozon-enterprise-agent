@@ -97,6 +97,8 @@ def test_viewer_cannot_submit_human_decision():
 
 def test_zhipu_failure_is_audited_and_dashboard_reports_safe_fallback(monkeypatch):
     class FailingAsyncClient:
+        calls = 0
+
         def __init__(self, *args, **kwargs):
             pass
 
@@ -107,6 +109,7 @@ def test_zhipu_failure_is_audited_and_dashboard_reports_safe_fallback(monkeypatc
             return False
 
         async def post(self, *args, **kwargs):
+            self.__class__.calls += 1
             raise RuntimeError("401 Unauthorized")
 
     headers = {**ADMIN_HEADERS, "X-Company-ID": "provider-audit-company"}
@@ -115,14 +118,20 @@ def test_zhipu_failure_is_audited_and_dashboard_reports_safe_fallback(monkeypatc
     monkeypatch.setattr(zhipu_module.settings, "zhipu_api_key", "test-invalid-key")
 
     with TestClient(app) as client:
+        # Provider failure is reachable only after both identities pass the guard.
+        names = ["审计候选甲", "审计候选乙"]
+        for index, name in enumerate(names):
+            created = client.post("/api/v1/products", headers=headers, json={"external_product_id": f"provider-audit-{index}", "title": name, "current_price": 173})
+            assert created.status_code == 201
         answer = client.post(
             "/api/v1/agent/ask",
             headers=headers,
-            json={"query": "比较商品A和商品B"},
+            json={"query": f"比较{names[0]}和{names[1]}"},
         )
         overview = client.get("/api/v1/dashboard/overview", headers=headers)
 
     assert answer.status_code == 200
+    assert FailingAsyncClient.calls == 1
     assert answer.json()["data"]["mode"] == "agent_v3_deterministic_fallback"
     assert answer.json()["data"]["response_mode"] == "deterministic_fallback"
     assert answer.json()["data"]["source_badge"] == "确定性 Planner 回退"

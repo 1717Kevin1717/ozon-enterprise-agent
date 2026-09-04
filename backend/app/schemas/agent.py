@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 ResponseMode = Literal[
@@ -19,8 +19,45 @@ ResponseType = Literal[
     "policy_answer",
     "insufficient_data",
     "clarification",
+    "not_found",
     "error",
 ]
+
+
+class EntityCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: str
+    name: str
+    confidence: float = Field(ge=0, le=1)
+
+
+class EntityResolutionResult(BaseModel):
+    """One requested mention, including unsuccessful resolution, not a search hit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mention: str
+    status: Literal["EXACT_MATCH", "NORMALIZED_MATCH", "UNIQUE_ALIAS_MATCH", "FUZZY_UNIQUE_MATCH", "AMBIGUOUS", "NOT_FOUND", "LOW_CONFIDENCE"]
+    product_id: str | None = None
+    name: str = ""
+    confidence: float = Field(default=0, ge=0, le=1)
+    candidates: list[EntityCandidate] = Field(default_factory=list, max_length=5)
+
+    @property
+    def resolved(self) -> bool:
+        return self.status in {"EXACT_MATCH", "NORMALIZED_MATCH", "UNIQUE_ALIAS_MATCH", "FUZZY_UNIQUE_MATCH"}
+
+    @model_validator(mode="after")
+    def validate_resolution_identity(self):
+        if self.resolved != bool(self.product_id):
+            raise ValueError("Only a resolved entity may carry a product identity")
+        if self.resolved and (not self.name or self.candidates):
+            raise ValueError("Resolved entities require a name, not candidate choices")
+        minimum = 2 if self.status == "AMBIGUOUS" else 1 if self.status == "LOW_CONFIDENCE" else 0
+        if len(self.candidates) < minimum or (self.status == "NOT_FOUND" and self.candidates):
+            raise ValueError("Resolution status and candidate count disagree")
+        return self
 
 
 class AgentEntity(BaseModel):
@@ -127,6 +164,7 @@ class AgentRunResult(BaseModel):
     total_count: int = Field(ge=0)
     displayed_count: int = Field(ge=0)
     entities: list[AgentEntity] = Field(default_factory=list)
+    requested_entities: list[EntityResolutionResult] = Field(default_factory=list)
     product_ids: list[str] = Field(default_factory=list)
     filter_criteria: dict[str, Any] = Field(default_factory=dict)
     fact: AgentFact | None = None

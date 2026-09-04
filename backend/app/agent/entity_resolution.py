@@ -1,61 +1,146 @@
 import re
-from difflib import SequenceMatcher
+import unicodedata
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 from app.db.models import Product
+from app.schemas.agent import EntityCandidate, EntityResolutionResult
 
 
 def normalize_entity(value: str) -> str:
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (value or "").casefold())
+    value = unicodedata.normalize("NFKC", value or "").casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value)
 
 
 def product_aliases(product: Product) -> tuple[str, ...]:
     title = normalize_entity(product.title)
     base = re.sub(r"\d+(?:件|个|只|套|支|片|枚)装$", "", title)
-    aliases = [title, base, normalize_entity(product.external_product_id), normalize_entity(product.sku)]
-    return tuple(dict.fromkeys(item for item in aliases if len(item) >= 3))
+    return tuple(dict.fromkeys(item for item in (title, base) if item))
+
+
+# Query grammar, not catalogue-specific aliases. Preserve unknown name qualifiers.
+_FIELD_SUFFIX = re.compile(
+    r"(?:的)?(?:当前|目前|现在)?(?:售价|价格|卖多少钱|多少钱|风险等级|风险级别|"
+    r"净利润|利润|roi|销量|有(?:多少|几).*?快照|是否|能不能|值得|详情|怎么样|如何|中(?:选出|挑选|选择)|选出)", re.I
+)
+_REFERENCE = re.compile(r"(?:(?:和|与)?(?:刚才|当前|已选|那个|这个|那两个|这两个|这几个|这\d+个|这四个|它|对比中心)(?:那|这|的)?(?:几个|两个)?(?:商品|产品|候选)?(?:相比)?)\Z")
+_GENERIC = {"商品", "产品", "用品", "电子产品", "桌面", "收纳", "东西"}
+
+
+def query_mentions(query: str, protected_names: tuple[str, ...] = ()) -> list[str]:
+    text = query.strip()
+    protected = {}
+    for name in sorted(set(protected_names), key=len, reverse=True):
+        if name and name in text:
+            marker = f"__ENTITY_{len(protected)}__"
+            text = text.replace(name, marker)
+            protected[marker] = name
+    text = re.sub(r"^(?:(?:请问|请|帮我|帮忙|查看|查询|分析一下|分析|比较|对比|如果|假如|把|将|从)\s*)+", "", text)
+    text = _FIELD_SUFFIX.split(text, maxsplit=1)[0]
+    text = re.split(r"[,，;；]", text, maxsplit=1)[0].strip(" 的：:。？！?!\"“”")
+    if not text or _REFERENCE.fullmatch(text) or text in {"候选池", "企业商品库", "公司商品库"}:
+        return []
+    mentions = re.split(r"以及|和|与|、|\s+vs\.?\s+", text, flags=re.I)
+    restored = []
+    for part in mentions:
+        part = part.strip(" 的：:。？！?!\"“”")
+        for marker, name in protected.items():
+            part = part.replace(marker, name)
+        if part:
+            restored.append(part)
+    return list(dict.fromkeys(restored))
 
 
 @dataclass
 class EntityResolution:
     products: list[Product] = field(default_factory=list)
-    ambiguous: list[dict] = field(default_factory=list)
-    method: str = "none"
+    requested_entities: list[EntityResolutionResult] = field(default_factory=list)
+
+    @property
+    def has_unresolved(self) -> bool:
+        return any(not item.resolved for item in self.requested_entities)
+
+    @property
+    def ambiguous(self) -> list[dict]:
+        return [item.model_dump() for item in self.requested_entities if item.status == "AMBIGUOUS"]
+
+
+def _result(mention: str, matches: list[tuple[float, Product]], status: str) -> EntityResolutionResult:
+    if not matches:
+        return EntityResolutionResult(mention=mention, status="NOT_FOUND")
+    score, product = matches[0]
+    if status not in {"AMBIGUOUS", "LOW_CONFIDENCE"} and len(matches) == 1:
+        return EntityResolutionResult(mention=mention, status=status, product_id=product.id, name=product.title, confidence=score)
+    return EntityResolutionResult(
+        mention=mention, status="LOW_CONFIDENCE" if status == "LOW_CONFIDENCE" else "AMBIGUOUS", confidence=score,
+        candidates=[EntityCandidate(product_id=item.id, name=item.title, confidence=value) for value, item in matches[:5]],
+    )
+
+
+def resolve_entity(products: list[Product], mention: str) -> EntityResolutionResult:
+    # IDs are exact identities, never fuzzy aliases. Callers supply tenant-scoped products.
+    ids = [p for p in products if mention in {p.id, p.external_product_id, p.sku}]
+    exact = ids or [p for p in products if mention == p.title]
+    if exact:
+        return _result(mention, [(1.0, p) for p in exact], "EXACT_MATCH")
+    normalized = normalize_entity(mention)
+    exact = [p for p in products if normalized == normalize_entity(p.title)]
+    if exact:
+        return _result(mention, [(0.99, p) for p in exact], "NORMALIZED_MATCH")
+    generic = normalized in _GENERIC or any(token in normalized for token in ("那个", "这个", "某个"))
+    lookup = re.sub(r"那个|这个|某个", "", normalized)
+    # Only shorten toward a meaningful name suffix, never discard user qualifiers
+    # or match a base product to an accessory having a different trailing head.
+    aliases = [p for p in products if any(alias.endswith(lookup) for alias in product_aliases(p))] if len(lookup) >= 3 else []
+    if aliases and not generic:
+        return _result(mention, [(0.95, p) for p in aliases], "UNIQUE_ALIAS_MATCH")
+    if generic:
+        possible = [p for p in products if lookup and lookup in normalize_entity(p.title)]
+        return _result(mention, [(0.5, p) for p in possible], "LOW_CONFIDENCE")
+    scored = []
+    if len(normalized) >= 4:
+        for product in products:
+            # Numbers identify models/variants; a different model is not a typo.
+            scores = []
+            for alias in product_aliases(product):
+                if re.findall(r"\d+", normalized) != re.findall(r"\d+", alias):
+                    continue
+                matcher = SequenceMatcher(None, normalized, alias)
+                edits = sum(max(end_a - start_a, end_b - start_b) for tag, start_a, end_a, start_b, end_b in matcher.get_opcodes() if tag != "equal")
+                score = matcher.ratio()
+                # Dropping several qualifier characters is not a harmless one-character typo.
+                scores.append(min(score, 0.81) if edits > 1 and score < 0.9 else score)
+            score = max(scores, default=0)
+            if score >= 0.65:
+                scored.append((score, product))
+    scored.sort(key=lambda item: (-item[0], item[1].title, item[1].id))
+    high = [item for item in scored if item[0] >= 0.82]
+    if high and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+        return _result(mention, high[:1], "FUZZY_UNIQUE_MATCH")
+    if len(high) > 1:
+        return _result(mention, high, "AMBIGUOUS")
+    return _result(mention, scored, "LOW_CONFIDENCE")
 
 
 def resolve_query_entities(products: list[Product], query: str, limit: int = 10) -> EntityResolution:
-    normalized_query = normalize_entity(query)
-    positions: dict[str, tuple[int, int, Product]] = {}
-    alias_map: dict[str, list[Product]] = {}
-    for product in products:
-        for alias in product_aliases(product):
-            if alias in normalized_query:
-                alias_map.setdefault(alias, []).append(product)
-    ambiguous = []
-    for alias, matches in alias_map.items():
-        unique = {item.id: item for item in matches}
-        if len(unique) > 1:
-            ambiguous.append({"alias": alias, "candidates": [{"id": item.id, "title": item.title} for item in unique.values()]})
-            continue
-        product = next(iter(unique.values()))
-        candidate = (normalized_query.find(alias), -len(alias), product)
-        current = positions.get(product.id)
-        if current is None or candidate[:2] < current[:2]:
-            positions[product.id] = candidate
-    resolved = [item[2] for item in sorted(positions.values(), key=lambda value: value[:2])][:limit]
-    if not resolved and not ambiguous:
-        entity_text = normalized_query
-        for phrase in ("售价是多少", "价格是多少", "售价多少", "价格多少", "卖多少钱", "现在售价", "利润怎么样", "利润如何", "分析一下", "商品"):
-            entity_text = entity_text.replace(normalize_entity(phrase), "")
-        scored: list[tuple[float, Product]] = []
-        if len(entity_text) >= 4:
-            for product in products:
-                score = max((SequenceMatcher(None, entity_text, alias).ratio() for alias in product_aliases(product)), default=0)
-                if score >= 0.84:
-                    scored.append((score, product))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        if scored and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
-            return EntityResolution([scored[0][1]], [], "normalized_unique_similarity")
-        if len(scored) > 1:
-            return EntityResolution([], [{"alias": entity_text, "candidates": [{"id": item.id, "title": item.title} for _, item in scored[:5]]}], "ambiguous_similarity")
-    return EntityResolution(resolved, ambiguous, "normalized_exact" if resolved else "none")
+    names = tuple(value for p in products for value in (p.title, p.id, p.external_product_id, p.sku) if value)
+    results = [resolve_entity(products, mention) for mention in query_mentions(query, names)]
+    by_id = {p.id: p for p in products}
+    resolved_ids = list(dict.fromkeys(item.product_id for item in results if item.resolved))
+    return EntityResolution([by_id[pid] for pid in resolved_ids[:limit]], results)
+
+
+def resolution_message(resolution: EntityResolution, *, comparison: bool = False) -> str:
+    parts = []
+    for item in resolution.requested_entities:
+        if item.resolved:
+            parts.append(f"‘{item.mention}’已识别为 {item.name}")
+        elif item.status == "NOT_FOUND":
+            parts.append(f"企业商品库中未找到‘{item.mention}’")
+        elif item.status == "AMBIGUOUS":
+            parts.append(f"‘{item.mention}’对应多个可能商品，请选择：" + "、".join(c.name for c in item.candidates))
+        else:
+            parts.append(f"‘{item.mention}’的匹配置信度不足，请确认是否指：" + "、".join(c.name for c in item.candidates))
+    if comparison:
+        parts.append("因此本次未执行商品比较，请先确认未解析的商品")
+    return "；".join(parts) + "。"

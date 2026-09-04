@@ -69,10 +69,13 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None) -> P
     selected = tuple(dict.fromkeys(selected_product_ids or []))[:10]
     comparison_words = any(token in lowered for token in ("比较", "对比", "哪个更", "这两个", "这几个", "这4个", "这四个"))
     reference_words = any(token in lowered for token in ("刚才", "这个", "那个", "它", "对比中心", "这两个", "这几个", "这4个", "这四个"))
-    profit_only = comparison_words and any(token in lowered for token in ("只看利润", "只比较利润", "仅看利润", "只看roi", "仅看roi", "利润对比"))
+    positive_scope = re.split(r"不要|不分析|无需|不需要|不比较", lowered, maxsplit=1)[0]
+    full_comparison = any(token in positive_scope for token in ("全面", "综合", "全维度", "最值得上架"))
+    profit_only = comparison_words and not full_comparison and any(token in positive_scope for token in ("利润", "roi")) and not any(token in positive_scope for token in ("需求", "竞争", "合规", "风险", "趋势"))
     count_question = bool(re.search(r"(?:公司|企业|商品库)?.*?(?:一共|总共|共有|总数).*?(?:多少|几).*?(?:商品|候选)|(?:公司|企业).*?(?:多少|几).*?(?:商品|候选)", normalized))
     compliance_policy = "合规" in lowered and any(token in lowered for token in ("能上架", "可以上架", "能不能上架", "没通过", "未通过"))
-    price_lookup = any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "卖多少钱", "现在售价")) and not any(token in lowered for token in ("调整", "改为", "模拟"))
+    price_lookup = any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "多少钱", "现在售价")) and not any(token in lowered for token in ("调整", "改为", "模拟"))
+    risk_fact = bool(re.search(r"风险(?:等级|级别).*(?:多少|什么|如何)", lowered)) and not comparison_words and not any(token in lowered for token in ("上架", "推荐", "决策", "筛选"))
     snapshot_question = any(token in lowered for token in ("销量快照", "上涨还是下降", "未来销量趋势", "销量趋势"))
     score_threshold = _number_after([r"(?:分数|评分|推荐度).*?(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上|达到|大于|>=)", r"(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上)"], normalized)
     proposed_price = _number_after([r"(?:售价|价格|定价).*?(?:到|为|=)\s*(\d+(?:\.\d+)?)", r"(\d+(?:\.\d+)?)\s*(?:rub|卢布)"], normalized)
@@ -109,6 +112,8 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None) -> P
         return ParsedIntent("recommendation_policy", plan=(), policy=_policy((), 0, ("recommendation_policy", "decision"), fast=True))
     if price_lookup:
         return ParsedIntent("product_price", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一解析商品的价格字段"},), policy=_policy(("get_product",), 1, ("price",), selection="query_first", fast=True))
+    if risk_fact:
+        return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取商品当前风险等级与来源"},), policy=_policy(("get_product",), 1, ("risk",), selection="query_first", fast=True))
     if proposed_price is not None and any(token in lowered for token in ("价格", "售价", "定价", "rub", "卢布")):
         return ParsedIntent("product_detail", proposed_price=proposed_price, selected_product_ids=selected, plan=({"tool": "get_product", "purpose": "读取目标商品"}, {"tool": "simulate_price_change", "purpose": "按目标售价重算利润与风险"}), policy=_policy(("get_product", "simulate_price_change"), 2, ("price", "profit", "risk"), selection="query_first"))
     if snapshot_question:
@@ -138,9 +143,10 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None) -> P
         filters = _validated_filters(**filters)
         return ParsedIntent("selection_recommendation", filters=filters, limit=limit if top_limit else 5, selected_product_ids=selected if reference_words else (), plan=({"tool": "filter_products", "purpose": "筛选候选池；已有明确选择时改为读取所选商品"},), policy=_policy(("filter_products", "compare_products"), 1, ("recommendation", "decision"), selection="query_first", fast=True))
     if profit_only:
-        return ParsedIntent("profit_comparison", selected_product_ids=selected if reference_words else (), limit=max(2, min(10, len(selected) or 10)), plan=({"tool": "compare_products", "purpose": "读取已解析商品"}, {"tool": "calculate_profit", "purpose": "仅计算利润与 ROI"}), policy=_policy(("compare_products", "calculate_profit"), 11, ("profit", "roi"), selection="query_first"))
+        return ParsedIntent("profit_comparison", selected_product_ids=selected if reference_words else (), limit=10, plan=({"tool": "compare_products", "purpose": "读取已解析商品"}, {"tool": "calculate_profit", "purpose": "仅计算利润与 ROI"}), policy=_policy(("compare_products", "calculate_profit"), 11, ("profit", "roi"), selection="query_first"))
     if comparison_words:
-        return ParsedIntent("product_comparison", selected_product_ids=selected if reference_words else (), limit=max(2, min(10, len(selected) or 10)), plan=({"tool": "compare_products", "purpose": "比较明确解析或当前引用的商品"},), policy=_policy(("compare_products",), 1, ("profit", "demand", "competition", "compliance", "risk"), selection="query_first"))
+        dimensions = ("profit", "demand", "competition", "compliance", "risk") if full_comparison else tuple(dimension for dimension, tokens in (("profit", ("利润", "roi")), ("demand", ("需求", "销量", "趋势")), ("competition", ("竞争",)), ("compliance", ("合规",)), ("risk", ("风险",))) if any(token in positive_scope for token in tokens))
+        return ParsedIntent("product_comparison", selected_product_ids=selected if reference_words else (), limit=10, plan=({"tool": "compare_products", "purpose": "比较明确解析或当前引用的商品"},), policy=_policy(("compare_products",), 1, dimensions or ("identity", "price"), selection="query_first"))
     if any(token in lowered for token in ("失败", "放弃", "历史案例", "历史上")):
         return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "find_historical_failures", "purpose": "匹配本企业历史放弃商品"}, {"tool": "search_company_memory", "purpose": "检索失败原因"}), policy=_policy(("find_historical_failures", "search_company_memory"), 4, ("history",), selection="query_first"))
     if any(token in lowered for token in ("利润怎么样", "roi", "利润如何")):

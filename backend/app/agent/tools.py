@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.entity_resolution import EntityResolution, resolve_query_entities
+from app.agent.entity_resolution import EntityResolution, resolve_query_entities, resolution_message
 from app.agent.intent_engine import ParsedIntent, parse_intent
 from app.agent.runtime import AgentRunState
 from app.agent.tool_registry import TOOL_REGISTRY
@@ -374,15 +374,17 @@ def _unique(items: list[str], limit: int = 8) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))[:limit]
 
 
-def _response_type(parsed: ParsedIntent, ambiguity: list[dict[str, Any]], products: list[dict[str, Any]], data_sufficiency: dict[str, Any] | None) -> str:
+def _response_type(parsed: ParsedIntent, resolution: EntityResolution, products: list[dict[str, Any]], data_sufficiency: dict[str, Any] | None) -> str:
+    if resolution.has_unresolved and parsed.policy.selection_mode != "ignore" and parsed.name != "selection_recommendation":
+        return "not_found" if all(item.status == "NOT_FOUND" or item.resolved for item in resolution.requested_entities) else "clarification"
     if parsed.name in {"company_product_count", "product_price"}:
         return "simple_fact" if parsed.name == "company_product_count" or products else "clarification"
+    if parsed.name == "product_detail" and parsed.policy.requested_dimensions == ("risk",):
+        return "simple_fact" if products else "clarification"
     if parsed.name in {"compliance_policy", "recommendation_policy"}:
         return "policy_answer"
     if parsed.name == "product_filter":
         return "filter_result"
-    if ambiguity and not products:
-        return "clarification"
     if parsed.name in {"profit_comparison", "product_comparison"}:
         return "comparison_result" if len(products) >= 2 else "clarification"
     if parsed.name == "selection_recommendation":
@@ -397,8 +399,8 @@ def _display_scope(response_type: str, dimensions: tuple[str, ...]) -> list[str]
         return ["answer", "fact", "source", "timestamp"]
     if response_type == "policy_answer":
         return ["answer", "policy", "source"]
-    if response_type == "clarification":
-        return ["answer"]
+    if response_type in {"clarification", "not_found"}:
+        return ["answer", "requested_entities"]
     if response_type == "insufficient_data":
         return ["answer", "product", "data_sufficiency", "evidence", "warnings", "source", "tool_summary"]
     if response_type == "filter_result":
@@ -503,14 +505,16 @@ async def agent_v1_ask(
     parsed = parse_intent(query, selected_product_ids)
     state = run_state or AgentRunState(parsed.policy)
     all_products = await repo.list(limit=500)
-    resolution: EntityResolution = resolve_query_entities(all_products, query, 10)
+    resolution = resolve_query_entities(all_products, query, 10) if parsed.policy.selection_mode != "ignore" else EntityResolution()
+    entity_scoped = parsed.policy.selection_mode != "ignore" and parsed.name != "selection_recommendation"
+    entity_blocked = entity_scoped and resolution.has_unresolved
     target_source = "query_entity" if resolution.products else "none"
     targets = resolution.products
-    if not targets and parsed.selected_product_ids:
+    if not targets and parsed.selected_product_ids and (not resolution.requested_entities or not entity_scoped):
         by_id = {item.id: item for item in all_products}
         targets = [by_id[item] for item in parsed.selected_product_ids if item in by_id]
         target_source = "explicit_selection" if targets else "none"
-    if not targets and parsed.policy.selection_mode != "ignore" and any(token in query for token in ("刚才", "那个", "它", "这两个", "这几个", "这4个", "这四个", "相比")):
+    if not targets and not resolution.requested_entities and parsed.policy.selection_mode != "ignore" and any(token in query for token in ("刚才", "那个", "它", "这两个", "这几个", "这4个", "这四个", "相比")):
         by_id = {item.id: item for item in all_products}
         targets = [by_id[item] for item in conversation.last_product_ids or [] if item in by_id]
         target_source = "session_reference" if targets else "none"
@@ -543,10 +547,9 @@ async def agent_v1_ask(
     total_count_override: int | None = None
     displayed_count_override: int | None = None
     filter_criteria: dict[str, Any] = {}
-    ambiguity = resolution.ambiguous
-
-    if ambiguity and not targets and parsed.name not in {"company_product_count", "product_filter", "compliance_policy", "recommendation_policy", "selection_recommendation"}:
-        event(trace, "entity_ambiguous", "entity_resolver", "商品名称存在真实歧义，需要用户确认。", candidates=ambiguity)
+    event(trace, "entity_resolution", "entity_resolver", "已逐项保存本轮商品名称解析结果。", requested_entities=[item.model_dump() for item in resolution.requested_entities])
+    if entity_blocked:
+        event(trace, "entity_resolution_blocked", "entity_resolver", "存在未解析实体，本次不执行商品工具或部分比较。")
     elif parsed.name == "company_product_count":
         result = await execute("count_products", {}, lambda: count_products(repo, role), "已统计当前企业商品主档总数。")
         matched_count_override = int((result.get("data") or {}).get("count") or 0)
@@ -584,7 +587,6 @@ async def agent_v1_ask(
                 for view in views:
                     product_id = str(view["id"])
                     await execute("calculate_profit", {"product_id": product_id}, lambda product_id=product_id: calculate_profit(repo, product_id, role), f"已核算 {view['title']} 的利润与 ROI。")
-            views.sort(key=lambda item: float((item.get("analysis") or {}).get("recommendation_score") or 0), reverse=True)
     elif parsed.name == "product_price":
         if len(targets) == 1:
             target = targets[0]
@@ -622,7 +624,7 @@ async def agent_v1_ask(
                 await execute("calculate_profit", {"product_id": target.id}, lambda: calculate_profit(repo, target.id, role), f"已核算 {target.title} 的利润与 ROI。")
 
     products = [_agent_product(view) for view in views]
-    response_type = _response_type(parsed, ambiguity, products, data_sufficiency)
+    response_type = _response_type(parsed, resolution, products, data_sufficiency)
     display_scope = _display_scope(response_type, parsed.policy.requested_dimensions)
     missing_data: list[dict[str, Any]] = []
     warning_messages: list[str] = []
@@ -634,7 +636,7 @@ async def agent_v1_ask(
         include_all_decision_evidence = response_type == "decision_report" or "detail" in requested
         for item in analysis.get("missing_data") or []:
             dimension = str(item.get("dimension") or "")
-            if include_all_decision_evidence or dimension in requested or (dimension == "profit" and "roi" in requested):
+            if response_type != "simple_fact" and (include_all_decision_evidence or dimension in requested or (dimension == "profit" and "roi" in requested)):
                 missing_data.append({"product_id": view.get("id"), "title": view.get("title"), **item})
                 actions.append(str(item.get("action") or ""))
 
@@ -643,6 +645,8 @@ async def agent_v1_ask(
                 "product_id": product["id"], "title": product["title"], "source": product["price_source"],
                 "summary": f"当前售价 {product['current_price']:g} {product['currency']}，来自商品主档价格字段。", "url": product["url"],
             })
+        elif response_type == "simple_fact" and requested == {"risk"}:
+            evidence.append({"product_id": product["id"], "title": product["title"], "source": "deterministic_evaluation_engine", "summary": f"当前风险等级：{product['risk_level']}；来自当前保存的商品分析或后端确定性评估。", "url": product["url"]})
         elif response_type == "filter_result":
             conditions = []
             if filter_criteria.get("min_margin_rate") is not None: conditions.append(f"净利率 {product['current_margin_rate']:.1%}")
@@ -660,6 +664,9 @@ async def agent_v1_ask(
             })
             if product["decision_status"] == "BLOCKED":
                 warning_messages.append(f"{product['title']}：合规未通过，任何利润排名都不能绕过上架阻断。")
+        elif response_type == "comparison_result":
+            values = {"identity": product["title"], "price": f"售价 {product['current_price']:g} {product['currency']}", "profit": f"净利率 {product['current_margin_rate']:.1%}", "roi": f"ROI {product['roi']:.1%}", "demand": f"需求评分 {product['demand_score']:g}", "competition": f"竞争评分 {product['competition_score']:g}", "compliance": f"合规状态 {product['compliance_status']}", "risk": f"风险等级 {product['risk_level']}"}
+            evidence.append({"product_id": product["id"], "title": product["title"], "source": "deterministic_comparison_result", "summary": "；".join(values[key] for key in parsed.policy.requested_dimensions if key in values), "url": product["url"]})
         elif response_type == "insufficient_data":
             evidence.append({
                 "product_id": product["id"], "title": product["title"], "source": "product_snapshot_repository",
@@ -689,9 +696,8 @@ async def agent_v1_ask(
         "formal_recommendation": "AVAILABLE" if recommended else "NONE",
         "statuses": {item["id"]: item["decision_status"] for item in products},
     }
-    if ambiguity and not targets:
-        candidates = [item["title"] for group in ambiguity for item in group.get("candidates", [])]
-        answer = f"商品名称存在歧义，请确认具体商品：{'、'.join(_unique(candidates))}。"
+    if entity_blocked:
+        answer = resolution_message(resolution, comparison=parsed.name in {"profit_comparison", "product_comparison"})
     elif parsed.name == "company_product_count":
         answer = f"目前公司商品主档一共有 {matched_count_override or 0} 个。"
     elif parsed.name == "compliance_policy":
@@ -708,10 +714,14 @@ async def agent_v1_ask(
         else:
             answer = f"相对排名第一的是 {products[0]['title']}（{products[0]['score']:.1f} 分），但当前无商品达到正式推荐标准。"
     elif parsed.name in {"profit_comparison", "product_comparison"}:
-        dimension = "利润与 ROI" if parsed.name == "profit_comparison" else "利润、需求、竞争、合规与风险"
-        answer = f"已完成 {len(products)} 个明确商品的{dimension}对比；相对排名第一的是 {products[0]['title']}。" if products else "需要明确选择或点名至少两个本企业商品后才能比较。"
+        labels = {"profit": "利润", "roi": "ROI", "demand": "需求", "competition": "竞争", "compliance": "合规", "risk": "风险", "identity": "商品身份", "price": "价格"}
+        dimension = "、".join(labels.get(key, key) for key in parsed.policy.requested_dimensions)
+        answer = f"已完成 {len(products)} 个明确商品的{dimension}对比；按本次请求的维度展示，不代表推荐上架。" if products else "请点名或选择至少两个不同的本企业商品后再比较。"
     elif parsed.name == "product_price":
-        answer = f"{products[0]['title']} 当前售价为 {products[0]['current_price']:g} RUB。" if products else "没有唯一识别到该商品，请补充完整商品名称。"
+        answer = f"{products[0]['title']} 当前售价为 {products[0]['current_price']:g} {products[0]['currency']}。" if products else "请提供要查询的商品名称或商品 ID。"
+    elif products and response_type == "simple_fact" and parsed.policy.requested_dimensions == ("risk",):
+        risk_label = {"low": "低", "medium": "中", "high": "高"}.get(products[0]["risk_level"], "未知")
+        answer = f"{products[0]['title']} 当前风险等级为 {risk_label}（{products[0]['risk_level']}）。"
     elif simulation:
         answer = f"售价调整为 {simulation['proposed_price']:g} RUB 后，单件净利润为 {simulation['net_profit']:.2f} RUB，净利率为 {simulation['margin_rate']:.1%}，推荐等级为 {simulation['recommendation_grade']}。"
     elif data_sufficiency:
@@ -728,7 +738,7 @@ async def agent_v1_ask(
     elif products:
         answer = f"{products[0]['title']} 当前动态推荐度为 {products[0]['score']:.1f}，决策状态为 {products[0]['decision_status']}；最终动作仍需人工审核。"
     else:
-        answer = "当前企业数据中没有唯一识别到可分析商品，请补充完整商品名称或明确选择商品。"
+        answer = "请提供要查询的商品名称或商品 ID，或明确引用已选商品。"
 
     source_badge = "GLM 实际调用成功" if response_mode == "glm_success" else "确定性 Planner 回退" if response_mode == "deterministic_fallback" else "规则引擎结果"
     latency_ms = round((time.perf_counter() - started) * 1000)
@@ -741,8 +751,13 @@ async def agent_v1_ask(
     elif parsed.name == "product_price" and products:
         product = products[0]
         fact = {"name": "product_price", "value": product["current_price"], "unit": "price", "product_id": product["id"], "currency": product["currency"], "source": product["price_source"], "timestamp": product["updated_at"]}
+    elif response_type == "simple_fact" and products and parsed.policy.requested_dimensions == ("risk",):
+        product = products[0]
+        fact = {"name": "product_risk_level", "value": product["risk_level"], "product_id": product["id"], "source": "deterministic_evaluation_engine", "timestamp": product["updated_at"]}
     entities = [{"product_id": item.id, "name": item.title, "resolution_method": target_source} for item in targets if target_source != "none"]
-    decision_status = _overall_decision_status(parsed.name, products)
+    decision_status = "NOT_APPLICABLE" if response_type == "simple_fact" else _overall_decision_status(parsed.name, products)
+    if response_type == "simple_fact":
+        decision_summary = {}
     human_review_required = (
         parsed.name == "compliance_policy"
         or response_type == "decision_report"
@@ -754,14 +769,14 @@ async def agent_v1_ask(
     payload = {
         "run_id": run_id, "session_id": session_id, "response_type": response_type, "answer": answer,
         "matched_count": matched_count, "total_count": total_count, "displayed_count": displayed_count,
-        "entities": entities, "product_ids": [item["id"] for item in products], "filter_criteria": filter_criteria, "fact": fact,
+        "entities": entities, "requested_entities": [item.model_dump() for item in resolution.requested_entities], "product_ids": [item["id"] for item in products], "filter_criteria": filter_criteria, "fact": fact,
         "products": products, "tool_results": _tool_result_contract(state.executions), "evidence": evidence,
         "risks": _unique(warning_messages), "warnings": _unique(warning_messages), "missing_data": missing_data, "next_actions": scoped_actions,
         "requires_human_review": human_review_required, "human_review_required": human_review_required,
         "tool_trace_summary": _trace_summary(trace), "response_mode": response_mode, "source_badge": source_badge,
         "active_provider": "deterministic_planner" if response_mode != "glm_success" else "zhipu", "active_model": active_model_override or ("agent-v3-rule-planner" if response_mode != "glm_success" else "glm"),
         "fallback_reason": fallback_reason, "latency_ms": latency_ms, "token_usage": token_usage_override or {}, "intent": parsed.name,
-        "task_completed": response_type not in {"clarification", "error"}, "fallback_used": response_mode == "deterministic_fallback", "tool_call_count": state.actual_tool_calls,
+        "task_completed": response_type not in {"clarification", "not_found", "error"}, "fallback_used": response_mode == "deterministic_fallback", "tool_call_count": state.actual_tool_calls,
         "duplicate_tool_execution": state.duplicate_tool_execution, "requested_dimensions": list(parsed.policy.requested_dimensions), "display_scope": display_scope, "selection_source": target_source,
         "decision_status": decision_status, "decision_summary": decision_summary, "data_sufficiency": data_sufficiency,
         "mode": "zhipu_controlled_function_calling" if response_mode == "glm_success" else "agent_v3_deterministic_fallback" if response_mode == "deterministic_fallback" else "agent_v3_rule_engine",

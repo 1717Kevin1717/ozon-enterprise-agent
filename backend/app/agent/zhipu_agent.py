@@ -194,6 +194,16 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
             provider_notice="该问题已由确定性快速路径完成，无需调用外部模型。",
             run_state=run_state,
         )
+    repo = ProductRepository(session, company_id)
+    resolution = resolve_query_entities(await repo.list(limit=500), query, 10)
+    resolved_ids = [item.id for item in resolution.products]
+    effective_ids = resolved_ids or ([] if resolution.requested_entities else list(parsed.selected_product_ids))
+    if resolution.has_unresolved:
+        return await rule_agent_ask(
+            session, company_id, user_id, role, query, session_id,
+            selected_product_ids=selected_product_ids,
+            response_mode="rule_engine", provider_notice="商品身份尚未确认，本次未调用外部模型。", run_state=run_state,
+        )
     if not settings.zhipu_api_key:
         return await rule_agent_ask(session, company_id, user_id, role, query, session_id, selected_product_ids=selected_product_ids, response_mode="deterministic_fallback", fallback_reason="KEY_MISSING", provider_notice=SAFE_ERROR_MESSAGES["KEY_MISSING"], run_state=run_state)
     conversation = await session.get(ConversationSession, session_id) if session_id else None
@@ -205,16 +215,6 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
     history = await _conversation_messages(session, company_id, session_id)
     session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"provider": "zhipu", "selected_product_ids": selected_product_ids or []}))
     await session.flush()
-    repo = ProductRepository(session, company_id)
-    resolution = resolve_query_entities(await repo.list(limit=500), query, 10)
-    resolved_ids = [item.id for item in resolution.products]
-    effective_ids = resolved_ids or list(parsed.selected_product_ids)
-    if resolution.ambiguous and not effective_ids:
-        return await rule_agent_ask(
-            session, company_id, user_id, role, query, session_id,
-            selected_product_ids=selected_product_ids, record_user_message=False,
-            response_mode="rule_engine", provider_notice="商品名称存在歧义，未调用外部模型。", run_state=run_state,
-        )
     context_note = f"本轮已由后端解析的商品 ID：{effective_ids}" if effective_ids else "本轮没有已解析商品 ID；不得猜测商品身份。"
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": f"{query}\n\n受控上下文：{context_note}"}]
     endpoint = f"{settings.zhipu_base_url.rstrip('/')}/chat/completions"
