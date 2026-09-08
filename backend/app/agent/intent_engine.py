@@ -21,6 +21,7 @@ class IntentPolicy:
 @dataclass(frozen=True)
 class ParsedIntent:
     name: str
+    recognized: bool = True
     filters: dict[str, Any] = field(default_factory=dict)
     limit: int = 10
     proposed_price: float | None = None
@@ -67,6 +68,10 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None) -> P
     normalized = " ".join(query.strip().split())
     lowered = normalized.casefold()
     selected = tuple(dict.fromkeys(selected_product_ids or []))[:10]
+    from app.agent.query_understanding import semantic_intent
+    semantic = semantic_intent(normalized, selected)
+    if semantic is not None:
+        return semantic
     comparison_words = any(token in lowered for token in ("比较", "对比", "哪个更", "这两个", "这几个", "这4个", "这四个"))
     reference_words = any(token in lowered for token in ("刚才", "这个", "那个", "它", "对比中心", "这两个", "这几个", "这4个", "这四个"))
     positive_scope = re.split(r"不要|不分析|无需|不需要|不比较", lowered, maxsplit=1)[0]
@@ -151,4 +156,5 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None) -> P
         return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "find_historical_failures", "purpose": "匹配本企业历史放弃商品"}, {"tool": "search_company_memory", "purpose": "检索失败原因"}), policy=_policy(("find_historical_failures", "search_company_memory"), 4, ("history",), selection="query_first"))
     if any(token in lowered for token in ("利润怎么样", "roi", "利润如何")):
         return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一商品"}, {"tool": "calculate_profit", "purpose": "核算利润与 ROI"}), policy=_policy(("get_product", "calculate_profit"), 2, ("profit", "roi"), selection="query_first", fast=True))
-    return ParsedIntent("product_detail", selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一商品主档与分析"},), policy=_policy(("get_product",), 1, ("detail",), selection="query_first", fast=True))
+    detail_requested = bool(re.search(r"是否值得|值不值得|是否推荐|能否上架|详情|怎么样", lowered))
+    return ParsedIntent("product_detail", recognized=detail_requested, selected_product_ids=selected if reference_words else (), plan=({"tool": "get_product", "purpose": "读取唯一商品主档与分析"},), policy=_policy(("get_product",), 1, ("detail",), selection="query_first", fast=True))

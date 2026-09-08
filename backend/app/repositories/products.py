@@ -1,10 +1,12 @@
 from datetime import UTC, datetime
+from copy import deepcopy
 from typing import List
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Memory, Product, ProductAnalysis, ProductSnapshot
 from app.schemas.products import ProductIn, ProductPatch
 from app.services.decision_engine import ALGORITHM_VERSION, WEIGHTS, analyze, to_dict
+from app.services.provenance import build_trust, capture_lineage
 
 class ProductRepository:
     def __init__(self, session: AsyncSession, company_id: str):
@@ -34,6 +36,8 @@ class ProductRepository:
             merged_payload.update(raw_payload)
             raw_payload = merged_payload
         values["raw_payload"] = raw_payload
+        raw_payload["_provided_fields"] = sorted(data.model_fields_set)
+        values["field_lineage"] = capture_lineage(data)
         if product is None:
             product = Product(company_id=self.company_id, **values)
             self.session.add(product)
@@ -60,6 +64,12 @@ class ProductRepository:
             if entries is not None: merged["visibleCompetitors"]=entries
             if lowest is not None: merged["visibleLowestCompetitorPriceRub"]=lowest
             values["raw_payload"]=merged
+        changed = {key for key, value in values.items() if key != "raw_payload" and getattr(product, key, None) != value}
+        patch_input = data.model_copy(update={"raw_payload": values.get("raw_payload", product.raw_payload)})
+        product.field_lineage = {**(product.field_lineage or {}), **capture_lineage(patch_input, changed_fields=changed)}
+        updated_raw = dict(values.get("raw_payload", product.raw_payload) or {})
+        updated_raw["_provided_fields"] = sorted(set(updated_raw.get("_provided_fields", [])) | changed)
+        values["raw_payload"] = updated_raw
         for key, value in values.items(): setattr(product, key, value)
         await self._snapshot(product, product.raw_payload, None)
         await self.session.commit(); await self.session.refresh(product)
@@ -67,7 +77,8 @@ class ProductRepository:
 
     async def _snapshot(self, product: Product, raw_payload: dict, captured_at: datetime | None) -> None:
         captured_at = captured_at or datetime.now(UTC).replace(tzinfo=None)
-        self.session.add(ProductSnapshot(company_id=self.company_id, product_id=product.id, captured_at=captured_at, price=product.current_price, rating=product.rating, review_count=product.review_count, sales_30d=product.latest_30d_sales, competitor_count=product.competitor_count, raw_payload=raw_payload or {}))
+        snapshot_payload = {**(raw_payload or {}), "_field_lineage": product.field_lineage or {}}
+        self.session.add(ProductSnapshot(company_id=self.company_id, product_id=product.id, captured_at=captured_at, price=product.current_price, rating=product.rating, review_count=product.review_count, sales_30d=product.latest_30d_sales, competitor_count=product.competitor_count, raw_payload=snapshot_payload))
 
     async def analyze(self, product: Product) -> ProductAnalysis:
         result = analyze(product)
@@ -189,4 +200,15 @@ def product_view(product: Product, analysis: ProductAnalysis | None = None) -> d
             "recommendation": meta.get("recommendation", "review_required"),
             "created_at": analysis.created_at,
         }
+    current_analysis = result.get("analysis") or to_dict(analyze(product))
+    result["data_trust"] = build_trust(product, current_analysis, saved_fields=(analysis.evidence_json or {}).get("field_provenance") if analysis else None, legacy_analysis=analysis is not None).model_dump(mode="json")
+    # Legacy labels such as enterprise_verified are not proof of external authenticity.
+    if analysis:
+        projected = deepcopy(analysis.evidence_json or {})
+        for dimension in ("demand", "profit", "competition", "compliance", "risk"):
+            for item in projected.get(dimension, {}).get("fields", []):
+                source = result["data_trust"]["fields"].get(item.get("field"), {})
+                item["source"] = source.get("provider", "unverified_input")
+                item["is_mock"] = source.get("is_mock", result["data_trust"]["is_mock"])
+        result["analysis"]["evidence"] = {**projected, "field_provenance": result["data_trust"]["fields"], "disclosure": result["data_trust"]["disclosure"]}
     return result

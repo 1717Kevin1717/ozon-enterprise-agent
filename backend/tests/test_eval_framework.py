@@ -19,8 +19,10 @@ def case_fixture():
 
 def test_golden_jsonl_schema_and_coverage():
     cases = load_cases(DEFAULT_CASES)
-    assert 20 <= len(cases) <= 30
-    assert {case.category for case in cases} == {"simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback"}
+    assert 20 <= len([case for case in cases if case.category not in {"provenance", "semantic_understanding"}]) <= 30
+    assert 8 <= len([case for case in cases if case.category == "provenance"]) <= 12
+    assert 12 <= len([case for case in cases if case.category == "semantic_understanding"]) <= 20
+    assert {case.category for case in cases} == {"simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback", "provenance", "semantic_understanding"}
     assert all("not real Ozon" in case.provenance for case in cases)
 
 

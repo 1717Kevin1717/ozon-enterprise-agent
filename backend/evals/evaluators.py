@@ -145,6 +145,46 @@ class FactGroundingEvaluator(Evaluator):
             for name, value in truth.model_dump(exclude_none=True).items():
                 if name != "min_matches":
                     rows.append(self.check(f"filter_criteria.{name}", value, lookup(result, f"filter_criteria.{name}")))
+        if expected.provenance:
+            rows += self.provenance_assertions(expected.provenance, run)
+        return rows
+
+    def provenance_assertions(self, truth, run):
+        result = run["result"]
+        fields = [field for item in result.get("evidence", []) for field in item.get("fields", [])]
+        matches = [item for item in fields if truth.field is None or item["field"] == truth.field]
+        rows = []
+        if truth.field:
+            rows.append(self.check("provenance_field_present", True, bool(matches)))
+        for item in matches:
+            for name in ("source_type", "provider", "is_mock", "evidence_status"):
+                expected = getattr(truth, name)
+                if expected is not None:
+                    rows.append(self.check(f"provenance.{item['field']}.{name}", expected, item.get(name)))
+            if truth.freshness:
+                rows.append(self.check("freshness", truth.freshness, item["freshness"]["status"]))
+            if truth.require_collected_at:
+                rows.append(self.check("collected_at_exists", True, bool(item.get("collected_at"))))
+            if truth.derived_inputs:
+                rows.append(self.check("derived_input_fields", True, set(truth.derived_inputs).issubset(item.get("derived_from", []))))
+                rows.append(self.check("derived_input_values", True, all(value.get("value") is not None for value in item.get("inputs", []))))
+            if item.get("is_mock"):
+                rows.append(self.check("mock_not_marketplace_real", True, item.get("source_type") in {"mock", "derived"} and not item.get("source_url")))
+        def bound(item, product_id):
+            return item.get("product_id") == product_id and item.get("company_id") == run["company_id"] and all(bound(child, product_id) for child in item.get("inputs", []))
+        if truth.product_binding:
+            rows.append(self.check("evidence_product_tenant_binding", True, all(bound(field, item["product_id"]) for item in result.get("evidence", []) for field in item.get("fields", []))))
+        notices = {item["code"] for item in result.get("trust_notices", []) if truth.field is None or item["field"] == truth.field}
+        for code in truth.notice_codes:
+            rows.append(self.check("required_trust_notice:" + code, True, code in notices))
+        for code in truth.forbidden_notice_codes:
+            rows.append(self.check("forbidden_trust_notice:" + code, False, code in notices))
+        if truth.tenant_isolation:
+            denials = run.get("foreign_denials", [])
+            rows.append(self.check("foreign_tool_denied", True, len(denials) == 3 and all(not item.get("success") and item.get("error_code") == "NOT_FOUND" and "data" not in item for item in denials)))
+            rows.append(self.check("foreign_evidence_hidden", [], result.get("evidence", [])))
+        for row in rows:
+            row.metric = "provenance_accuracy"
         return rows
 
 
@@ -173,7 +213,35 @@ class IdempotencyEvaluator(Evaluator):
         return rows
 
 
-EVALUATORS = (IntentEvaluator(), ResponseTypeEvaluator(), EntityResolutionEvaluator(), ToolScopeEvaluator(), RequestedDimensionEvaluator(), DecisionPolicyEvaluator(), DataSufficiencyEvaluator(), FactGroundingEvaluator(), StateLeakageEvaluator(), IdempotencyEvaluator())
+class SemanticUnderstandingEvaluator(Evaluator):
+    def evaluate(self, case, run):
+        if case.category != "semantic_understanding":
+            return []
+        result, expected = run["result"], case.expected
+        understanding = result.get("understanding") or {}
+        checks = [
+            ("intent_understanding_accuracy", "intent", expected.intent, understanding.get("intent")),
+            ("entity_span_accuracy", "entity_mentions", expected.entity_mentions, understanding.get("entity_mentions")),
+            ("semantic_route_accuracy", "route", expected.semantic_route, understanding.get("route")),
+            ("semantic_route_accuracy", "planner_calls", expected.planner_calls, understanding.get("planner_calls")),
+            ("reference_resolution_accuracy", "selection_source", expected.selection_source, result.get("selection_source")),
+            ("reference_resolution_accuracy", "reference_field", expected.reference_field, understanding.get("reference_field")),
+            ("response_scope_accuracy", "response_type", expected.response_type, result.get("response_type")),
+        ]
+        rows = []
+        for metric, name, truth, actual in checks:
+            if truth is not None:
+                row = self.check(name, truth, actual)
+                row.metric = metric
+                rows.append(row)
+        for scope in expected.forbidden_display_scope:
+            row = self.check("forbidden_scope:"+scope, False, scope in result.get("display_scope", []))
+            row.metric = "response_scope_accuracy"
+            rows.append(row)
+        return rows
+
+
+EVALUATORS = (IntentEvaluator(), ResponseTypeEvaluator(), EntityResolutionEvaluator(), ToolScopeEvaluator(), RequestedDimensionEvaluator(), DecisionPolicyEvaluator(), DataSufficiencyEvaluator(), FactGroundingEvaluator(), StateLeakageEvaluator(), IdempotencyEvaluator(), SemanticUnderstandingEvaluator())
 
 
 def evaluate(case: GoldenCase, run: dict) -> list[AssertionResult]:

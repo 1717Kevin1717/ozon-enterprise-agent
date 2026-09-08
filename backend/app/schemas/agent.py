@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.schemas.provenance import FieldEvidence, TrustNotice
 
 
 ResponseMode = Literal[
@@ -11,6 +12,7 @@ ResponseMode = Literal[
 ]
 
 ResponseType = Literal[
+    "provenance_fact", "calculation_explanation", "decision_explanation", "data_quality_answer",
     "simple_fact",
     "product_detail",
     "filter_result",
@@ -22,6 +24,38 @@ ResponseType = Literal[
     "not_found",
     "error",
 ]
+
+
+IntentName = Literal[
+    "company_product_count", "product_price", "product_filter", "product_detail",
+    "profit_comparison", "product_comparison", "compliance_policy", "recommendation_policy",
+    "selection_recommendation", "provenance_fact", "calculation_explanation",
+    "decision_explanation", "data_quality_answer", "data_quality_policy", "unknown",
+]
+
+
+class QueryUnderstanding(BaseModel):
+    """Understanding is a plan, never a source of business facts."""
+    model_config = ConfigDict(extra="forbid")
+    intent: IntentName
+    question_type: str = ""
+    entity_mentions: list[str] = Field(default_factory=list, max_length=10)
+    references: list[str] = Field(default_factory=list, max_length=10)
+    reference_field: str | None = None
+    metrics: list[str] = Field(default_factory=list)
+    metric_values: list[float] = Field(default_factory=list)
+    requested_dimensions: list[str] = Field(default_factory=list)
+    comparison_requested: bool = False
+    explanation_requested: bool = False
+    provenance_requested: bool = False
+    calculation_requested: bool = False
+    policy_requested: bool = False
+    requires_context: bool = False
+    confidence: float = Field(ge=0, le=1)
+    route: Literal["DETERMINISTIC_FAST_PATH", "SEMANTIC_PLANNER", "CLARIFICATION"]
+    planned_tools: list[str] = Field(default_factory=list, max_length=10)
+    planner_calls: int = Field(default=0, ge=0, le=1)
+    failure_code: str | None = None
 
 
 class EntityCandidate(BaseModel):
@@ -88,6 +122,7 @@ class AgentFact(BaseModel):
     currency: str = ""
     source: str
     timestamp: datetime | None = None
+    provenance: FieldEvidence | None = None
 
 
 class DataSufficiencyResult(BaseModel):
@@ -139,6 +174,8 @@ class AgentProduct(BaseModel):
     missing_fields: list[str] = Field(default_factory=list)
     url: str = ""
     main_image_url: str = ""
+    is_mock: bool = False
+    data_disclosure: str = ""
 
 
 class AgentEvidence(BaseModel):
@@ -149,6 +186,14 @@ class AgentEvidence(BaseModel):
     source: str
     summary: str
     url: str = ""
+    fields: list[FieldEvidence] = Field(default_factory=list)
+    disclosure: str = ""
+
+    @model_validator(mode="after")
+    def evidence_product_binding(self):
+        if any(item.product_id != self.product_id for item in self.fields):
+            raise ValueError("Agent evidence product mismatch")
+        return self
 
 
 class AgentRunResult(BaseModel):
@@ -173,6 +218,7 @@ class AgentRunResult(BaseModel):
     evidence: list[AgentEvidence] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    trust_notices: list[TrustNotice] = Field(default_factory=list)
     missing_data: list[dict[str, Any]] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
     requires_human_review: bool = False
@@ -186,6 +232,7 @@ class AgentRunResult(BaseModel):
     latency_ms: int = Field(ge=0)
     token_usage: dict[str, Any] = Field(default_factory=dict)
     intent: str
+    understanding: QueryUnderstanding | None = None
     task_completed: bool = True
     fallback_used: bool = False
     tool_call_count: int = Field(default=0, ge=0)
@@ -205,6 +252,15 @@ class AgentRunResult(BaseModel):
     data_completeness: dict[str, Any] | None = None
     provider_notice: str = ""
     model_summary: str = ""
+
+    @model_validator(mode="after")
+    def validate_evidence_bindings(self):
+        identities = set(self.product_ids)
+        if any(item.product_id not in identities for item in self.evidence):
+            raise ValueError("Evidence must refer to a returned product")
+        if self.fact and self.fact.provenance and self.fact.product_id != self.fact.provenance.product_id:
+            raise ValueError("Fact and evidence product identity disagree")
+        return self
 
 
 def validate_agent_answer(payload: dict[str, Any]) -> dict[str, Any]:

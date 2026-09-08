@@ -12,6 +12,7 @@ from app.db.session import get_session
 from app.repositories.products import ProductRepository, product_view
 from app.schemas.products import AgentAsk, CapturePacket, CompareRequest, DecisionCreate, DemoSeedRequest, ProductIn, ProductPatch
 from app.services.demo_dataset import enterprise_demo_candidates
+from app.services.provenance import snapshot_view
 
 router = APIRouter(prefix="/api/v1")
 ROLE_ORDER = {"viewer":0,"operator":1,"analyst":2,"reviewer":3,"company_admin":4,"super_admin":5}
@@ -249,6 +250,7 @@ async def dashboard_overview(ctx: dict = Depends(context), session: AsyncSession
             **provider_payload,
         },
         "is_demo_empty": len(views) == 0,
+        "data_disclosure": {"contains_mock": any(item["data_trust"]["is_mock"] for item in views), "notice": "含演示 / Mock 数据，汇总值不代表真实 Ozon 市场。" if any(item["data_trust"]["is_mock"] for item in views) else "企业录入数据；来源声明不等于已通过外部真实性验证。"},
     }}
 
 
@@ -327,7 +329,7 @@ async def get_analysis(product_id: str, ctx: dict = Depends(context), session: A
     repo=ProductRepository(session,ctx["company_id"]); analysis=await repo.latest_analysis(product_id)
     if not analysis: raise HTTPException(404,detail={"code":"ANALYSIS_NOT_FOUND","message":"尚未分析该商品。"})
     product=await ProductRepository(session,ctx["company_id"]).get(product_id)
-    return {"success":True,"data":{"algorithm_version":analysis.algorithm_version,"weights":analysis.weights_json,"scores":{"demand":analysis.demand_score,"profit":analysis.profit_score,"competition":analysis.competition_score,"compliance":analysis.compliance_score,"total":analysis.total_score},"risk_level":analysis.risk_level,"risks":analysis.risks_json,"evidence":analysis.evidence_json,"input_snapshot":analysis.input_snapshot,"visible_competitors":(product.raw_payload or {}).get("visibleCompetitors",[]) if product else [],"visible_lowest_competitor_price":(product.raw_payload or {}).get("visibleLowestCompetitorPriceRub",0) if product else 0,"created_at":analysis.created_at}}
+    return {"success":True,"data":{"algorithm_version":analysis.algorithm_version,"weights":analysis.weights_json,"scores":{"demand":analysis.demand_score,"profit":analysis.profit_score,"competition":analysis.competition_score,"compliance":analysis.compliance_score,"total":analysis.total_score},"risk_level":analysis.risk_level,"risks":analysis.risks_json,"evidence":product_view(product, analysis)["analysis"]["evidence"],"input_snapshot":analysis.input_snapshot,"visible_competitors":(product.raw_payload or {}).get("visibleCompetitors",[]) if product else [],"visible_lowest_competitor_price":(product.raw_payload or {}).get("visibleLowestCompetitorPriceRub",0) if product else 0,"created_at":analysis.created_at}}
 
 
 @router.get("/products/{product_id}/history")
@@ -337,10 +339,7 @@ async def product_history(product_id: str, ctx: dict = Depends(context), session
     if not product:
         raise HTTPException(404, detail={"code": "PRODUCT_NOT_FOUND", "message": "商品不存在或不属于当前企业。"})
     rows = await repo.history(product_id)
-    return {"success": True, "data": [{
-        "id": row.id, "captured_at": row.captured_at, "price": row.price, "rating": row.rating,
-        "review_count": row.review_count, "sales_30d": row.sales_30d, "competitor_count": row.competitor_count,
-    } for row in rows]}
+    return {"success": True, "data": [snapshot_view(row) for row in rows]}
 
 
 @router.get("/decisions")

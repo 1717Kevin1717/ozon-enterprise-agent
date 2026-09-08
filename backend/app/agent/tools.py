@@ -1,4 +1,5 @@
 import time
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 
@@ -7,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.entity_resolution import EntityResolution, resolve_query_entities, resolution_message
+from app.agent.query_understanding import understand_query, resolve_understanding, semantic_fallback, semantic_policy
 from app.agent.intent_engine import ParsedIntent, parse_intent
 from app.agent.runtime import AgentRunState
 from app.agent.tool_registry import TOOL_REGISTRY
@@ -15,6 +17,8 @@ from app.repositories.products import ProductRepository, product_view
 from app.schemas.agent import validate_agent_answer
 from app.services.decision_engine import analyze, recommendation_gate_status, simulate_price, to_dict
 from app.services.knowledge_base import search_documents
+from app.services.provenance import FRESHNESS_MAX_AGE_DAYS, evidence_notices, scoped_fields, snapshot_view
+from app.schemas.provenance import FieldEvidence
 
 
 TOOL_POLICY = {spec.tool_name: list(spec.allowed_roles) for spec in TOOL_REGISTRY.all()}
@@ -167,7 +171,7 @@ async def get_product_history(repo: ProductRepository, product_id: str, role: st
     if not await repo.get(product_id):
         return tool_error("get_product_history", "NOT_FOUND")
     rows = await repo.history(product_id)
-    data = [{"captured_at": item.captured_at, "price": item.price, "sales_30d": item.sales_30d, "rating": item.rating, "review_count": item.review_count, "competitor_count": item.competitor_count} for item in rows]
+    data = [snapshot_view(item) for item in rows]
     return {"tool": "get_product_history", "success": True, "data": data}
 
 
@@ -179,7 +183,9 @@ async def calculate_profit(repo: ProductRepository, product_id: str, role: str) 
         return tool_error("calculate_profit", "NOT_FOUND")
     result = to_dict(analyze(product))
     fields = ("gross_profit", "gross_margin", "net_profit", "net_margin", "roi", "expected_profit", "current_margin_rate", "break_even_price", "target_price", "profit_score", "risk_score", "data_confidence", "missing_data", "evidence_completeness")
-    return {"tool": "calculate_profit", "success": True, "data": {key: result[key] for key in fields}}
+    data = {key: result[key] for key in fields}
+    data["provenance"] = scoped_fields({"fields": result["evidence"].get("field_provenance", {})}, ("profit", "roi"))
+    return {"tool": "calculate_profit", "success": True, "data": data}
 
 
 async def analyze_competition(repo: ProductRepository, product_id: str, role: str) -> dict:
@@ -193,7 +199,7 @@ async def analyze_competition(repo: ProductRepository, product_id: str, role: st
 
 
 SALES_SNAPSHOT_MINIMUM = 2
-SALES_SNAPSHOT_FRESHNESS_DAYS = 30
+SALES_SNAPSHOT_FRESHNESS_DAYS = FRESHNESS_MAX_AGE_DAYS["sales_snapshot"]
 
 
 def sales_data_sufficiency(
@@ -343,7 +349,7 @@ def _agent_product(view: dict[str, Any]) -> dict[str, Any]:
     )
     lineage = view.get("field_lineage") or {}
     price_lineage = lineage.get("current_price") or lineage.get("currentPriceRub") or "company_product_database"
-    price_source = price_lineage.get("source", "company_product_database") if isinstance(price_lineage, dict) else str(price_lineage)
+    price_source = price_lineage.get("provider") or price_lineage.get("source", "company_product_database") if isinstance(price_lineage, dict) else str(price_lineage)
     return {
         "id": str(view.get("id") or ""), "external_product_id": str(view.get("external_product_id") or ""), "title": str(view.get("title") or ""),
         "brand": str(view.get("brand") or ""), "category_path": str(view.get("category_path") or ""), "score": float(analysis.get("recommendation_score") or 0),
@@ -357,6 +363,7 @@ def _agent_product(view: dict[str, Any]) -> dict[str, Any]:
         "updated_at": view.get("updated_at"), "current_margin_rate": margin,
         "net_profit": float(analysis.get("net_profit") or 0), "roi": float(analysis.get("roi") or 0), "missing_fields": list(analysis.get("missing_fields") or []),
         "url": str(view.get("url") or ""), "main_image_url": str(view.get("main_image_url") or ""),
+        "is_mock": bool((view.get("data_trust") or {}).get("is_mock")), "data_disclosure": str((view.get("data_trust") or {}).get("disclosure") or ""),
     }
 
 
@@ -414,7 +421,7 @@ def _display_scope(response_type: str, dimensions: tuple[str, ...]) -> list[str]
 
 def _source_name(lineage_value: Any, fallback: str) -> str:
     if isinstance(lineage_value, dict):
-        return str(lineage_value.get("source") or fallback)
+        return str(lineage_value.get("provider") or lineage_value.get("source") or fallback)
     return str(lineage_value or fallback)
 
 
@@ -479,7 +486,7 @@ def _overall_decision_status(intent: str, products: list[dict[str, Any]]) -> str
 
 async def _ensure_conversation(session: AsyncSession, company_id: str, user_id: str, query: str, session_id: str | None) -> ConversationSession:
     conversation = await session.get(ConversationSession, session_id) if session_id else None
-    if not conversation or conversation.company_id != company_id:
+    if not conversation or conversation.company_id != company_id or conversation.user_id != user_id:
         conversation = ConversationSession(company_id=company_id, user_id=user_id, title=query[:80], goal_summary=query[:300])
         session.add(conversation)
         await session.flush()
@@ -492,6 +499,7 @@ async def agent_v1_ask(
     fallback_reason: str | None = None, provider_notice: str = "", trace_prefix: list[dict[str, Any]] | None = None,
     active_model_override: str | None = None, token_usage_override: dict[str, Any] | None = None, model_summary: str = "",
     run_state: AgentRunState | None = None,
+    understanding_override=None, parsed_override=None, semantic_planner=None,
 ) -> dict:
     started = time.perf_counter()
     run_id = uid()
@@ -502,10 +510,21 @@ async def agent_v1_ask(
     if record_user_message:
         session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"selected_product_ids": selected_product_ids or []}))
 
-    parsed = parse_intent(query, selected_product_ids)
-    state = run_state or AgentRunState(parsed.policy)
     all_products = await repo.list(limit=500)
-    resolution = resolve_query_entities(all_products, query, 10) if parsed.policy.selection_mode != "ignore" else EntityResolution()
+    parsed, understanding = (parsed_override, understanding_override) if understanding_override is not None else understand_query(query, all_products, selected_product_ids)
+    if understanding.route == "SEMANTIC_PLANNER" and not understanding.planner_calls:
+        parsed, understanding = await semantic_fallback(query, understanding, semantic_planner, selected_product_ids or ())
+    if understanding.references and not understanding.entity_mentions:
+        reference_field = "current_price" if "这个价格" in query else (conversation.state_json or {}).get("last_fact_dimension")
+        understanding = understanding.model_copy(update={"reference_field": reference_field})
+        if "这个指标" in query and parsed.name == "provenance_fact" and reference_field:
+            dimensions = ("sales_snapshot", "data_sufficiency", "provenance") if reference_field == "sales_growth_rate" else ("profit", "provenance") if reference_field == "net_margin" else ("price", "provenance")
+            parsed = semantic_policy(parsed.name, dimensions, selected_product_ids or ())
+            understanding = understanding.model_copy(update={"requested_dimensions": list(dimensions), "metrics": [reference_field]})
+    state = run_state or AgentRunState(parsed.policy)
+    if not state.executions:
+        state.policy = parsed.policy  # A resolved reference may narrow/extend its field tools.
+    resolution = resolve_understanding(all_products, understanding) if parsed.policy.selection_mode != "ignore" else EntityResolution()
     entity_scoped = parsed.policy.selection_mode != "ignore" and parsed.name != "selection_recommendation"
     entity_blocked = entity_scoped and resolution.has_unresolved
     target_source = "query_entity" if resolution.products else "none"
@@ -514,10 +533,12 @@ async def agent_v1_ask(
         by_id = {item.id: item for item in all_products}
         targets = [by_id[item] for item in parsed.selected_product_ids if item in by_id]
         target_source = "explicit_selection" if targets else "none"
-    if not targets and not resolution.requested_entities and parsed.policy.selection_mode != "ignore" and any(token in query for token in ("刚才", "那个", "它", "这两个", "这几个", "这4个", "这四个", "相比")):
+    if not targets and not resolution.requested_entities and parsed.policy.selection_mode != "ignore" and (understanding.requires_context or any(token in query for token in ("刚才", "那个", "它", "这两个", "这几个", "这4个", "这四个", "相比"))):
         by_id = {item.id: item for item in all_products}
         targets = [by_id[item] for item in conversation.last_product_ids or [] if item in by_id]
         target_source = "session_reference" if targets else "none"
+
+    event(trace, "query_understood", "query_understanding", "已拆分问题意图、实体、指代和指标；业务事实仍由后端提供。", understanding=understanding.model_dump(mode="json"))
 
     event(trace, "planning_finished", "planner", f"已识别业务意图：{parsed.name}。", plan=list(parsed.plan), requested_dimensions=list(parsed.policy.requested_dimensions), selection_source=target_source)
 
@@ -526,7 +547,13 @@ async def agent_v1_ask(
         normalized = spec.input_schema.model_validate(arguments).model_dump()
 
         async def validated_runner() -> dict[str, Any]:
-            raw = await runner()
+            try:
+                raw = await asyncio.wait_for(runner(), timeout=spec.timeout_seconds)
+            except TimeoutError:
+                return tool_error(tool_name, "TOOL_TIMEOUT", "工具执行超时，请稍后重试。")
+            except Exception:
+                # Boundary catch: retain a failed run entry, never expose driver/DB traceback.
+                return tool_error(tool_name, "BACKEND_ERROR", "后端读取失败，本次未生成业务事实。")
             try:
                 return spec.output_schema.model_validate(raw).model_dump(mode="python")
             except ValidationError:
@@ -553,8 +580,13 @@ async def agent_v1_ask(
     elif parsed.name == "company_product_count":
         result = await execute("count_products", {}, lambda: count_products(repo, role), "已统计当前企业商品主档总数。")
         matched_count_override = int((result.get("data") or {}).get("count") or 0)
-    elif parsed.name in {"compliance_policy", "recommendation_policy"}:
+    elif parsed.name in {"compliance_policy", "recommendation_policy", "data_quality_policy", "unknown"}:
         pass
+    elif parsed.name == "data_quality_answer":
+        for target in targets[:10]:
+            detail = await execute("get_product", {"product_id": target.id}, lambda target=target: get_product(repo, target.id, role), f"已读取 {target.title} 的字段时效证据。")
+            if detail.get("success"):
+                views.append(detail["data"])
     elif parsed.name == "product_filter":
         args = {**parsed.filters, "limit": parsed.limit}
         result = await execute("filter_products", args, lambda: filter_products(repo, role, **args), "已按用户明确条件完成确定性筛选。")
@@ -630,6 +662,7 @@ async def agent_v1_ask(
     warning_messages: list[str] = []
     actions: list[str] = []
     evidence: list[dict[str, Any]] = []
+    trust_notices = []
     for view, product in zip(views, products):
         analysis = view.get("analysis") or {}
         requested = set(parsed.policy.requested_dimensions)
@@ -680,6 +713,17 @@ async def agent_v1_ask(
             if response_type in {"decision_report", "product_detail"} and (include_all_decision_evidence or "risk" in requested):
                 warning_messages.extend(_scoped_risk_message(view, item) for item in analysis.get("risks") or [])
 
+        trust = view.get("data_trust") or {}
+        fields = scoped_fields(trust, parsed.policy.requested_dimensions, decision=include_all_decision_evidence, criteria=filter_criteria)
+        # Existing response scopes stay intact. These are source caveats, not new business analyses.
+        evidence[-1]["fields"] = fields
+        evidence[-1]["disclosure"] = trust.get("disclosure", "来源未知。")
+        trust_notices.extend(item.model_dump() for item in evidence_notices([FieldEvidence.model_validate(item) for item in fields]))
+        if product["is_mock"]:
+            evidence[-1]["url"] = ""  # Ozon search URL is a reference, not proof of a mock price.
+        if response_type == "simple_fact" and fields:
+            evidence[-1]["source"] = fields[0]["provider"]
+
     if data_sufficiency and data_sufficiency.get("status") == "INSUFFICIENT_DATA":
         reported = data_sufficiency.get("reported_metric")
         source = data_sufficiency.get("reported_metric_source") or "not_provided"
@@ -687,7 +731,7 @@ async def agent_v1_ask(
         if reported is not None and source != "not_provided":
             warning_messages.append(f"企业报告记录销量增速 {float(reported):.1f}%（来源：{source}），但当前只有 {snapshot_count} 次销量快照，无法据此验证快照趋势。")
         if data_sufficiency.get("stale"):
-            warning_messages.append("最近一次销量快照已超过 30 天，不能代表当前销量趋势。")
+            warning_messages.append(f"最近一次销量快照已超过 {SALES_SNAPSHOT_FRESHNESS_DAYS} 天，不能代表当前销量趋势。")
 
     recommended = [item for item in products if item["decision_status"] == "RECOMMENDED"]
     decision_summary = {
@@ -754,6 +798,11 @@ async def agent_v1_ask(
     elif response_type == "simple_fact" and products and parsed.policy.requested_dimensions == ("risk",):
         product = products[0]
         fact = {"name": "product_risk_level", "value": product["risk_level"], "product_id": product["id"], "source": "deterministic_evaluation_engine", "timestamp": product["updated_at"]}
+    if fact and fact.get("product_id") and evidence and evidence[0].get("fields"):
+        fact["provenance"] = evidence[0]["fields"][0]
+        fact["source"] = fact["provenance"]["provider"]
+    if response_type == "decision_report" and trust_notices:
+        answer += " 本次结论须结合来源说明使用；演示、过期或来源不足的数据不能视为已验证的当前市场事实。"
     entities = [{"product_id": item.id, "name": item.title, "resolution_method": target_source} for item in targets if target_source != "none"]
     decision_status = "NOT_APPLICABLE" if response_type == "simple_fact" else _overall_decision_status(parsed.name, products)
     if response_type == "simple_fact":
@@ -768,10 +817,11 @@ async def agent_v1_ask(
         scoped_actions = ["查看商品证据后，由企业审核人决定是否进入下一阶段。"]
     payload = {
         "run_id": run_id, "session_id": session_id, "response_type": response_type, "answer": answer,
+        "understanding": understanding.model_dump(mode="json"),
         "matched_count": matched_count, "total_count": total_count, "displayed_count": displayed_count,
         "entities": entities, "requested_entities": [item.model_dump() for item in resolution.requested_entities], "product_ids": [item["id"] for item in products], "filter_criteria": filter_criteria, "fact": fact,
         "products": products, "tool_results": _tool_result_contract(state.executions), "evidence": evidence,
-        "risks": _unique(warning_messages), "warnings": _unique(warning_messages), "missing_data": missing_data, "next_actions": scoped_actions,
+        "risks": _unique(warning_messages), "warnings": _unique(warning_messages), "trust_notices": trust_notices, "missing_data": missing_data, "next_actions": scoped_actions,
         "requires_human_review": human_review_required, "human_review_required": human_review_required,
         "tool_trace_summary": _trace_summary(trace), "response_mode": response_mode, "source_badge": source_badge,
         "active_provider": "deterministic_planner" if response_mode != "glm_success" else "zhipu", "active_model": active_model_override or ("agent-v3-rule-planner" if response_mode != "glm_success" else "glm"),
@@ -783,14 +833,28 @@ async def agent_v1_ask(
         "conclusion": answer, "trace": trace, "simulation": simulation, "data_completeness": (views[0].get("analysis") or {}).get("evidence_completeness") if views else None,
         "provider_notice": provider_notice, "model_summary": model_summary,
     }
+    from app.agent.semantic_response import scope_semantic_response
+    scope_semantic_response(payload, views, understanding, entity_blocked)
+    failed_steps = [item for item in state.executions if item["status"] == "failed" and not any(
+        done["status"] == "success" and done["tool_name"] == item["tool_name"] and done["normalized_args"] == item["normalized_args"]
+        for done in state.executions)]
+    if failed_steps:
+        payload.update(response_type="error", task_completed=False, answer="后端工具未能完整返回数据，本次无法给出可靠结果，请稍后重试。", fact=None)
+        payload["conclusion"] = payload["answer"]
+    if payload["evidence"]:
+        event(trace, "evidence_bound", "provenance", "已绑定本次结论引用的字段证据；来源由后端提供。", evidence_ids=[field["evidence_id"] for item in payload["evidence"] for field in item.get("fields", [])])
     validated = validate_agent_answer(payload)
-    conversation.last_product_ids = [item["id"] for item in products[:10]]
-    conversation.conclusion_summary = answer[:1000]
-    conversation.state_json = {"last_intent": parsed.name, "last_product_ids": conversation.last_product_ids, "last_tool_summary": validated["tool_trace_summary"], "response_mode": response_mode, "requested_dimensions": list(parsed.policy.requested_dimensions)}
+    # Keep the last explicit context across a policy/clarification turn. No new history store.
+    if products:
+        conversation.last_product_ids = [item["id"] for item in products[:10]]
+    conversation.conclusion_summary = validated["answer"][:1000]
+    previous_dimension = (conversation.state_json or {}).get("last_fact_dimension")
+    conversation.state_json = {"last_intent": parsed.name, "last_product_ids": conversation.last_product_ids, "last_tool_summary": validated["tool_trace_summary"], "response_mode": response_mode, "requested_dimensions": list(parsed.policy.requested_dimensions), "last_fact_dimension": understanding.metrics[0] if products and understanding.metrics else previous_dimension}
+    answer = validated["answer"]
     if not conversation.goal_summary:
         conversation.goal_summary = query[:300]
     execution_log = state.executions
-    session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="assistant", content=answer, metadata_json={"run_id": run_id, "response_type": response_type, "response_mode": response_mode, "selected_product_ids": conversation.last_product_ids, "tool_trace_summary": validated["tool_trace_summary"], "missing_data": missing_data, "warnings": validated["warnings"], "decision_summary": decision_summary}))
+    session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="assistant", content=answer, metadata_json={"run_id": run_id, "response_type": validated["response_type"], "response_mode": response_mode, "selected_product_ids": conversation.last_product_ids, "tool_trace_summary": validated["tool_trace_summary"], "missing_data": validated["missing_data"], "warnings": validated["warnings"], "decision_summary": validated["decision_summary"]}))
     session.add(AgentRun(id=run_id, company_id=company_id, user_id=user_id, session_id=session_id, query=query, model=validated["active_model"], active_provider=validated["active_provider"], response_mode=response_mode, fallback_reason=fallback_reason or "", intent=parsed.name, prompt_version="agent-run-result-v2", tool_registry_version="v3", tools_used=[item["tool_name"] for item in execution_log if item["status"] in {"success", "failed"}], trace_json=[*trace, {"event": "run_execution_state", "executions": execution_log}], answer=answer, latency_ms=latency_ms, token_usage=token_usage_override or {}))
     await session.commit()
     return validated

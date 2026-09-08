@@ -1,4 +1,5 @@
 from urllib.parse import quote
+from datetime import UTC, datetime
 
 from app.connectors.images import ImageProvider, PublicDemoImageProvider
 from app.schemas.products import ProductIn
@@ -40,6 +41,7 @@ def _preserved_candidates(provider: ImageProvider) -> list[ProductIn]:
     for index, (external_id, name, brand, category, price, cost, sales, growth, competitors, competitor_min, competitor_avg, saturation, pressure, compliance, certificate) in enumerate(rows):
         image = provider.for_category(category, index)
         products.append(ProductIn(
+            captured_at=datetime.now(UTC),
             external_product_id=external_id,
             title=name,
             brand=brand,
@@ -110,6 +112,7 @@ def enterprise_demo_candidates(provider: ImageProvider | None = None) -> list[Pr
             product_name = f"{name} {2 + index % 7}件装" if index % 3 == 0 else name
             external_id = f"demo-ozon-{2000 + index}"
             products.append(ProductIn(
+                captured_at=datetime.now(UTC),
                 external_product_id=external_id,
                 title=product_name,
                 brand=f"{brand_roots[index % len(brand_roots)]}{category[:1]}Lab",

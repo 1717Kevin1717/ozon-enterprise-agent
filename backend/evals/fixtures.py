@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+from datetime import UTC, datetime, timedelta
 from contextlib import ExitStack
 from unittest.mock import patch
 
@@ -87,6 +88,17 @@ async def _execute(case: GoldenCase) -> dict:
             inputs += [ProductIn(**item.model_dump()) for item in case.setup.additions]
             catalog = []
             for item in inputs:
+                for override in case.setup.provenance_overrides:
+                    if override.title != item.title:
+                        continue
+                    if override.clear_provenance:
+                        item = item.model_copy(update={"field_lineage": {}, "raw_payload": {}, "sales_source": "not_provided"})
+                    else:
+                        record = {"source_type": override.source_type or "mock", "provider": override.provider or "mock_enterprise_catalog"}
+                        if override.age_days is not None:
+                            record["observed_at"] = (datetime.now(UTC) - timedelta(days=override.age_days)).isoformat()
+                            record["collected_at"] = record["observed_at"]
+                        item = item.model_copy(update={"field_lineage": {**item.field_lineage, override.field: record}})
                 product = await repo.upsert(item)
                 analysis = await repo.analyze(product)
                 # Oracle input captured BEFORE the Agent runs; no search/filter tool used.
@@ -98,8 +110,23 @@ async def _execute(case: GoldenCase) -> dict:
                     raise ValueError("Fixture title is missing")
                 return title_map[title]
 
+            foreign_catalog, foreign_denials = [], []
+            if case.setup.foreign_additions:
+                from app.agent.tools import get_product, get_product_history, calculate_profit
+                foreign_company = company + "-other"
+                session.add(Company(id=foreign_company, name="Other tenant fixture"))
+                await session.commit()
+                foreign_repo = ProductRepository(session, foreign_company)
+                for item in case.setup.foreign_additions:
+                    foreign = await foreign_repo.upsert(ProductIn(**item.model_dump(), raw_payload={"demo_data": True}))
+                    await foreign_repo.analyze(foreign)
+                    foreign_catalog.append({"id": foreign.id, "title": foreign.title})
+                    foreign_denials += [await tool(repo, foreign.id, "company_admin") for tool in (get_product, get_product_history, calculate_profit)]
+
             def expand(query):
-                return re.sub(r"\{product_id:([^}]+)\}", lambda match: identity(match[1]), query)
+                expanded = re.sub(r"\{product_id:([^}]+)\}", lambda match: identity(match[1]), query)
+                foreign_map = {item["title"]: item["id"] for item in foreign_catalog}
+                return re.sub(r"\{foreign_product_id:([^}]+)\}", lambda match: foreign_map[match[1]], expanded)
 
             selected = [identity(title) for title in case.setup.selected_titles]
             query = expand(case.query)
@@ -109,7 +136,12 @@ async def _execute(case: GoldenCase) -> dict:
                 session_id = previous["session_id"]
             mock_calls = 0
             if case.setup.mock_llm == "disabled":
-                result = await rule_agent_ask(session, company, "golden-user", "company_admin", query, session_id, selected)
+                async def semantic_mock(*args):
+                    nonlocal mock_calls
+                    mock_calls += 1
+                    return case.setup.semantic_plan
+                result = await rule_agent_ask(session, company, "golden-user", "company_admin", query, session_id, selected,
+                    semantic_planner=semantic_mock if case.setup.semantic_plan is not None else None)
             else:
                 ids = [identity(title) for title in case.setup.mock_product_titles]
 
@@ -137,6 +169,6 @@ async def _execute(case: GoldenCase) -> dict:
                 with patch.object(provider.httpx, "AsyncClient", MockClient), patch.object(provider.settings, "zhipu_api_key", "mock-eval-key-not-real"):
                     result = await provider.zhipu_agent_ask(session, company, "golden-user", "company_admin", query, session_id, selected)
             validated = AgentRunResult.model_validate(result).model_dump(mode="json")
-            return {"query": query, "result": validated, "catalog": catalog, "mock_calls": mock_calls}
+            return {"query": query, "result": validated, "catalog": catalog, "mock_calls": mock_calls, "company_id": company, "foreign_catalog": foreign_catalog, "foreign_denials": foreign_denials}
     finally:
         await engine.dispose()

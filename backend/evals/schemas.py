@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator, field_validator
-from app.schemas.agent import EntityResolutionResult, ResponseType
+from app.schemas.agent import EntityResolutionResult, ResponseType, IntentName
 
 EntityStatus = EntityResolutionResult.model_fields["status"].annotation
-Category = Literal["simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback"]
-Intent = Literal["company_product_count", "product_price", "product_filter", "product_detail", "profit_comparison", "product_comparison", "compliance_policy", "recommendation_policy", "selection_recommendation"]
+Category = Literal["simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback", "provenance", "semantic_understanding"]
+Intent = IntentName
 Dimension = Literal["count", "price", "risk", "profit", "roi", "identity", "demand", "competition", "compliance", "decision", "recommendation", "recommendation_policy", "sales_snapshot", "data_sufficiency", "filters", "data_completeness", "recommendation_score", "detail", "history"]
 
 
@@ -24,13 +24,25 @@ class AddedProduct(StrictModel):
     current_price: float = Field(gt=0)
 
 
+class ProvenanceOverride(StrictModel):
+    title: str
+    field: Literal["current_price", "sales_growth_rate"] = "current_price"
+    age_days: int | None = Field(default=None, ge=0)
+    source_type: str | None = None
+    provider: str | None = None
+    clear_provenance: bool = False
+
+
 class Setup(StrictModel):
     dataset: Literal["mock_enterprise_v1", "empty"] = "mock_enterprise_v1"
     selected_titles: list[str] = Field(default_factory=list)
     additions: list[AddedProduct] = Field(default_factory=list)
     previous_query: str | None = None
+    semantic_plan: dict[str, JsonValue] | None = None
     mock_llm: Literal["disabled", "timeout_after_tool", "repeated_tool"] = "disabled"
     mock_product_titles: list[str] = Field(default_factory=list)
+    provenance_overrides: list[ProvenanceOverride] = Field(default_factory=list)
+    foreign_additions: list[AddedProduct] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def mock_targets_required(self):
@@ -60,8 +72,27 @@ class SufficiencyTruth(StrictModel):
     reported_metric_source: str | None = None
 
 
+class ProvenanceTruth(StrictModel):
+    field: str | None = None
+    source_type: str | None = None
+    provider: str | None = None
+    is_mock: bool | None = None
+    freshness: Literal["FRESH", "STALE", "UNKNOWN"] | None = None
+    evidence_status: Literal["TRACEABLE", "SOURCE_MISSING"] | None = None
+    derived_inputs: list[str] = Field(default_factory=list)
+    notice_codes: list[str] = Field(default_factory=list)
+    forbidden_notice_codes: list[str] = Field(default_factory=list)
+    require_collected_at: bool = False
+    product_binding: bool = True
+    tenant_isolation: bool = False
+
+
 class Expected(StrictModel):
     intent: Intent | None = None
+    entity_mentions: list[str] | None = None
+    semantic_route: Literal["DETERMINISTIC_FAST_PATH", "SEMANTIC_PLANNER", "CLARIFICATION"] | None = None
+    planner_calls: int | None = Field(default=None, ge=0, le=1)
+    reference_field: str | None = None
     response_type: ResponseType | None = None
     entity_statuses: list[EntityStatus] | None = None
     resolved_titles: list[str] | None = None
@@ -84,6 +115,7 @@ class Expected(StrictModel):
     task_completed: bool | None = None
     reuse_tool: str | None = None
     duplicate_tool_execution: int | None = Field(default=None, ge=0)
+    provenance: ProvenanceTruth | None = None
 
     @field_validator("required_facts")
     @classmethod

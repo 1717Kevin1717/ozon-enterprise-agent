@@ -56,6 +56,11 @@ def summarize(rows):
     metrics, categories = defaultdict(list), defaultdict(list)
     for row in rows:
         categories[row["category"]].append(row["passed"])
+        if row["category"] == "semantic_understanding":
+            route = row.get("execution", {}).get("result", {}).get("understanding", {}).get("route")
+            name = {"DETERMINISTIC_FAST_PATH": "rule_fast_path_case_accuracy", "SEMANTIC_PLANNER": "semantic_fallback_case_accuracy", "CLARIFICATION": "semantic_clarification_case_accuracy"}.get(route)
+            if name:
+                metrics[name].append(row["passed"])
         by_metric = defaultdict(list)
         for assertion in row["assertions"]:
             by_metric[assertion["metric"]].append(assertion["passed"])

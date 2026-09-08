@@ -20,7 +20,7 @@ def product_aliases(product: Product) -> tuple[str, ...]:
 
 # Query grammar, not catalogue-specific aliases. Preserve unknown name qualifiers.
 _FIELD_SUFFIX = re.compile(
-    r"(?:的)?(?:当前|目前|现在)?(?:售价|价格|卖多少钱|多少钱|风险等级|风险级别|"
+    r"(?:的)?(?:当前|目前|现在)?(?:为什么|为何|怎么|主要卡在|数据|这个价格|这个指标|售价|价格|卖多少钱|多少钱|风险等级|风险级别|"
     r"净利润|利润|roi|销量|有(?:多少|几).*?快照|是否|能不能|值得|详情|怎么样|如何|中(?:选出|挑选|选择)|选出)", re.I
 )
 _REFERENCE = re.compile(r"(?:(?:和|与)?(?:刚才|当前|已选|那个|这个|那两个|这两个|这几个|这\d+个|这四个|它|对比中心)(?:那|这|的)?(?:几个|两个)?(?:商品|产品|候选)?(?:相比)?)\Z")
@@ -35,9 +35,13 @@ def query_mentions(query: str, protected_names: tuple[str, ...] = ()) -> list[st
             marker = f"__ENTITY_{len(protected)}__"
             text = text.replace(name, marker)
             protected[marker] = name
+    # Percent values in metric questions are not model/pack-size digits. Names
+    # already protected above retain legitimate 65W / 4件装 specifications.
+    text = re.sub(r"(?:的)?\s*[+-]?\d+(?:\.\d+)?\s*[%％]", "", text)
     text = re.sub(r"^(?:(?:请问|请|帮我|帮忙|查看|查询|分析一下|分析|比较|对比|如果|假如|把|将|从)\s*)+", "", text)
     text = _FIELD_SUFFIX.split(text, maxsplit=1)[0]
     text = re.split(r"[,，;；]", text, maxsplit=1)[0].strip(" 的：:。？！?!\"“”")
+    text = re.sub(r"(?:这|那)(?:个|条|项)$", "", text).rstrip(" 的")
     if not text or _REFERENCE.fullmatch(text) or text in {"候选池", "企业商品库", "公司商品库"}:
         return []
     mentions = re.split(r"以及|和|与|、|\s+vs\.?\s+", text, flags=re.I)

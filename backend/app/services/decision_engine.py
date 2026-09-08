@@ -3,6 +3,7 @@ from math import log1p
 from typing import Any
 
 from app.db.models import Product
+from app.services.provenance import build_trust
 
 ALGORITHM_VERSION = "v2.0.0-enterprise-evaluation"
 WEIGHTS = {"profit": 0.28, "demand": 0.24, "competition": 0.18, "compliance": 0.18, "risk": 0.12}
@@ -239,7 +240,7 @@ def analyze(product: Product, strategy_factor: float = 1.0, historical_risk_fact
         "risk": {"score": scores["risk"], "fields": [{"field": "manual_risk_level", "value": product.manual_risk_level, "source": "human_or_rule"}]},
         "dynamic": {"base_score": base_score, "data_confidence": completeness["ratio"], "strategy_factor": strategy_factor, "historical_risk_factor": historical_risk_factor, "recommendation_score": recommendation_score},
     }
-    return AnalysisResult(
+    result = AnalysisResult(
         demand_score=scores["demand"], profit_score=scores["profit"], competition_score=scores["competition"], compliance_score=scores["compliance"], risk_score=scores["risk"], total_score=total_score,
         base_score=base_score, recommendation_score=recommendation_score, recommendation_grade=grade, data_confidence=completeness["ratio"], data_completeness=completeness["percent"], evidence_completeness=completeness,
         missing_data=missing, missing_fields=missing_fields, risk_level=risk_level, risks=risks, evidence=evidence, score_explanations=score_explanations, recommendation=recommendation,
@@ -247,6 +248,17 @@ def analyze(product: Product, strategy_factor: float = 1.0, historical_risk_fact
         current_margin_rate=net_margin, expected_profit=net_profit, break_even_price=round(break_even_price, 2), target_price=round(target_price, 2), price_position=price_position,
         strategy_factor=strategy_factor, historical_risk_factor=historical_risk_factor,
     )
+    if product.id and product.company_id:
+        trust = build_trust(product, {key: getattr(result, key) for key in ("gross_profit", "gross_margin", "net_profit", "net_margin", "roi", "risk_level")})
+        evidence["field_provenance"] = {key: value.model_dump(mode="json") for key, value in trust.fields.items()}
+        evidence["disclosure"] = trust.disclosure
+        for dimension in ("demand", "profit", "competition", "compliance", "risk"):
+            for item in evidence[dimension]["fields"]:
+                source = trust.fields.get(item["field"])
+                item["source"] = source.provider if source else "unverified_input"
+                item["is_mock"] = source.is_mock if source else trust.is_mock
+                item["evidence_id"] = source.evidence_id if source else None
+    return result
 
 
 def recommendation_gate_status(

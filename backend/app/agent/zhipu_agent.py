@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.entity_resolution import resolve_query_entities
 from app.agent.intent_engine import parse_intent
+from app.agent.query_understanding import understand_query, semantic_fallback
 from app.agent.runtime import AgentRunState
 from app.agent.tool_registry import TOOL_REGISTRY
 from app.agent.tools import (
@@ -184,7 +185,15 @@ async def _conversation_messages(session: AsyncSession, company_id: str, session
 
 
 async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, role: str, query: str, session_id: str | None, selected_product_ids: list[str] | None = None) -> dict:
-    parsed = parse_intent(query, selected_product_ids)
+    parsed, understanding = understand_query(query, await ProductRepository(session, company_id).list(limit=500), selected_product_ids)
+    if understanding.route == "SEMANTIC_PLANNER":
+        parsed, understanding = await semantic_fallback(query, understanding, _semantic_plan if settings.zhipu_api_key else None, selected_product_ids or ())
+        return await rule_agent_ask(session, company_id, user_id, role, query, session_id, selected_product_ids=selected_product_ids,
+            understanding_override=understanding, parsed_override=parsed,
+            response_mode="deterministic_fallback" if understanding.failure_code else "glm_success",
+            fallback_reason=understanding.failure_code,
+            active_model_override=settings.zhipu_model if not understanding.failure_code else None,
+            provider_notice="语义规划未成功，当前需要澄清；未编造商品事实。" if understanding.failure_code else "GLM仅完成问题理解；全部事实和解释来自后端证据。")
     run_state = AgentRunState(parsed.policy)
     if parsed.policy.fast_path:
         return await rule_agent_ask(
@@ -207,7 +216,7 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
     if not settings.zhipu_api_key:
         return await rule_agent_ask(session, company_id, user_id, role, query, session_id, selected_product_ids=selected_product_ids, response_mode="deterministic_fallback", fallback_reason="KEY_MISSING", provider_notice=SAFE_ERROR_MESSAGES["KEY_MISSING"], run_state=run_state)
     conversation = await session.get(ConversationSession, session_id) if session_id else None
-    if not conversation or conversation.company_id != company_id:
+    if not conversation or conversation.company_id != company_id or conversation.user_id != user_id:
         conversation = ConversationSession(company_id=company_id, user_id=user_id, title=query[:80], goal_summary=query[:300])
         session.add(conversation)
         await session.flush()
@@ -271,3 +280,20 @@ async def zhipu_agent_ask(session: AsyncSession, company_id: str, user_id: str, 
         model_summary="",
         run_state=run_state,
     )
+
+
+async def _semantic_plan(query: str, rule_understanding: dict):
+    """One request, no tool loop, no enterprise catalogue or prior conversations sent."""
+    from app.schemas.agent import QueryUnderstanding
+    prompt = "你只拆分问题，不回答业务事实。返回符合给定Schema的JSON。entity_mentions必须是当前query原文的商品名称片段；指代放references。禁止猜测商品ID、价格、合规或计算结果。仅选择来源核验、计算解释、推荐原因、数据质量或简单事实意图。planned_tools仅可为get_product/calculate_profit/get_sales_trend；后端会核验权限和范围。"
+    try:
+        async with httpx.AsyncClient(timeout=min(settings.zhipu_timeout_seconds, 15)) as client:
+            response = await client.post(f"{settings.zhipu_base_url.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {settings.zhipu_api_key}"},
+                json={"model": settings.zhipu_model, "temperature": 0, "max_tokens": 900,
+                    "messages": [{"role": "system", "content": prompt + json.dumps(QueryUnderstanding.model_json_schema(), ensure_ascii=False)},
+                                 {"role": "user", "content": query}]})
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+    except (httpx.HTTPError, KeyError, IndexError) as exc:
+        raise ValueError("Semantic provider unavailable") from exc
