@@ -26,7 +26,9 @@ def test_demo_seed_populates_enterprise_dashboard_idempotently():
     assert payload["metrics"]["total_products"] == 60
     assert payload["metrics"]["analyzed_products"] == 60
     assert payload["categories"]
-    assert payload["agent"]["status"] in {"unconfigured", "configured", "ready", "error"}
+    assert payload["agent"]["status"] in {
+        "disabled", "not_configured", "configured_unverified", "ready", "error",
+    }
     assert "notice" in payload["agent"]
     assert {item["key"] for item in payload["data_coverage"]} == {
         "identity",

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.schemas.agent import AgentEvidence
 from app.schemas.provenance import FieldEvidence, ProductDataTrust
-from app.services.provenance import build_trust, raw_evidence, derived_evidence, freshness
+from app.services.provenance import build_trust, raw_evidence, derived_evidence, freshness, scoped_fields
 
 
 NOW = datetime(2026, 9, 4, 12, tzinfo=UTC)
@@ -98,6 +98,89 @@ def test_complete_presence_is_not_freshness_or_trend_sufficiency():
     assert suff["reported_metric"] == -9.6 and suff["observed_trend"] == "INSUFFICIENT_DATA"
 
 
+def profit_evidence_bundle(**updates):
+    from app.agent.tools import _profit_calculation_evidence
+    from app.services.decision_engine import analyze, to_dict
+    from app.services.demo_dataset import enterprise_demo_candidates
+
+    candidate = enterprise_demo_candidates()[0].model_copy(update=updates)
+    subject = SimpleNamespace(id="profit-evidence-product", company_id="test-tenant", currency="RUB", **candidate.model_dump())
+    result = to_dict(analyze(subject))
+    data = {
+        "net_profit": result["net_profit"],
+        "net_margin": result["net_margin"],
+        "roi": result["roi"],
+        "provenance": scoped_fields({"fields": result["evidence"]["field_provenance"]}, ("profit", "roi")),
+    }
+    return candidate, result, data, _profit_calculation_evidence(data)
+
+
+def test_b01_profit_result_and_evidence_are_same_calculation():
+    _candidate, result, _data, calculation = profit_evidence_bundle()
+    assert calculation["result"] == result["net_profit"]
+    assert calculation["metric"] == "net_profit" and calculation["unit"] == "RUB"
+    assert calculation["derived_from"]
+
+
+def test_b02_profit_evidence_contains_current_price_input():
+    candidate, _result, _data, calculation = profit_evidence_bundle(current_price=777)
+    inputs = {item["field"]: item for item in calculation["inputs"]}
+    assert inputs["current_price"]["value"] == candidate.current_price == 777
+    assert calculation["input_sources"]["current_price"] != "unknown"
+
+
+def test_b03_margin_uses_same_current_price_and_profit_result():
+    candidate, result, _data, calculation = profit_evidence_bundle(current_price=777)
+    inputs = {item["field"]: item for item in calculation["inputs"]}
+    assert inputs["current_price"]["value"] == 777
+    assert result["net_margin"] == pytest.approx(result["net_profit"] / candidate.current_price, abs=0.0001)
+
+
+def test_b04_unknown_cost_inputs_are_disclosed_as_zero_normalization():
+    _candidate, _result, _data, calculation = profit_evidence_bundle(
+        procurement_cost=0, shipping_cost=0, fulfillment_cost=0, advertising_cost=0,
+        platform_fee=0, warehousing_cost=0, tax_cost=0, return_loss_reserve=0,
+        other_cost=0, platform_commission_rate=0, field_lineage={},
+        raw_payload={"source": "unidentified_import"},
+    )
+    inputs = {item["field"]: item for item in calculation["inputs"]}
+    assert inputs["procurement_cost"]["presence"] == "UNKNOWN"
+    assert "normalized to 0" in calculation["formula"]
+
+
+def test_b05_missing_source_propagates_to_calculation_evidence_status():
+    _candidate, _result, _data, calculation = profit_evidence_bundle(
+        field_lineage={}, raw_payload={"source": "unidentified_import"},
+    )
+    assert calculation["evidence_status"] == "SOURCE_MISSING"
+    assert any(item["evidence_status"] == "SOURCE_MISSING" for item in calculation["inputs"])
+
+
+def test_b06_cost_breakdown_is_backend_input_projection_sorted_by_amount():
+    candidate, result, _data, calculation = profit_evidence_bundle()
+    amounts = [item["amount"] for item in calculation["cost_breakdown"]]
+    assert amounts == sorted(amounts, reverse=True)
+    assert sum(amounts) == pytest.approx(candidate.current_price - result["net_profit"], abs=0.01)
+    assert calculation["total_cost"] == pytest.approx(sum(amounts), abs=0.01)
+    assert calculation["cost_breakdown"][0]["share_of_price"] == pytest.approx(amounts[0] / candidate.current_price, abs=0.0001)
+
+
+def test_b07_calculation_evidence_does_not_reverse_engineer_inputs_from_result():
+    _candidate, _result, data, calculation = profit_evidence_bundle()
+    original_breakdown = calculation["cost_breakdown"]
+    data["net_profit"] = 999999
+    from app.agent.tools import _profit_calculation_evidence
+    changed = _profit_calculation_evidence(data)
+    assert changed["result"] == 999999
+    assert changed["cost_breakdown"] == original_breakdown
+
+
+def test_b08_mock_disclosure_is_preserved_in_profit_evidence():
+    _candidate, _result, _data, calculation = profit_evidence_bundle()
+    assert any(item["is_mock"] for item in calculation["inputs"])
+    assert all(item["provider"] != "ozon" for item in calculation["inputs"] if item["is_mock"])
+
+
 def test_product_binding_rejects_foreign_fields():
     trust = build_trust(product(), now=NOW).model_dump()
     trust["fields"]["current_price"]["company_id"] = "other"
@@ -109,7 +192,7 @@ async def repository_scenario():
     from app.db.models import Base, Company
     from app.repositories.products import ProductRepository, product_view
     from app.schemas.products import ProductIn, ProductPatch
-    from app.agent.tools import rule_agent_ask, get_product, get_product_history, calculate_profit
+    from app.agent.tools import rule_agent_ask, get_product, get_product_history, calculate_profit, merge_profit_calculation
     from app.services.demo_dataset import enterprise_demo_candidates
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
@@ -157,6 +240,12 @@ async def repository_scenario():
             legacy_view = product_view(p, a)
             assert legacy_view["data_trust"]["fields"]["net_profit"]["inputs"][0]["value"] is None
             assert any(item["code"] == "LEGACY_ANALYSIS" for item in legacy_view["data_trust"]["notices"])
+            current_profit = await calculate_profit(repo, p.id, "company_admin")
+            merge_profit_calculation(legacy_view, current_profit)
+            rebound = legacy_view["data_trust"]["fields"]["net_profit"]
+            assert rebound["inputs"][0]["value"] == 170
+            assert legacy_view["analysis"]["net_profit"] == current_profit["data"]["net_profit"]
+            assert not any(item["code"] == "LEGACY_ANALYSIS" for item in legacy_view["data_trust"]["notices"])
             # A subsequent raw update without evidence invalidates only the changed field's source.
             manual = await repo.upsert(ProductIn(external_product_id="manual-test", title="手工设备", current_price=90, raw_payload={"source": "enterprise_workbench"}))
             assert raw_evidence(manual, "current_price").source_type == "manual"

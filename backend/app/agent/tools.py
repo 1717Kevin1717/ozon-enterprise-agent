@@ -1,5 +1,6 @@
 import time
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 
@@ -8,7 +9,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.entity_resolution import EntityResolution, resolve_query_entities, resolution_message
-from app.agent.query_understanding import understand_query, resolve_understanding, semantic_fallback, semantic_policy
+from app.agent.context import build_context_snapshot, resolve_context_reference
+from app.agent.query_understanding import arbitrate_entity_mentions, build_semantic_context_packet, understand_query, semantic_fallback, semantic_policy
 from app.agent.intent_engine import ParsedIntent, parse_intent
 from app.agent.runtime import AgentRunState
 from app.agent.tool_registry import TOOL_REGISTRY
@@ -185,7 +187,97 @@ async def calculate_profit(repo: ProductRepository, product_id: str, role: str) 
     fields = ("gross_profit", "gross_margin", "net_profit", "net_margin", "roi", "expected_profit", "current_margin_rate", "break_even_price", "target_price", "profit_score", "risk_score", "data_confidence", "missing_data", "evidence_completeness")
     data = {key: result[key] for key in fields}
     data["provenance"] = scoped_fields({"fields": result["evidence"].get("field_provenance", {})}, ("profit", "roi"))
+    calculation_evidence = _profit_calculation_evidence(data)
+    if calculation_evidence:
+        data["calculation_evidence"] = calculation_evidence
     return {"tool": "calculate_profit", "success": True, "data": data}
+
+
+def _profit_calculation_evidence(data: dict[str, Any]) -> dict[str, Any]:
+    """Project current raw inputs into an auditable calculation view without reverse engineering."""
+    net_profit_evidence = next(
+        (item for item in data.get("provenance", []) if item.get("field") == "net_profit"),
+        None,
+    )
+    if not net_profit_evidence:
+        return {}
+    inputs = {item["field"]: item for item in net_profit_evidence.get("inputs", [])}
+
+    def amount(field: str) -> float:
+        value = inputs.get(field, {}).get("value")
+        return float(value or 0)
+
+    shipping_field = "shipping_cost" if amount("shipping_cost") else "fulfillment_cost"
+    price = amount("current_price")
+    commission_rate = amount("platform_commission_rate")
+    commission_sources = [inputs.get("current_price", {}), inputs.get("platform_commission_rate", {})]
+    cost_items = [
+        ("procurement_cost", amount("procurement_cost"), inputs.get("procurement_cost", {})),
+        (shipping_field, amount(shipping_field), inputs.get(shipping_field, {})),
+        ("platform_commission", price * commission_rate, {
+            "provider": "deterministic_evaluation_engine",
+            "presence": "PRESENT" if all(item.get("presence") == "PRESENT" for item in commission_sources) else "UNKNOWN",
+            "evidence_status": "TRACEABLE" if all(item.get("evidence_status") == "TRACEABLE" for item in commission_sources) else "SOURCE_MISSING",
+        }),
+        *[(field, amount(field), inputs.get(field, {})) for field in (
+            "platform_fee", "advertising_cost", "warehousing_cost", "tax_cost",
+            "return_loss_reserve", "other_cost",
+        )],
+    ]
+    rendered_costs = [
+        {
+            "field": field,
+            "amount": round(value, 4),
+            "share_of_price": round(value / price, 4) if price else None,
+            "provider": source.get("provider", "unknown"),
+            "presence": source.get("presence", "UNKNOWN"),
+            "evidence_status": source.get("evidence_status", "SOURCE_MISSING"),
+        }
+        for field, value, source in sorted(cost_items, key=lambda item: item[1], reverse=True)
+    ]
+    return {
+        "metric": "net_profit",
+        "formula": net_profit_evidence.get("calculation", ""),
+        "inputs": net_profit_evidence.get("inputs", []),
+        "input_sources": {field: item.get("provider", "unknown") for field, item in inputs.items()},
+        "derived_from": net_profit_evidence.get("derived_from", []),
+        "result": data.get("net_profit"),
+        "net_margin": data.get("net_margin"),
+        "roi": data.get("roi"),
+        "sale_price": price,
+        "total_cost": round(sum(item["amount"] for item in rendered_costs), 4),
+        "unit": "RUB",
+        "evidence_status": net_profit_evidence.get("evidence_status", "SOURCE_MISSING"),
+        "input_gaps": [item["field"] for item in rendered_costs if item["presence"] != "PRESENT"],
+        "cost_breakdown": rendered_costs,
+    }
+
+
+def merge_profit_calculation(view: dict[str, Any], tool_result: dict[str, Any]) -> None:
+    """Bind current deterministic profit state and its evidence to one response view."""
+    if not tool_result.get("success"):
+        return
+    data = tool_result.get("data") or {}
+    analysis = view.setdefault("analysis", {})
+    for field in (
+        "gross_profit", "gross_margin", "net_profit", "net_margin", "roi",
+        "current_margin_rate", "expected_profit", "break_even_price", "target_price",
+        "profit_score", "risk_score", "data_confidence", "missing_data", "evidence_completeness",
+    ):
+        if field in data:
+            analysis[field] = data[field]
+    if "net_margin" in data:
+        view["current_margin_rate"] = data["net_margin"]
+    if data.get("calculation_evidence"):
+        analysis["calculation_evidence"] = data["calculation_evidence"]
+
+    trust = view.setdefault("data_trust", {})
+    trust_fields = trust.setdefault("fields", {})
+    for item in data.get("provenance") or []:
+        trust_fields[item["field"]] = item
+    if data.get("provenance"):
+        trust["is_mock"] = bool(trust.get("is_mock") or any(item.get("is_mock") for item in data["provenance"]))
+        trust["notices"] = [item for item in trust.get("notices", []) if item.get("code") != "LEGACY_ANALYSIS"]
 
 
 async def analyze_competition(repo: ProductRepository, product_id: str, role: str) -> dict:
@@ -495,9 +587,14 @@ async def _ensure_conversation(session: AsyncSession, company_id: str, user_id: 
 
 async def agent_v1_ask(
     session: AsyncSession, company_id: str, user_id: str, role: str, query: str, session_id: str | None,
-    selected_product_ids: list[str] | None = None, record_user_message: bool = True, response_mode: str = "rule_engine",
+    selected_product_ids: list[str] | None = None, selection_revision: int = 0, selection_bound_session_id: str | None = None,
+    record_user_message: bool = True, response_mode: str = "rule_engine",
     fallback_reason: str | None = None, provider_notice: str = "", trace_prefix: list[dict[str, Any]] | None = None,
     active_model_override: str | None = None, token_usage_override: dict[str, Any] | None = None, model_summary: str = "",
+    active_provider_override: str | None = None, reasoning_handler=None,
+    fallback_used_override: bool | None = None,
+    requested_provider_override: str | None = None, fallback_provider_override: str | None = None,
+    model_route_override: str | None = None, provider_calls_override: list[dict[str, Any]] | None = None,
     run_state: AgentRunState | None = None,
     understanding_override=None, parsed_override=None, semantic_planner=None,
 ) -> dict:
@@ -508,14 +605,25 @@ async def agent_v1_ask(
     conversation = await _ensure_conversation(session, company_id, user_id, query, session_id)
     session_id = conversation.id
     if record_user_message:
-        session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"selected_product_ids": selected_product_ids or []}))
+        session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"selected_product_ids": selected_product_ids or [], "selection_revision": selection_revision, "selection_bound_session_id": selection_bound_session_id}))
 
     all_products = await repo.list(limit=500)
-    parsed, understanding = (parsed_override, understanding_override) if understanding_override is not None else understand_query(query, all_products, selected_product_ids)
+    context_snapshot = build_context_snapshot(
+        conversation, company_id=company_id, user_id=user_id, query=query, products=all_products,
+        selected_product_ids=selected_product_ids, selection_revision=selection_revision,
+        selection_bound_session_id=selection_bound_session_id,
+    )
+    parsed, understanding = (parsed_override, understanding_override) if understanding_override is not None else understand_query(query, all_products, selected_product_ids, context_snapshot)
     if understanding.route == "SEMANTIC_PLANNER" and not understanding.planner_calls:
-        parsed, understanding = await semantic_fallback(query, understanding, semantic_planner, selected_product_ids or ())
+        if semantic_planner is not None:
+            packet = build_semantic_context_packet(query, understanding, context_snapshot, all_products)
+            parsed, understanding = await semantic_fallback(query, understanding, semantic_planner, selected_product_ids or (), packet)
+        elif not parsed.recognized:
+            parsed, understanding = await semantic_fallback(query, understanding, None, selected_product_ids or ())
+        else:
+            understanding = understanding.model_copy(update={"route": "DETERMINISTIC_FAST_PATH"})
     if understanding.references and not understanding.entity_mentions:
-        reference_field = "current_price" if "这个价格" in query else (conversation.state_json or {}).get("last_fact_dimension")
+        reference_field = "current_price" if "这个价格" in query else context_snapshot.last_fact_dimension
         understanding = understanding.model_copy(update={"reference_field": reference_field})
         if "这个指标" in query and parsed.name == "provenance_fact" and reference_field:
             dimensions = ("sales_snapshot", "data_sufficiency", "provenance") if reference_field == "sales_growth_rate" else ("profit", "provenance") if reference_field == "net_margin" else ("price", "provenance")
@@ -524,19 +632,25 @@ async def agent_v1_ask(
     state = run_state or AgentRunState(parsed.policy)
     if not state.executions:
         state.policy = parsed.policy  # A resolved reference may narrow/extend its field tools.
-    resolution = resolve_understanding(all_products, understanding) if parsed.policy.selection_mode != "ignore" else EntityResolution()
+    arbitration = (
+        arbitrate_entity_mentions(all_products, understanding, query)
+        if parsed.policy.selection_mode != "ignore"
+        else None
+    )
+    resolution = arbitration.resolution if arbitration else EntityResolution()
     entity_scoped = parsed.policy.selection_mode != "ignore" and parsed.name != "selection_recommendation"
-    entity_blocked = entity_scoped and resolution.has_unresolved
-    target_source = "query_entity" if resolution.products else "none"
-    targets = resolution.products
-    if not targets and parsed.selected_product_ids and (not resolution.requested_entities or not entity_scoped):
-        by_id = {item.id: item for item in all_products}
-        targets = [by_id[item] for item in parsed.selected_product_ids if item in by_id]
-        target_source = "explicit_selection" if targets else "none"
-    if not targets and not resolution.requested_entities and parsed.policy.selection_mode != "ignore" and (understanding.requires_context or any(token in query for token in ("刚才", "那个", "它", "这两个", "这几个", "这4个", "这四个", "相比"))):
-        by_id = {item.id: item for item in all_products}
-        targets = [by_id[item] for item in conversation.last_product_ids or [] if item in by_id]
-        target_source = "session_reference" if targets else "none"
+    explicit_ids = [item.id for item in resolution.products]
+    context_resolution = resolve_context_reference(query, understanding, explicit_ids, context_snapshot)
+    entity_blocked = entity_scoped and (resolution.has_unresolved or context_resolution.requires_clarification)
+    context_source = context_resolution.source
+    target_source = {
+        "explicit_query": "query_entity", "ui_selection": "explicit_selection",
+        "last_explicit_entity": "session_reference", "last_comparison": "session_reference",
+        "last_resolved_entity": "session_reference", "ordinal_reference": "session_reference",
+        "session_state": "session_reference",
+    }.get(context_source, "none")
+    by_id = {item.id: item for item in all_products}
+    targets = [by_id[item] for item in context_resolution.product_ids if item in by_id]
 
     event(trace, "query_understood", "query_understanding", "已拆分问题意图、实体、指代和指标；业务事实仍由后端提供。", understanding=understanding.model_dump(mode="json"))
 
@@ -574,7 +688,19 @@ async def agent_v1_ask(
     total_count_override: int | None = None
     displayed_count_override: int | None = None
     filter_criteria: dict[str, Any] = {}
-    event(trace, "entity_resolution", "entity_resolver", "已逐项保存本轮商品名称解析结果。", requested_entities=[item.model_dump() for item in resolution.requested_entities])
+    event(
+        trace, "entity_resolution", "entity_resolver", "已逐项保存本轮商品名称解析结果。",
+        requested_entities=[{
+            "status": item.status,
+            "resolved": item.resolved,
+            "candidate_count": len(item.candidates),
+        } for item in resolution.requested_entities],
+        entity_candidate_count=len(understanding.entity_mentions),
+        candidate_role=list(arbitration.candidate_roles) if arbitration else [],
+        candidate_resolution_status=list(arbitration.candidate_statuses) if arbitration else [],
+        context_target_source=context_source,
+        ignored_semantic_candidate_count=arbitration.ignored_semantic_candidate_count if arbitration else 0,
+    )
     if entity_blocked:
         event(trace, "entity_resolution_blocked", "entity_resolver", "存在未解析实体，本次不执行商品工具或部分比较。")
     elif parsed.name == "company_product_count":
@@ -618,7 +744,8 @@ async def agent_v1_ask(
             if parsed.name == "profit_comparison":
                 for view in views:
                     product_id = str(view["id"])
-                    await execute("calculate_profit", {"product_id": product_id}, lambda product_id=product_id: calculate_profit(repo, product_id, role), f"已核算 {view['title']} 的利润与 ROI。")
+                    profit_result = await execute("calculate_profit", {"product_id": product_id}, lambda product_id=product_id: calculate_profit(repo, product_id, role), f"已核算 {view['title']} 的利润与 ROI。")
+                    merge_profit_calculation(view, profit_result)
     elif parsed.name == "product_price":
         if len(targets) == 1:
             target = targets[0]
@@ -653,10 +780,14 @@ async def agent_v1_ask(
             if detail.get("success"):
                 views = [detail["data"]]
             if "profit" in parsed.policy.requested_dimensions:
-                await execute("calculate_profit", {"product_id": target.id}, lambda: calculate_profit(repo, target.id, role), f"已核算 {target.title} 的利润与 ROI。")
+                profit_result = await execute("calculate_profit", {"product_id": target.id}, lambda: calculate_profit(repo, target.id, role), f"已核算 {target.title} 的利润与 ROI。")
+                if views:
+                    merge_profit_calculation(views[0], profit_result)
 
     products = [_agent_product(view) for view in views]
     response_type = _response_type(parsed, resolution, products, data_sufficiency)
+    if context_resolution.requires_clarification and parsed.policy.selection_mode != "ignore":
+        response_type = "clarification"
     display_scope = _display_scope(response_type, parsed.policy.requested_dimensions)
     missing_data: list[dict[str, Any]] = []
     warning_messages: list[str] = []
@@ -741,7 +872,22 @@ async def agent_v1_ask(
         "statuses": {item["id"]: item["decision_status"] for item in products},
     }
     if entity_blocked:
-        answer = resolution_message(resolution, comparison=parsed.name in {"profit_comparison", "product_comparison"})
+        if resolution.has_unresolved:
+            answer = resolution_message(resolution, comparison=parsed.name in {"profit_comparison", "product_comparison"})
+        elif context_resolution.failure_code == "MISSING_UI_SELECTION":
+            answer = "当前没有可引用的已选商品，请先在对比中心选择商品，或直接说出商品名称。"
+        elif context_resolution.failure_code == "ORDINAL_OUT_OF_RANGE":
+            answer = "当前会话没有对应序号的比较商品，请先完成一次明确的商品比较。"
+        elif context_resolution.failure_code == "MISSING_CONTEXT" and (
+            understanding.metric == "net_margin"
+            or "net_margin" in understanding.metrics
+            or understanding.reference_field == "net_margin"
+        ):
+            answer = "请告诉我你想查看哪个商品的净利率。"
+        elif context_resolution.failure_code == "MISSING_CONTEXT" and "profit" in understanding.requested_dimensions:
+            answer = "请告诉我你想查看哪个商品的利润或净利率。"
+        else:
+            answer = "当前会话中没有唯一可引用的商品，请直接说出商品名称。"
     elif parsed.name == "company_product_count":
         answer = f"目前公司商品主档一共有 {matched_count_override or 0} 个。"
     elif parsed.name == "compliance_policy":
@@ -760,7 +906,11 @@ async def agent_v1_ask(
     elif parsed.name in {"profit_comparison", "product_comparison"}:
         labels = {"profit": "利润", "roi": "ROI", "demand": "需求", "competition": "竞争", "compliance": "合规", "risk": "风险", "identity": "商品身份", "price": "价格"}
         dimension = "、".join(labels.get(key, key) for key in parsed.policy.requested_dimensions)
-        answer = f"已完成 {len(products)} 个明确商品的{dimension}对比；按本次请求的维度展示，不代表推荐上架。" if products else "请点名或选择至少两个不同的本企业商品后再比较。"
+        if products and parsed.name == "profit_comparison" and re.search(r"谁.*(?:利润|赚).*(?:好|高|多)|利润.*(?:最好|最高)", query):
+            leader = max(products, key=lambda item: (item["net_profit"], item["current_margin_rate"], item["id"]))
+            answer = f"按后端当前利润计算，{leader['title']} 的单件净利润最高，为 {leader['net_profit']:.2f} {leader['currency']}；本次只比较利润与 ROI，不代表推荐上架。"
+        else:
+            answer = f"已完成 {len(products)} 个明确商品的{dimension}对比；按本次请求的维度展示，不代表推荐上架。" if products else "请点名或选择至少两个不同的本企业商品后再比较。"
     elif parsed.name == "product_price":
         answer = f"{products[0]['title']} 当前售价为 {products[0]['current_price']:g} {products[0]['currency']}。" if products else "请提供要查询的商品名称或商品 ID。"
     elif products and response_type == "simple_fact" and parsed.policy.requested_dimensions == ("risk",):
@@ -784,11 +934,27 @@ async def agent_v1_ask(
     else:
         answer = "请提供要查询的商品名称或商品 ID，或明确引用已选商品。"
 
-    source_badge = "GLM 实际调用成功" if response_mode == "glm_success" else "确定性 Planner 回退" if response_mode == "deterministic_fallback" else "规则引擎结果"
+    source_badge = (
+        "GLM 实际调用成功" if response_mode == "glm_success" else
+        f"{active_provider_override or '语义模型'} 实际调用成功" if response_mode == "model_success" else
+        "确定性 Planner 回退" if response_mode == "deterministic_fallback" else "规则引擎结果"
+    )
     latency_ms = round((time.perf_counter() - started) * 1000)
     matched_count = matched_count_override if matched_count_override is not None else len(products)
     total_count = total_count_override if total_count_override is not None else matched_count
     displayed_count = displayed_count_override if displayed_count_override is not None else len(products)
+    clarification_code: str | None = None
+    if response_type == "clarification":
+        if context_resolution.requires_clarification:
+            clarification_code = context_resolution.failure_code or "MISSING_CONTEXT"
+        elif resolution.has_unresolved:
+            statuses = {item.status for item in resolution.requested_entities if not item.resolved}
+            if "AMBIGUOUS" in statuses:
+                clarification_code = "ENTITY_AMBIGUOUS"
+            elif "LOW_CONFIDENCE" in statuses:
+                clarification_code = "ENTITY_LOW_CONFIDENCE"
+        elif understanding.clarification_required and not understanding.failure_code:
+            clarification_code = "USER_CLARIFICATION_REQUIRED"
     fact = None
     if parsed.name == "company_product_count":
         fact = {"name": "company_product_count", "value": matched_count, "unit": "products", "source": "company_product_database"}
@@ -824,12 +990,19 @@ async def agent_v1_ask(
         "risks": _unique(warning_messages), "warnings": _unique(warning_messages), "trust_notices": trust_notices, "missing_data": missing_data, "next_actions": scoped_actions,
         "requires_human_review": human_review_required, "human_review_required": human_review_required,
         "tool_trace_summary": _trace_summary(trace), "response_mode": response_mode, "source_badge": source_badge,
-        "active_provider": "deterministic_planner" if response_mode != "glm_success" else "zhipu", "active_model": active_model_override or ("agent-v3-rule-planner" if response_mode != "glm_success" else "glm"),
-        "fallback_reason": fallback_reason, "latency_ms": latency_ms, "token_usage": token_usage_override or {}, "intent": parsed.name,
-        "task_completed": response_type not in {"clarification", "not_found", "error"}, "fallback_used": response_mode == "deterministic_fallback", "tool_call_count": state.actual_tool_calls,
-        "duplicate_tool_execution": state.duplicate_tool_execution, "requested_dimensions": list(parsed.policy.requested_dimensions), "display_scope": display_scope, "selection_source": target_source,
+        "active_provider": active_provider_override or ("zhipu" if response_mode == "glm_success" else "deterministic_planner"), "active_model": active_model_override or ("glm" if response_mode == "glm_success" else "agent-v3-rule-planner"),
+        "requested_provider": requested_provider_override or ("zhipu" if response_mode == "glm_success" else "deterministic_planner"),
+        "fallback_provider": fallback_provider_override,
+        "model_route": model_route_override or ("QWEN_SEMANTIC" if response_mode == "model_success" else "DETERMINISTIC_FAST_PATH"),
+        "provider_calls": provider_calls_override or [],
+        "fallback_reason": fallback_reason, "clarification_code": clarification_code,
+        "latency_ms": latency_ms, "token_usage": token_usage_override or {}, "intent": parsed.name,
+        "task_completed": response_type not in {"clarification", "not_found", "error"},
+        "fallback_used": response_mode == "deterministic_fallback" if fallback_used_override is None else fallback_used_override,
+        "tool_call_count": state.actual_tool_calls,
+        "duplicate_tool_execution": state.duplicate_tool_execution, "requested_dimensions": list(parsed.policy.requested_dimensions), "display_scope": display_scope, "selection_source": target_source, "context_source": context_source,
         "decision_status": decision_status, "decision_summary": decision_summary, "data_sufficiency": data_sufficiency,
-        "mode": "zhipu_controlled_function_calling" if response_mode == "glm_success" else "agent_v3_deterministic_fallback" if response_mode == "deterministic_fallback" else "agent_v3_rule_engine",
+        "mode": "provider_semantic_handoff" if response_mode == "model_success" else "zhipu_controlled_function_calling" if response_mode == "glm_success" else "agent_v3_deterministic_fallback" if response_mode == "deterministic_fallback" else "agent_v3_rule_engine",
         "conclusion": answer, "trace": trace, "simulation": simulation, "data_completeness": (views[0].get("analysis") or {}).get("evidence_completeness") if views else None,
         "provider_notice": provider_notice, "model_summary": model_summary,
     }
@@ -844,12 +1017,65 @@ async def agent_v1_ask(
     if payload["evidence"]:
         event(trace, "evidence_bound", "provenance", "已绑定本次结论引用的字段证据；来源由后端提供。", evidence_ids=[field["evidence_id"] for item in payload["evidence"] for field in item.get("fields", [])])
     validated = validate_agent_answer(payload)
-    # Keep the last explicit context across a policy/clarification turn. No new history store.
-    if products:
-        conversation.last_product_ids = [item["id"] for item in products[:10]]
+    if reasoning_handler is not None:
+        reasoning = await reasoning_handler(validated)
+        if reasoning:
+            if reasoning.get("provider_call"):
+                validated["provider_calls"] = [*validated.get("provider_calls", []), reasoning["provider_call"]]
+            if reasoning.get("failed"):
+                event(trace, "reasoning_failed", str(reasoning["provider_call"]["actual_provider"]), "辅助推理失败；保留后端确定性解释与门禁。", failure_code=reasoning["provider_call"].get("failure_code"))
+                validated["trace"] = trace
+                validated = validate_agent_answer(validated)
+                reasoning = None
+        if reasoning:
+            event(trace, "reasoning_finished", str(reasoning["provider"]), "复杂解释已基于后端验证事实生成；未改变后端决策状态。")
+            validated["trace"] = trace
+            validated["model_summary"] = str(reasoning["summary"])
+            validated["provider_notice"] = (validated.get("provider_notice") or "") + f" {reasoning['provider']} 仅提供基于已验证事实的辅助解释。"
+            validated["active_provider"] = f"{validated['active_provider']}+{reasoning['provider']}"
+            validated["active_model"] = f"{validated['active_model']}+{reasoning['model']}"
+            validated["token_usage"] = {
+                "semantic": validated.get("token_usage") or {},
+                "reasoning": reasoning.get("usage") or {},
+            }
+            validated = validate_agent_answer(validated)
+    # Persist typed references only after the validated run; never copy business facts into session state.
+    previous_state = conversation.state_json or {}
+    successful_context = bool(validated["task_completed"] and not entity_blocked)
+    last_explicit_ids = list(previous_state.get("last_explicit_product_ids") or [])
+    if successful_context and explicit_ids:
+        last_explicit_ids = explicit_ids[:10]
+    last_resolved_ids = list(previous_state.get("last_resolved_product_ids") or conversation.last_product_ids or [])
+    if successful_context and targets:
+        last_resolved_ids = [item.id for item in targets[:10]]
+    comparison_ids = list(previous_state.get("last_comparison_product_ids") or [])
+    comparison_order = list(previous_state.get("last_comparison_order") or [])
+    if successful_context and parsed.name in {"profit_comparison", "product_comparison"} and len(targets) >= 2:
+        comparison_order = [item.id for item in targets[:10]]
+        comparison_ids = list(comparison_order)
+    conversation.last_product_ids = last_resolved_ids
     conversation.conclusion_summary = validated["answer"][:1000]
-    previous_dimension = (conversation.state_json or {}).get("last_fact_dimension")
-    conversation.state_json = {"last_intent": parsed.name, "last_product_ids": conversation.last_product_ids, "last_tool_summary": validated["tool_trace_summary"], "response_mode": response_mode, "requested_dimensions": list(parsed.policy.requested_dimensions), "last_fact_dimension": understanding.metrics[0] if products and understanding.metrics else previous_dimension}
+    previous_dimension = previous_state.get("last_fact_dimension")
+    current_dimension = understanding.metrics[0] if products and understanding.metrics else previous_dimension
+    if products and response_type == "simple_fact" and parsed.policy.requested_dimensions == ("price",):
+        current_dimension = "current_price"
+    elif products and "profit" in parsed.policy.requested_dimensions:
+        current_dimension = "net_margin"
+    tool_refs = [f"{run_id}:{index}:{item['tool_name']}" for index, item in enumerate(state.executions) if item["status"] == "success"]
+    conversation.state_json = {
+        "schema_version": "context-v1", "turn_index": context_snapshot.turn_index,
+        "last_intent": parsed.name, "last_response_type": validated["response_type"],
+        "last_product_ids": last_resolved_ids, "last_explicit_product_ids": last_explicit_ids,
+        "last_resolved_product_ids": last_resolved_ids,
+        "last_comparison_product_ids": comparison_ids, "last_comparison_order": comparison_order,
+        "last_tool_summary": validated["tool_trace_summary"], "last_tool_result_refs": tool_refs,
+        "response_mode": response_mode, "requested_dimensions": list(parsed.policy.requested_dimensions),
+        "last_requested_dimensions": list(parsed.policy.requested_dimensions),
+        "last_metric": current_dimension or previous_state.get("last_metric"),
+        "last_fact_dimension": current_dimension,
+        "last_preference_order": understanding.preference_order or previous_state.get("last_preference_order") or [],
+        "last_negative_scope": understanding.negative_scope or previous_state.get("last_negative_scope") or [],
+    }
     answer = validated["answer"]
     if not conversation.goal_summary:
         conversation.goal_summary = query[:300]

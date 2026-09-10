@@ -19,7 +19,11 @@ def safe_environment() -> dict[str, str]:
     # Allowlist OS runtime variables, not arbitrary inherited credentials/config.
     names = ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP", "LANG", "LC_ALL")
     env = {name: os.environ[name] for name in names if name in os.environ}
-    env.update(APP_ENV="test", DATABASE_URL=MEMORY_URL, LLM_PROVIDER="disabled", LLM_API_KEY="", ZHIPU_API_KEY="", PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+    env.update(
+        APP_ENV="test", DATABASE_URL=MEMORY_URL, LLM_PROVIDER="disabled", LLM_API_KEY="",
+        ZHIPU_API_KEY="", QWEN_API_KEY="", DASHSCOPE_API_KEY="", DEEPSEEK_API_KEY="",
+        PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8",
+    )
     return env
 
 
@@ -59,15 +63,18 @@ def execute_isolated(case: GoldenCase) -> dict:
         guards.enter_context(patch.object(httpx.Client, "send", deny_http))
         guards.enter_context(patch("urllib.request.urlopen", deny_http))
         from app.core.config import settings
-        if settings.database_url != MEMORY_URL or settings.zhipu_api_key or settings.llm_api_key:
+        if settings.database_url != MEMORY_URL or settings.zhipu_api_key or settings.llm_api_key or settings.qwen_api_key or settings.dashscope_api_key or settings.deepseek_api_key:
             raise RuntimeError("Unsafe evaluation settings")
         result = asyncio.run(_execute(case))
-        result["safety"] = {**guard_stats, "database_url": MEMORY_URL, "real_key_loaded": False, "llm_mode": case.setup.mock_llm}
+        result["safety"] = {**guard_stats, "database_url": MEMORY_URL, "real_key_loaded": False, "llm_mode": case.setup.mock_provider_route if case.setup.mock_provider_route != "disabled" else case.setup.mock_llm}
         return result
 
 
 async def _execute(case: GoldenCase) -> dict:
+    from app.agent import model_agent
     from app.agent import zhipu_agent as provider
+    from app.agent.model_router import ModelRouter
+    from app.agent.providers.base import ModelCapabilities, ModelProvider, ProviderCallResult, ProviderFailure
     from app.agent.tools import rule_agent_ask
     from app.db.models import Base, Company
     from app.db.session import engine, SessionLocal
@@ -135,7 +142,53 @@ async def _execute(case: GoldenCase) -> dict:
                 previous = await rule_agent_ask(session, company, "golden-user", "company_admin", expand(case.setup.previous_query), None, selected)
                 session_id = previous["session_id"]
             mock_calls = 0
-            if case.setup.mock_llm == "disabled":
+            if case.setup.mock_provider_route != "disabled":
+                class EvalProvider(ModelProvider):
+                    def __init__(self, name, frames=(), failure=None, *, reasoning=False):
+                        super().__init__(api_key="offline-mock-not-real", base_url="https://offline.invalid", model_name=name + "-offline")
+                        self.provider_name = name
+                        self.frames = list(frames)
+                        self.failure = failure
+                        self.capabilities = ModelCapabilities(
+                            supports_text=True, supports_structured_output=True,
+                            supports_reasoning=reasoning, supports_tool_planning=True,
+                        )
+
+                    async def semantic_interpret(self, query, context_slots):
+                        nonlocal mock_calls
+                        mock_calls += 1
+                        if self.failure:
+                            raise ProviderFailure(self.failure, self.provider_name)
+                        return ProviderCallResult(json.dumps(self.frames.pop(0), ensure_ascii=False), self.provider_name, self.model_name)
+
+                    async def reason(self, decision_packet):
+                        nonlocal mock_calls
+                        mock_calls += 1
+                        if self.failure:
+                            raise ProviderFailure(self.failure, self.provider_name)
+                        return ProviderCallResult(json.dumps(self.frames.pop(0), ensure_ascii=False), self.provider_name, self.model_name)
+
+                mode = case.setup.mock_provider_route
+                providers = []
+                if mode != "provider_unconfigured":
+                    providers.append(EvalProvider(
+                        "qwen", [case.setup.semantic_plan],
+                        failure="NETWORK_TIMEOUT" if mode == "qwen_timeout_deepseek" else None,
+                    ))
+                if mode == "qwen_timeout_deepseek":
+                    providers.append(EvalProvider("deepseek", [case.setup.semantic_plan], reasoning=True))
+                elif mode == "qwen_reasoning":
+                    providers.append(EvalProvider("deepseek", [case.setup.reasoning_plan], reasoning=True))
+                model_router = ModelRouter(
+                    providers, primary_name="qwen", reasoning_name="deepseek",
+                    data_mode="mock_only" if mode == "qwen_reasoning" else "disabled",
+                )
+                with patch.object(model_agent, "build_model_router", lambda: model_router):
+                    result = await model_agent.dual_model_agent_ask(
+                        session, company, "golden-user", "company_admin", query, session_id, selected,
+                        selection_revision=1 if selected else 0, selection_bound_session_id=session_id,
+                    )
+            elif case.setup.mock_llm == "disabled":
                 async def semantic_mock(*args):
                     nonlocal mock_calls
                     mock_calls += 1

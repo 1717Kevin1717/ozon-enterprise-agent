@@ -136,9 +136,9 @@ def build_trust(product, analysis: dict | None = None, *, saved_fields: dict | N
         calculations = {
             "gross_profit": ([fields["current_price"], fields["procurement_cost"]], "price - procurement_cost"),
             "gross_margin": ([fields["current_price"], fields["procurement_cost"]], "(price - procurement_cost) / price; zero price => 0"),
-            "net_profit": (profit_inputs, "price - procurement - (shipping or fulfillment) - price*commission_rate - platform_fee - advertising - warehousing - tax - return_reserve - other"),
-            "net_margin": (profit_inputs, "net_profit / price; zero price => 0"),
-            "roi": (profit_inputs, "net_profit / total_cost; zero total_cost => 0"),
+            "net_profit": (profit_inputs, "price - procurement - (shipping or fulfillment) - price*commission_rate - platform_fee - advertising - warehousing - tax - return_reserve - other; missing/unknown numeric inputs are normalized to 0 by evaluation_v2"),
+            "net_margin": (profit_inputs, "net_profit / price; zero price => 0; missing/unknown numeric inputs are normalized to 0 by evaluation_v2"),
+            "roi": (profit_inputs, "net_profit / total_cost; zero total_cost => 0; missing/unknown numeric inputs are normalized to 0 by evaluation_v2"),
             "risk_level": (raw_fields, "existing evaluation v2 risk score + evidence-readiness and hard gates; lineage presence also contributes to existing readiness; see analysis.score_explanations.risk"),
         }
         for name, (inputs, formula) in calculations.items():

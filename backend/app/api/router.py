@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.tool_registry import TOOL_REGISTRY
+from app.agent.model_agent import dual_model_agent_ask
+from app.agent.model_router import build_model_router
 from app.agent.tools import compare_products, rule_agent_ask
 from app.agent.zhipu_agent import zhipu_agent_ask
 from app.core.config import settings
@@ -115,28 +117,60 @@ async def agent_provider_status(session: AsyncSession, company_id: str) -> dict:
     latest = await session.scalar(
         select(AgentRun).where(
             AgentRun.company_id == company_id,
-            or_(AgentRun.active_provider == "zhipu", AgentRun.fallback_reason != ""),
+            or_(AgentRun.active_provider != "deterministic_planner", AgentRun.fallback_reason != ""),
         ).order_by(desc(AgentRun.created_at)).limit(1)
     )
-    configured = settings.llm_provider.lower() == "zhipu" and bool(settings.zhipu_api_key)
+    configured_provider = settings.llm_provider.lower()
+    model_router = build_model_router()
+    router_status = model_router.status()
+    status_metadata = {
+        "providers": router_status["providers"],
+        "capability_matrix": router_status["capability_matrix"],
+        "requested_provider": model_router.primary_name if configured_provider in {"qwen", "dual", "model_router"} else configured_provider,
+        "ready_for_mock": True,
+        "real_smoke_verified": False,
+        "legacy": configured_provider == "zhipu",
+    }
+    if configured_provider in {"qwen", "dual", "model_router"}:
+        configured_candidates = model_router.semantic_candidates()
+        configured = bool(configured_candidates)
+        configured_name = configured_candidates[0].provider_name if configured_candidates else model_router.primary_name
+        configured_model = configured_candidates[0].model_name if configured_candidates else settings.primary_llm_model
+    else:
+        configured = configured_provider == "zhipu" and bool(settings.zhipu_api_key)
+        configured_name = "zhipu"
+        configured_model = settings.zhipu_model
     if not configured:
-        return {"configured": False, "reachable": None, "last_call_success": False, "active_provider": "deterministic_planner", "active_model": "agent-v2-rule-planner", "response_mode": "rule_engine", "fallback_reason": "KEY_MISSING", "latency_ms": None, "token_usage": {}, "status": "unconfigured", "notice": "未配置智谱，当前使用确定性 Planner。", "last_checked_at": None}
+        disabled = configured_provider == "disabled"
+        return {"configured": False, "reachable": None, "last_call_success": False, "active_provider": "deterministic_planner", "active_model": "agent-v3-rule-planner", "response_mode": "rule_engine", "fallback_reason": None if disabled else "PROVIDER_NOT_CONFIGURED", "latency_ms": None, "token_usage": {}, "status": "disabled" if disabled else "not_configured", "notice": "外部模型已禁用，当前使用确定性 Planner。" if disabled else "主语义模型未配置，确定性查询仍可使用。", "last_checked_at": None, **status_metadata}
     if not latest:
-        return {"configured": True, "reachable": None, "last_call_success": None, "active_provider": "zhipu", "active_model": settings.zhipu_model, "response_mode": "configured_unverified", "fallback_reason": None, "latency_ms": None, "token_usage": {}, "status": "configured", "notice": "智谱已配置，但当前企业尚无可审计的实际调用记录。", "last_checked_at": None}
-    success = latest.response_mode == "glm_success"
+        return {"configured": True, "reachable": None, "last_call_success": None, "active_provider": configured_name, "active_model": configured_model, "response_mode": "configured_unverified", "fallback_reason": None, "latency_ms": None, "token_usage": {}, "status": "configured_unverified", "notice": "模型已配置，但当前企业尚无可审计的实际调用记录。", "last_checked_at": None, **status_metadata}
+    success = latest.response_mode in {"glm_success", "model_success"}
     reason = latest.fallback_reason or None
     messages = {
-        "AUTHENTICATION_FAILED": "智谱认证失败；最近回答已安全回退。",
-        "MODEL_UNAVAILABLE": "智谱模型不可用；最近回答已安全回退。",
-        "RATE_LIMITED": "智谱额度或频率受限；最近回答已安全回退。",
-        "NETWORK_TIMEOUT": "智谱网络请求超时；最近回答已安全回退。",
-        "INVALID_RESPONSE": "智谱响应格式不合规；最近回答已安全回退。",
-        "PROVIDER_UNAVAILABLE": "智谱服务暂时不可用；最近回答已安全回退。",
-        "PROVIDER_ERROR": "智谱调用失败；最近回答已安全回退。",
+        "AUTH_FAILED": "模型认证失败；最近回答已安全回退。",
+        "AUTHENTICATION_FAILED": "模型认证失败；最近回答已安全回退。",
+        "MODEL_UNAVAILABLE": "模型不可用；最近回答已安全回退。",
+        "MODEL_NOT_FOUND": "配置的模型名称不存在或当前账号不可用；最近回答已安全回退。",
+        "RATE_LIMITED": "模型额度或频率受限；最近回答已安全回退。",
+        "NETWORK_TIMEOUT": "模型网络请求超时；最近回答已安全回退。",
+        "CONNECT_ERROR": "模型连接失败；最近回答已安全回退。",
+        "TLS_ERROR": "模型安全连接失败；最近回答已安全回退。",
+        "PROXY_ERROR": "模型代理连接失败；最近回答已安全回退。",
+        "REMOTE_PROTOCOL_ERROR": "模型连接协议异常；最近回答已安全回退。",
+        "HTTP_ERROR": "模型 HTTP 请求失败；最近回答已安全回退。",
+        "RESPONSE_READ_ERROR": "模型响应读取失败；最近回答已安全回退。",
+        "REQUEST_SERIALIZATION_ERROR": "模型请求构造失败；最近回答已安全回退。",
+        "INVALID_RESPONSE": "模型响应格式不合规；最近回答已安全回退。",
+        "SCHEMA_VALIDATION_FAILED": "模型结构化输出未通过后端校验；最近回答已安全回退。",
+        "SEMANTIC_PLAN_VALIDATION_FAILED": "模型语义计划未通过后端约束校验；最近回答已安全回退。",
+        "PROVIDER_UNAVAILABLE": "模型服务暂时不可用；最近回答已安全回退。",
+        "PROVIDER_ERROR": "模型调用失败；最近回答已安全回退。",
+        "PROVIDER_INTERNAL_ERROR": "模型服务内部异常；最近回答已安全回退。",
     }
     return {
         "configured": True,
-        "reachable": False if reason == "NETWORK_TIMEOUT" else True if success or reason else None,
+        "reachable": True if success else False if reason == "NETWORK_TIMEOUT" else True if reason else None,
         "last_call_success": success,
         "active_provider": latest.active_provider,
         "active_model": latest.model,
@@ -145,8 +179,9 @@ async def agent_provider_status(session: AsyncSession, company_id: str) -> dict:
         "latency_ms": latest.latency_ms,
         "token_usage": latest.token_usage or {},
         "status": "ready" if success else "error",
-        "notice": "智谱最近一次受控调用成功。" if success else messages.get(reason or "", "智谱最近调用状态未知，当前回答可能来自回退。"),
+        "notice": f"{latest.active_provider} 最近一次受控调用成功。" if success else messages.get(reason or "", "模型最近调用状态未知，当前回答可能来自回退。"),
         "last_checked_at": latest.created_at,
+        **status_metadata,
     }
 
 
@@ -433,13 +468,13 @@ async def create_agent_session(ctx: dict = Depends(context), session: AsyncSessi
 
 @router.get("/agent/sessions")
 async def list_agent_sessions(ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):
-    rows=list((await session.scalars(select(ConversationSession).where(ConversationSession.company_id == ctx["company_id"]).order_by(ConversationSession.updated_at.desc()))).all())
+    rows=list((await session.scalars(select(ConversationSession).where(ConversationSession.company_id == ctx["company_id"], ConversationSession.user_id == ctx["user_id"]).order_by(ConversationSession.updated_at.desc()))).all())
     return {"success":True,"data":[{"id":row.id,"title":row.title,"goal_summary":row.goal_summary,"last_product_ids":row.last_product_ids,"conclusion_summary":row.conclusion_summary,"state":row.state_json,"updated_at":row.updated_at} for row in rows]}
 
 
 @router.get("/agent/sessions/{session_id}/messages")
 async def agent_session_messages(session_id: str, ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):
-    conversation = await session.scalar(select(ConversationSession).where(ConversationSession.id == session_id, ConversationSession.company_id == ctx["company_id"]))
+    conversation = await session.scalar(select(ConversationSession).where(ConversationSession.id == session_id, ConversationSession.company_id == ctx["company_id"], ConversationSession.user_id == ctx["user_id"]))
     if not conversation:
         raise HTTPException(404, detail={"code": "SESSION_NOT_FOUND", "message": "会话不存在或不属于当前企业。"})
     rows = list((await session.scalars(select(ConversationMessage).where(ConversationMessage.company_id == ctx["company_id"], ConversationMessage.session_id == session_id).order_by(ConversationMessage.created_at))).all())
@@ -448,8 +483,25 @@ async def agent_session_messages(session_id: str, ctx: dict = Depends(context), 
 @router.post("/agent/ask")
 async def ask_agent(data: AgentAsk, ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):
     require_role(ctx,"analyst")
-    handler=zhipu_agent_ask if settings.llm_provider.lower()=="zhipu" else rule_agent_ask
-    return {"success":True,"data":await handler(session,ctx["company_id"],ctx["user_id"],ctx["role"],data.query,data.session_id,data.selected_product_ids)}
+    provider = settings.llm_provider.lower()
+    handler = dual_model_agent_ask if provider in {"qwen", "dual", "model_router"} else zhipu_agent_ask if provider == "zhipu" else rule_agent_ask
+    if data.provider_execution_policy != "AUTO":
+        require_role(ctx, "company_admin")
+        if handler is not dual_model_agent_ask:
+            raise HTTPException(status_code=409, detail={"code": "PROVIDER_POLICY_UNAVAILABLE", "message": "当前 Agent 模式不支持请求级模型约束。"})
+    if handler is dual_model_agent_ask:
+        from app.agent.model_router import ProviderExecutionPolicy
+        result = await handler(
+            session, ctx["company_id"], ctx["user_id"], ctx["role"], data.query, data.session_id,
+            data.selected_product_ids, data.selection_revision, data.selection_bound_session_id,
+            provider_policy=ProviderExecutionPolicy(data.provider_execution_policy),
+        )
+    else:
+        result = await handler(
+            session, ctx["company_id"], ctx["user_id"], ctx["role"], data.query, data.session_id,
+            data.selected_product_ids, data.selection_revision, data.selection_bound_session_id,
+        )
+    return {"success":True,"data":result}
 
 @router.get("/memory/search")
 async def memory_search(q: str, ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):

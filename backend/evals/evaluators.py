@@ -104,7 +104,10 @@ class DecisionPolicyEvaluator(Evaluator):
     def evaluate(self, case, run):
         rows = self.fields(case.expected, run["result"], ["decision_status", "human_review_required"])
         for text in case.expected.required_content:
-            rows.append(self.check(f"required_content:{text}", True, text in run["result"].get("answer", "")))
+            # Required facts may live in the user-facing answer or in validated
+            # structured evidence. This keeps presentation wording independent
+            # from the deterministic calculation/provenance contract.
+            rows.append(self.check(f"required_content:{text}", True, text in business_text(run["result"])))
         return rows
 
 
@@ -194,6 +197,36 @@ class StateLeakageEvaluator(Evaluator):
         return self.fields(case.expected, run["result"], ["selection_source"])
 
 
+class ConversationContextEvaluator(Evaluator):
+    """Deterministic context/source/scope assertions for conversational cases."""
+
+    def evaluate(self, case, run):
+        if case.category not in {"conversation_context", "semantic_orchestration"}:
+            return []
+        result, expected = run["result"], case.expected
+        rows = []
+        if expected.context_source is not None:
+            source = result.get("context_source", MISSING)
+            metric = "selection_binding_accuracy" if expected.context_source == "ui_selection" else "session_isolation_accuracy" if expected.context_source in {"none", "session_state"} and expected.response_type == "clarification" else "reference_resolution_accuracy"
+            row = self.check("context_source", expected.context_source, source)
+            row.metric = metric
+            rows.append(row)
+        if expected.product_titles is not None:
+            actual = sorted(item.get("title") for item in result.get("products", []))
+            row = self.check("context_products", sorted(expected.product_titles), actual)
+            row.metric = "context_resolution_accuracy"
+            rows.append(row)
+        if expected.semantic_route is not None:
+            row = self.check("semantic_route", expected.semantic_route, (result.get("understanding") or {}).get("route"))
+            row.metric = "semantic_route_accuracy"
+            rows.append(row)
+        if expected.requested_dimensions is not None:
+            row = self.check("contextual_dimensions", sorted(expected.requested_dimensions), sorted(result.get("requested_dimensions", [])))
+            row.metric = "contextual_scope_accuracy"
+            rows.append(row)
+        return rows
+
+
 class IdempotencyEvaluator(Evaluator):
     metric = "fallback_accuracy"
     def evaluate(self, case, run):
@@ -241,7 +274,28 @@ class SemanticUnderstandingEvaluator(Evaluator):
         return rows
 
 
-EVALUATORS = (IntentEvaluator(), ResponseTypeEvaluator(), EntityResolutionEvaluator(), ToolScopeEvaluator(), RequestedDimensionEvaluator(), DecisionPolicyEvaluator(), DataSufficiencyEvaluator(), FactGroundingEvaluator(), StateLeakageEvaluator(), IdempotencyEvaluator(), SemanticUnderstandingEvaluator())
+class ModelRouterEvaluator(Evaluator):
+    metric = "model_routing_accuracy"
+
+    def evaluate(self, case, run):
+        if case.category not in {"natural_language_generalization", "contextual_followup", "model_routing"}:
+            return []
+        result, expected = run["result"], case.expected
+        rows = self.fields(expected, result, ["active_provider", "requested_provider", "fallback_provider", "model_route"])
+        if expected.requires_reasoning is not None:
+            rows.append(self.check(
+                "requires_reasoning", expected.requires_reasoning,
+                bool((result.get("understanding") or {}).get("requires_reasoning")),
+            ))
+        if expected.provider_call_count_max is not None:
+            actual = len(result.get("provider_calls") or [])
+            rows.append(self.check("provider_call_count_max", expected.provider_call_count_max, actual, passed=actual <= expected.provider_call_count_max))
+        for row in rows:
+            row.metric = self.metric
+        return rows
+
+
+EVALUATORS = (IntentEvaluator(), ResponseTypeEvaluator(), EntityResolutionEvaluator(), ToolScopeEvaluator(), RequestedDimensionEvaluator(), DecisionPolicyEvaluator(), DataSufficiencyEvaluator(), FactGroundingEvaluator(), StateLeakageEvaluator(), IdempotencyEvaluator(), SemanticUnderstandingEvaluator(), ConversationContextEvaluator(), ModelRouterEvaluator())
 
 
 def evaluate(case: GoldenCase, run: dict) -> list[AssertionResult]:

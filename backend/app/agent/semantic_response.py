@@ -4,9 +4,91 @@ from app.schemas.provenance import FieldEvidence
 from app.services.provenance import evidence_notices, scoped_fields
 
 
+COST_LABELS = {
+    "procurement_cost": "采购成本",
+    "shipping_cost": "配送费",
+    "fulfillment_cost": "履约费",
+    "platform_commission": "平台佣金",
+    "platform_fee": "平台服务费",
+    "advertising_cost": "广告费",
+    "warehousing_cost": "仓储费",
+    "tax_cost": "税费",
+    "return_loss_reserve": "退货损失准备",
+    "other_cost": "其他成本",
+}
+
+
+def _money(value) -> str:
+    return f"{float(value or 0):.2f} RUB"
+
+
+def _rate(value) -> str:
+    return f"{float(value or 0):.2%}"
+
+
+def _business_cost_items(calculation: dict, *, limit: int | None = None) -> list[dict]:
+    items = [item for item in calculation.get("cost_breakdown", []) if float(item.get("amount") or 0) > 0]
+    return items if limit is None else items[:limit]
+
+
+def _cost_item_text(item: dict) -> str:
+    label = COST_LABELS.get(item.get("field"), "其他成本")
+    share = item.get("share_of_price")
+    return f"{label} {_money(item.get('amount'))}" + (f"（占售价 {_rate(share)}）" if share is not None else "")
+
+
+def _evidence_gap_text(calculation: dict) -> str:
+    gaps = [COST_LABELS.get(field, field) for field in calculation.get("input_gaps", [])]
+    if not gaps:
+        return ""
+    return f"\n数据提示：{ '、'.join(gaps) }尚无可验证输入；现有计算按后端已披露的默认规则处理，正式决策前需补齐。"
+
+
+def _profit_answer(title: str, analysis: dict) -> str:
+    calculation = analysis.get("calculation_evidence") or {}
+    net_profit = calculation.get("result", analysis.get("net_profit"))
+    net_margin = calculation.get("net_margin", analysis.get("net_margin"))
+    roi = calculation.get("roi", analysis.get("roi"))
+    top = _business_cost_items(calculation, limit=3)
+    pressure = "、".join(COST_LABELS.get(item.get("field"), "其他成本") for item in top)
+    text = f"{title}当前单件净利润约 {_money(net_profit)}，净利率约 {_rate(net_margin)}，ROI 约 {_rate(roi)}。"
+    if pressure:
+        text += f" 当前成本压力主要来自{pressure}。"
+    return text + _evidence_gap_text(calculation)
+
+
+def _calculation_answer(title: str, analysis: dict) -> str:
+    calculation = analysis.get("calculation_evidence") or {}
+    items = _business_cost_items(calculation)
+    lines = [
+        f"{title}当前单件净利润约 {_money(calculation.get('result', analysis.get('net_profit')))}，净利率约 {_rate(calculation.get('net_margin', analysis.get('net_margin')))}。",
+        f"计算逻辑：售价 {_money(calculation.get('sale_price'))} - 成本合计 {_money(calculation.get('total_cost'))} = 净利润 {_money(calculation.get('result'))}。",
+    ]
+    if items:
+        lines.append("实际计入的成本：" + "；".join(_cost_item_text(item) for item in items) + "。")
+    return "\n".join(lines) + _evidence_gap_text(calculation)
+
+
+def _cost_breakdown_answer(title: str, analysis: dict) -> str:
+    calculation = analysis.get("calculation_evidence") or {}
+    items = _business_cost_items(calculation)
+    if not items:
+        return f"{title}目前没有足够的后端成本输入，暂时无法判断主要成本压力。" + _evidence_gap_text(calculation)
+    lines = [f"{title}目前成本压力主要来自以下几项："]
+    lines.extend(f"{index}. {_cost_item_text(item)}" for index, item in enumerate(items, 1))
+    leaders = "、".join(COST_LABELS.get(item.get("field"), "其他成本") for item in items[:3])
+    lines.append(f"简要结论：{leaders}是当前利润空间最主要的压力来源；排序完全来自本轮后端成本数据。")
+    return "\n".join(lines) + _evidence_gap_text(calculation)
+
+
 def scope_semantic_response(payload, views, understanding, entity_blocked):
     intent = understanding.intent
-    if intent not in SEMANTIC_TYPES | {"unknown"}:
+    if intent not in SEMANTIC_TYPES | {"unknown", "product_detail"}:
+        return
+    if intent == "product_detail" and not ({"profit", "roi"} & set(understanding.requested_dimensions)):
+        # Risk facts and snapshot sufficiency already have narrower, validated
+        # response contracts in the deterministic backend renderer.  The
+        # semantic renderer is only needed for conversational profit follow-ups.
         return
     if entity_blocked:
         return
@@ -15,7 +97,7 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
     payload["display_scope"] = ["answer", "evidence", "source", "tool_summary", *understanding.requested_dimensions]
     if intent == "unknown":
         payload.update(response_type="clarification", task_completed=False,
-                       answer="我还不能确定这个问题的意图。请说明要查询的商品，以及价格、来源、计算依据或推荐原因等具体内容。")
+                       answer=understanding.clarification_reason or "我还不能确定这个问题的意图。请说明要查询的商品，以及价格、来源、计算依据或推荐原因等具体内容。")
     elif intent == "data_quality_policy":
         payload.update(response_type="policy_answer", task_completed=True,
             answer="不能。数据完整度（Completeness）只说明字段是否填写，不等于证据充分性（Sufficiency）、时效（Freshness）、来源可追溯性（Provenance）或正式推荐（Recommendation）。完整度100%也不能绕过利润要求、合规硬性阻断和人工审核；来源为Mock的数据不代表真实市场。")
@@ -42,7 +124,11 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
             payload["trust_notices"].extend(notices)
             title = view["title"]
             if intent == "calculation_explanation":
-                text = "；".join(f"{f['field']} = {f.get('value')}；公式：{f.get('calculation') or '计算公式未保存'}；输入：" + "、".join(f"{i['field']}={i.get('value')}（{i.get('provider', 'unknown')}）" for i in f.get('inputs', [])) for f in fields)
+                calculation = analysis.get("calculation_evidence") or {}
+                if understanding.metric == "cost_breakdown" and calculation.get("cost_breakdown"):
+                    text = _cost_breakdown_answer(title, analysis)
+                else:
+                    text = _calculation_answer(title, analysis)
             elif intent == "decision_explanation":
                 product = next(p for p in payload["products"] if p["id"] == view["id"])
                 payload["decision_status"] = product["decision_status"]
@@ -63,6 +149,8 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
                     text = f"企业报告记录增长率 {suff.get('reported_metric')}%（来源：{suff.get('reported_metric_source', 'unknown')}），它不是系统快照趋势。当前 {suff.get('snapshot_count', 0)} 次快照，观察趋势 {suff.get('observed_trend', 'INSUFFICIENT_DATA')}。"
                     if suff.get("status") == "INSUFFICIENT_DATA":
                         text += "证据不足，无法根据快照验证涨跌。"
+                elif intent == "product_detail" and ("profit" in dimensions or "roi" in dimensions):
+                    text = _profit_answer(title, analysis)
                 else:
                     text = "；".join(f"{f['field']}={f.get('value')}；来源类型 {f.get('source_type')}；provider {f.get('provider')}；采集时间 {f.get('collected_at') or '未知'}；时效 {f.get('freshness', {}).get('status', 'UNKNOWN')}" for f in fields if f["field"] in {"current_price", "net_margin", "net_profit"})
                 text += " " + trust.get("disclosure", "来源未知。")
@@ -70,7 +158,7 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
                     text += " 不是实时 Ozon 数据，不能作为真实 Ozon 原始页面凭证。"
                 else:
                     text += " 来源声明和有效期不等于实时核验；当前未请求外部平台。"
-            parts.append(f"{title}：{text}")
+            parts.append(text if text.startswith(title) else f"{title}：{text}")
             payload["evidence"].append({"product_id": view["id"], "title": title, "source": "validated_backend_evidence", "summary": text,
                 "fields": fields, "disclosure": trust.get("disclosure", ""), "url": "" if trust.get("is_mock") else next((f.get("source_url") for f in fields if f.get("source_url")), "")})
         payload["answer"] = "\n".join(parts)

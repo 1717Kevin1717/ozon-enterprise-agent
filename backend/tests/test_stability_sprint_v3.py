@@ -122,6 +122,12 @@ def test_partial_comparison_blocks_tools_and_explains_known_entity(deterministic
     assert "未执行商品比较" in result["answer"]
     assert result["products"] == [] and result["matched_count"] == 0
     assert result["tool_call_count"] == 0 and not result["task_completed"]
+    if mode == "AMBIGUOUS":
+        assert result["clarification_code"] == "ENTITY_AMBIGUOUS"
+    elif mode == "LOW_CONFIDENCE":
+        assert result["clarification_code"] == "ENTITY_LOW_CONFIDENCE"
+    else:
+        assert result["clarification_code"] is None
     assert any(row["event"] == "entity_resolution_blocked" for row in result["trace"])
 
 
@@ -140,6 +146,7 @@ def test_selected_state_does_not_override_explicit_unknown_entity(deterministic_
     assert result["response_type"] == "not_found"
     assert result["selection_source"] == "none" and result["entities"] == []
     assert result["products"] == [] and result["tool_call_count"] == 0
+    assert result["clarification_code"] is None
     assert "未找到" in result["answer"]
 
 

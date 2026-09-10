@@ -19,11 +19,20 @@ def case_fixture():
 
 def test_golden_jsonl_schema_and_coverage():
     cases = load_cases(DEFAULT_CASES)
-    assert 20 <= len([case for case in cases if case.category not in {"provenance", "semantic_understanding"}]) <= 30
+    context_categories = {"conversation_context", "semantic_orchestration"}
+    act8_categories = {"natural_language_generalization", "contextual_followup", "model_routing"}
+    assert 20 <= len([case for case in cases if case.category not in {"provenance", "semantic_understanding", *context_categories, *act8_categories}]) <= 30
     assert 8 <= len([case for case in cases if case.category == "provenance"]) <= 12
     assert 12 <= len([case for case in cases if case.category == "semantic_understanding"]) <= 20
-    assert {case.category for case in cases} == {"simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback", "provenance", "semantic_understanding"}
-    assert all("not real Ozon" in case.provenance for case in cases)
+    assert len([case for case in cases if case.category in context_categories]) == 20
+    assert len([case for case in cases if case.category == "natural_language_generalization"]) == 3
+    assert len([case for case in cases if case.category == "contextual_followup"]) == 6
+    assert len([case for case in cases if case.category == "model_routing"]) == 6
+    assert {case.category for case in cases} == {"simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback", "provenance", "semantic_understanding", "natural_language_generalization", "contextual_followup", "model_routing", *context_categories}
+    legacy = [case for case in cases if case.category not in context_categories]
+    contextual = [case for case in cases if case.category in context_categories]
+    assert all("not real Ozon" in case.provenance for case in legacy)
+    assert all(case.provenance.startswith(("ACT7", "Existing deterministic")) for case in contextual)
 
 
 def test_duplicate_case_id_rejected(tmp_path):
@@ -110,6 +119,8 @@ def test_worker_never_reads_dotenv_key_or_production_db(tmp_path, monkeypatch):
     secret = "FAKE_SECRET_MUST_NOT_BE_READ"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{sentinel.as_posix()}")
     monkeypatch.setenv("ZHIPU_API_KEY", secret)
+    monkeypatch.setenv("QWEN_API_KEY", secret)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
     script = r'''
 import builtins, json, pathlib, sys
 from unittest.mock import patch

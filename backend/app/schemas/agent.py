@@ -3,10 +3,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.schemas.provenance import FieldEvidence, TrustNotice
+from app.schemas.semantic_vocabulary import (
+    CANONICAL_DIMENSIONS,
+    CANONICAL_INTENTS,
+    CANONICAL_METRICS,
+)
 
 
 ResponseMode = Literal[
     "glm_success",
+    "model_success",
     "deterministic_fallback",
     "rule_engine",
 ]
@@ -25,37 +31,193 @@ ResponseType = Literal[
     "error",
 ]
 
-
-IntentName = Literal[
-    "company_product_count", "product_price", "product_filter", "product_detail",
-    "profit_comparison", "product_comparison", "compliance_policy", "recommendation_policy",
-    "selection_recommendation", "provenance_fact", "calculation_explanation",
-    "decision_explanation", "data_quality_answer", "data_quality_policy", "unknown",
+ContextSource = Literal[
+    "explicit_query", "ui_selection", "last_explicit_entity", "last_comparison",
+    "last_resolved_entity", "ordinal_reference", "session_state", "none", "conflict", "invalid",
 ]
+
+
+class ContextTarget(BaseModel):
+    """A verified product identity that can be referenced by a later turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: str
+    source: ContextSource
+    turn_index: int = Field(ge=0)
+
+
+class ContextSnapshot(BaseModel):
+    """Typed short-term references; never a copy of enterprise facts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "context-v1"
+    session_id: str
+    company_id: str
+    user_id: str
+    turn_index: int = Field(default=1, ge=1)
+    current_query: str
+    current_selected_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    selection_revision: int = Field(default=0, ge=0)
+    selection_bound_session_id: str | None = None
+    last_explicit_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    last_resolved_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    last_intent: str | None = None
+    last_response_type: str | None = None
+    last_requested_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    last_metric: str | None = None
+    last_fact_dimension: str | None = None
+    last_comparison_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    last_comparison_order: list[str] = Field(default_factory=list, max_length=10)
+    last_tool_result_refs: list[str] = Field(default_factory=list, max_length=20)
+    last_preference_order: list[str] = Field(default_factory=list, max_length=10)
+    last_negative_scope: list[str] = Field(default_factory=list, max_length=10)
+    context_warnings: list[str] = Field(default_factory=list, max_length=10)
+
+
+class ReferenceResolutionResult(BaseModel):
+    """The product targets selected from explicit entities or short-term context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_ids: list[str] = Field(default_factory=list, max_length=10)
+    source: ContextSource = "none"
+    reference_expression: str | None = None
+    inherited_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    confidence: float = Field(default=0, ge=0, le=1)
+    requires_clarification: bool = False
+    failure_code: str | None = None
+
+
+IntentName = Literal[*CANONICAL_INTENTS]
 
 
 class QueryUnderstanding(BaseModel):
     """Understanding is a plan, never a source of business facts."""
     model_config = ConfigDict(extra="forbid")
     intent: IntentName
+    task_type: str = ""
     question_type: str = ""
-    entity_mentions: list[str] = Field(default_factory=list, max_length=10)
+    entity_mentions: list[str] = Field(
+        default_factory=list,
+        max_length=10,
+        description=(
+            "Literal product names, product aliases, or product identifiers explicitly present in the current query only; "
+            "never pronouns, ordinal references, metrics, dimensions, or references to a previous result."
+        ),
+    )
     references: list[str] = Field(default_factory=list, max_length=10)
+    reference_slots: list[ContextSource] = Field(default_factory=list, max_length=10)
     reference_field: str | None = None
-    metrics: list[str] = Field(default_factory=list)
+    metrics: list[str] = Field(
+        default_factory=list,
+        description=f"Specific metric values; canonical values: {', '.join(CANONICAL_METRICS)}",
+    )
+    metric: str | None = Field(
+        default=None,
+        description=f"Primary specific metric; canonical values: {', '.join(CANONICAL_METRICS)}",
+    )
     metric_values: list[float] = Field(default_factory=list)
-    requested_dimensions: list[str] = Field(default_factory=list)
+    requested_dimensions: list[str] = Field(
+        default_factory=list,
+        description=f"Business analysis areas; canonical values: {', '.join(CANONICAL_DIMENSIONS)}",
+    )
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    negative_scope: list[str] = Field(default_factory=list, max_length=20)
+    preference_order: list[str] = Field(default_factory=list, max_length=10)
     comparison_requested: bool = False
+    comparison_required: bool = False
     explanation_requested: bool = False
     provenance_requested: bool = False
     calculation_requested: bool = False
     policy_requested: bool = False
     requires_context: bool = False
+    requires_tools: bool = False
+    requires_reasoning: bool = False
+    clarification_required: bool = False
+    clarification_reason: str | None = None
     confidence: float = Field(ge=0, le=1)
     route: Literal["DETERMINISTIC_FAST_PATH", "SEMANTIC_PLANNER", "CLARIFICATION"]
-    planned_tools: list[str] = Field(default_factory=list, max_length=10)
+    planned_tools: list[str] = Field(
+        default_factory=list,
+        max_length=10,
+        description="Advisory tool suggestions only; the backend derives and authorizes the executable tool plan.",
+    )
+    advisory_tool_mismatch: list[str] = Field(default_factory=list, max_length=10)
     planner_calls: int = Field(default=0, ge=0, le=1)
     failure_code: str | None = None
+    semantic_provider: str | None = None
+
+
+class ModelInput(BaseModel):
+    """Future-safe provider input contract; URLs/opaque references only, no media bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=20000)
+    images: list[str] = Field(default_factory=list, max_length=5)
+    videos: list[str] = Field(default_factory=list, max_length=2)
+
+    @property
+    def has_multimodal_input(self) -> bool:
+        return bool(self.images or self.videos)
+
+
+class ProviderCallAudit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requested_provider: str
+    actual_provider: str
+    model_name: str
+    route: str
+    status: Literal["success", "failed", "skipped"]
+    failure_code: str | None = None
+    exception_class: str | None = None
+    failure_stage: str | None = None
+    upstream_status: int | None = Field(default=None, ge=100, le=599)
+    validation_rule_id: str | None = None
+    validation_reason_code: str | None = None
+    validation_field: str | None = None
+    latency_ms: int | None = Field(default=None, ge=0)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
+
+
+class SemanticContextPacket(BaseModel):
+    """Minimum context exposed to an LLM planner; contains no business metrics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    session_id: str
+    turn_index: int = Field(ge=1)
+    current_selected_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    last_explicit_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    last_resolved_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    last_comparison_order: list[str] = Field(default_factory=list, max_length=10)
+    last_intent: str | None = None
+    last_response_type: str | None = None
+    last_requested_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    last_metric: str | None = None
+    last_preference_order: list[str] = Field(default_factory=list, max_length=10)
+    last_negative_scope: list[str] = Field(default_factory=list, max_length=10)
+    reference_candidates: list[str] = Field(default_factory=list, max_length=10)
+    verified_product_names: dict[str, str] = Field(default_factory=dict)
+    allowed_tools: list[str] = Field(default_factory=list, max_length=20)
+    max_tool_calls: int = Field(default=0, ge=0, le=20)
+    rule_understanding: QueryUnderstanding
+
+
+class GroundedReasoningOutput(BaseModel):
+    """Advisory explanation over validated facts; never a business truth source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1, max_length=1200)
+    priority_labels: list[str] = Field(default_factory=list, max_length=10)
+    dimensions_used: list[str] = Field(default_factory=list, max_length=10)
+    formal_recommendation_label: str | None = None
+    human_review_required: bool = False
 
 
 class EntityCandidate(BaseModel):
@@ -100,7 +262,10 @@ class AgentEntity(BaseModel):
     entity_type: Literal["product"] = "product"
     product_id: str
     name: str
-    resolution_method: Literal["query_entity", "explicit_selection", "session_reference"]
+    resolution_method: Literal[
+        "query_entity", "explicit_selection", "session_reference", "explicit_query", "ui_selection",
+        "last_explicit_entity", "last_comparison", "last_resolved_entity", "ordinal_reference", "session_state",
+    ]
 
 
 class AgentToolResult(BaseModel):
@@ -228,7 +393,12 @@ class AgentRunResult(BaseModel):
     source_badge: str
     active_provider: str
     active_model: str
+    requested_provider: str = "deterministic_planner"
+    fallback_provider: str | None = None
+    model_route: str = "DETERMINISTIC_FAST_PATH"
+    provider_calls: list[ProviderCallAudit] = Field(default_factory=list)
     fallback_reason: str | None = None
+    clarification_code: str | None = None
     latency_ms: int = Field(ge=0)
     token_usage: dict[str, Any] = Field(default_factory=dict)
     intent: str
@@ -240,6 +410,7 @@ class AgentRunResult(BaseModel):
     requested_dimensions: list[str] = Field(default_factory=list)
     display_scope: list[str] = Field(default_factory=list)
     selection_source: str = "none"
+    context_source: ContextSource = "none"
     decision_status: str = "NOT_APPLICABLE"
     decision_summary: dict[str, Any] = Field(default_factory=dict)
     data_sufficiency: DataSufficiencyResult | None = None

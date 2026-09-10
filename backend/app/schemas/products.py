@@ -119,6 +119,9 @@ class AgentAsk(BaseModel):
     query: str = Field(min_length=2, max_length=2000)
     session_id: str | None = None
     selected_product_ids: list[str] = Field(default_factory=list, max_length=10)
+    selection_revision: int = Field(default=0, ge=0)
+    selection_bound_session_id: str | None = None
+    provider_execution_policy: Literal["AUTO", "QWEN_ONLY", "PRIMARY_ONLY"] = "AUTO"
 
 
 class DecisionCreate(BaseModel):

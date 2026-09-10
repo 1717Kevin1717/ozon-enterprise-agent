@@ -9,9 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator, f
 from app.schemas.agent import EntityResolutionResult, ResponseType, IntentName
 
 EntityStatus = EntityResolutionResult.model_fields["status"].annotation
-Category = Literal["simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback", "provenance", "semantic_understanding"]
+Category = Literal["simple_fact", "entity", "filtering", "comparison", "policy", "data_sufficiency", "state", "fallback", "provenance", "semantic_understanding", "conversation_context", "semantic_orchestration", "natural_language_generalization", "contextual_followup", "model_routing"]
 Intent = IntentName
-Dimension = Literal["count", "price", "risk", "profit", "roi", "identity", "demand", "competition", "compliance", "decision", "recommendation", "recommendation_policy", "sales_snapshot", "data_sufficiency", "filters", "data_completeness", "recommendation_score", "detail", "history"]
+Dimension = Literal["count", "price", "risk", "profit", "roi", "identity", "demand", "competition", "compliance", "decision", "recommendation", "recommendation_policy", "sales_snapshot", "data_sufficiency", "filters", "data_completeness", "recommendation_score", "detail", "history", "calculation", "evidence", "decision_reason", "provenance", "freshness", "policy", "data_quality"]
 
 
 class StrictModel(BaseModel):
@@ -39,6 +39,8 @@ class Setup(StrictModel):
     additions: list[AddedProduct] = Field(default_factory=list)
     previous_query: str | None = None
     semantic_plan: dict[str, JsonValue] | None = None
+    reasoning_plan: dict[str, JsonValue] | None = None
+    mock_provider_route: Literal["disabled", "qwen_semantic", "qwen_reasoning", "qwen_timeout_deepseek", "provider_unconfigured"] = "disabled"
     mock_llm: Literal["disabled", "timeout_after_tool", "repeated_tool"] = "disabled"
     mock_product_titles: list[str] = Field(default_factory=list)
     provenance_overrides: list[ProvenanceOverride] = Field(default_factory=list)
@@ -48,6 +50,10 @@ class Setup(StrictModel):
     def mock_targets_required(self):
         if self.mock_llm != "disabled" and len(self.mock_product_titles) != 2:
             raise ValueError("Mock tool scenario requires two fixture product titles")
+        if self.mock_provider_route in {"qwen_semantic", "qwen_reasoning", "qwen_timeout_deepseek"} and self.semantic_plan is None:
+            raise ValueError("Mock provider route requires a SemanticFrame fixture")
+        if self.mock_provider_route == "qwen_reasoning" and self.reasoning_plan is None:
+            raise ValueError("Mock reasoning route requires a reasoning frame fixture")
         return self
 
 
@@ -111,11 +117,18 @@ class Expected(StrictModel):
     filter_truth: FilterTruth | None = None
     data_sufficiency: SufficiencyTruth | None = None
     selection_source: Literal["none", "query_entity", "explicit_selection", "session_reference"] | None = None
+    context_source: Literal["none", "explicit_query", "ui_selection", "last_explicit_entity", "last_comparison", "last_resolved_entity", "ordinal_reference", "session_state"] | None = None
     fallback_used: bool | None = None
     task_completed: bool | None = None
     reuse_tool: str | None = None
     duplicate_tool_execution: int | None = Field(default=None, ge=0)
     provenance: ProvenanceTruth | None = None
+    active_provider: str | None = None
+    requested_provider: str | None = None
+    fallback_provider: str | None = None
+    model_route: str | None = None
+    provider_call_count_max: int | None = Field(default=None, ge=0)
+    requires_reasoning: bool | None = None
 
     @field_validator("required_facts")
     @classmethod

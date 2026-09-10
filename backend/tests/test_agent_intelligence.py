@@ -74,7 +74,9 @@ def test_backend_and_renderer_are_compact(deterministic_client, question, intent
     if intent == 'provenance_fact':
         assert '不是实时 Ozon' in result['answer'] and 'mock_enterprise_catalog' in result['answer']
     if intent == 'calculation_explanation':
-        assert 'net_profit / price' in result['answer'] and 'procurement_cost' in html
+        assert all(label in result['answer'] for label in ('净利润', '净利率', '计算逻辑', '采购成本'))
+        assert 'net_profit / price' not in result['answer'] and 'procurement_cost' not in result['answer']
+        assert '采购成本' in html
         assert not result['warnings'] and not result['missing_data']
 
 
