@@ -77,13 +77,8 @@ flowchart LR
 
 > 以下截图使用 synthetic / mock data，仅用于展示产品原型和功能验证，不代表真实 Ozon 市场数据。
 
-### 1. Agent / 产品主界面
+### 1. Agent / 产品主界面<img width="1280" height="736" alt="image" src="https://github.com/user-attachments/assets/bb26fe71-6e6a-46fe-916d-cbbb92254d43" />
 
-<!-- 上传截图后，将文件名替换为 screenshots 文件夹中的真实文件名
-
-![Agent Product UI](screenshots/agent-product-ui.png)
-
--->
 
 展示重点：
 
