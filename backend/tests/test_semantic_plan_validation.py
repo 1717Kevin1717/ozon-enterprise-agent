@@ -174,6 +174,84 @@ def test_raw_alias_mention_passes_before_backend_entity_resolution():
     assert resolution.products[0].title == "桌面理线器"
 
 
+@pytest.mark.parametrize(
+    ("operation", "provider_dimensions", "expected_dimensions"),
+    [
+        ("RECOVER", ["identity", "price"], ["price"]),
+        ("REFINE", ["analysis"], ["detail"]),
+    ],
+)
+def test_recover_from_partial_comparison_narrows_to_single_product_scope(
+    operation, provider_dimensions, expected_dimensions,
+):
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "product_detail",
+            operation=operation,
+            requested_dimensions=provider_dimensions,
+            planned_tools=["get_product"],
+            requires_context=True,
+            reference_slots=["last_resolved_entity"],
+        ),
+        "继续分析剩余候选",
+        context_packet={
+            "last_resolved_product_ids": ["opaque-context-slot"],
+            "task_context": {"has_pending_unresolved_entity": True},
+        },
+    )
+
+    assert parsed.name == "product_detail"
+    assert understood.requested_dimensions == expected_dimensions
+
+
+def test_partial_comparison_task_state_overrides_provider_filter_label_on_recover():
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "product_filter",
+            operation="REFINE",
+            requested_dimensions=["identity", "price"],
+            planned_tools=["get_product"],
+            requires_context=True,
+            reference_slots=["last_resolved_entity", "ordinal_reference"],
+        ),
+        "继续分析剩余候选",
+        context_packet={
+            "last_resolved_product_ids": ["opaque-context-slot"],
+            "task_context": {
+                "active_task_type": "product_comparison",
+                "has_pending_unresolved_entity": True,
+            },
+        },
+    )
+
+    assert parsed.name == "product_detail"
+    assert understood.operation == "RECOVER"
+    assert understood.requested_dimensions == ["price"]
+
+
+def test_ordinal_continuation_inherits_last_verified_dimension():
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "product_detail",
+            requested_dimensions=["identity", "price"],
+            planned_tools=[],
+            requires_context=True,
+            ordinal_reference=1,
+            reference_slots=["ordinal_reference"],
+            clarification_required=True,
+        ),
+        "第一个呢",
+        context_packet={
+            "last_comparison_order": ["opaque-1", "opaque-2"],
+            "last_requested_dimensions": ["profit"],
+        },
+    )
+
+    assert parsed.name == "product_detail"
+    assert understood.requested_dimensions == ["profit"]
+    assert understood.clarification_required is False
+
+
 def test_context_only_profit_plan_passes_for_context_resolver():
     parsed, understood = validate_semantic_plan(
         plan(
@@ -311,7 +389,46 @@ def test_cost_breakdown_normalizes_to_profit_and_keeps_backend_tool_plan():
 
     assert understood.requested_dimensions == ["profit"]
     assert understood.metric == "cost_breakdown"
-    assert parsed.policy.allowed_tools == ("get_product", "calculate_profit")
+
+
+@pytest.mark.parametrize("provider_dimension", ["cost", "costs", "cost_analysis", "cost_components"])
+def test_provider_cost_dimension_aliases_normalize_to_cost_breakdown(provider_dimension):
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "calculation_explanation",
+            requested_dimensions=[provider_dimension],
+            planned_tools=["get_product", "calculate_profit"],
+            reference_slots=["last_resolved_entity"],
+            requires_context=True,
+        ),
+        "继续解释该商品",
+        context_packet={"last_resolved_product_ids": ["opaque-context-slot"]},
+    )
+
+    assert understood.requested_dimensions == ["profit"]
+    assert understood.metric == "cost_breakdown"
+    assert parsed.policy.requested_dimensions == ("profit",)
+
+
+def test_cost_breakdown_metric_arbitrates_broad_product_detail_intent():
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "product_detail",
+            requested_dimensions=["profit", "calculation"],
+            metrics=["cost_breakdown"],
+            metric="cost_breakdown",
+            planned_tools=["get_product", "calculate_profit"],
+            reference_slots=["last_resolved_entity"],
+            requires_context=True,
+        ),
+        "继续解释该商品",
+        context_packet={"last_resolved_product_ids": ["opaque-context-slot"]},
+    )
+
+    assert parsed.name == "calculation_explanation"
+    assert understood.intent == "calculation_explanation"
+    assert understood.requested_dimensions == ["profit", "calculation"]
+    assert understood.metric == "cost_breakdown"
 
 
 def test_context_only_metric_supplies_its_canonical_dimension():

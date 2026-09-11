@@ -20,13 +20,13 @@ CANONICAL_INTENTS = (
 )
 
 SEMANTIC_PLANNER_INTENTS = frozenset({
-    "product_price", "product_detail", "product_comparison", "profit_comparison",
+    "product_price", "product_filter", "product_detail", "product_comparison", "profit_comparison",
     "selection_recommendation", "provenance_fact", "calculation_explanation",
     "decision_explanation", "data_quality_answer", "data_quality_policy", "unknown",
 })
 
 CANONICAL_DIMENSIONS = (
-    "price", "profit", "roi", "risk", "detail", "identity", "demand",
+    "price", "profit", "roi", "risk", "detail", "identity", "filters", "demand",
     "competition", "compliance", "recommendation", "decision", "provenance",
     "sales_snapshot", "data_sufficiency", "calculation", "evidence",
     "decision_reason", "freshness", "data_quality", "policy",
@@ -35,21 +35,30 @@ CANONICAL_DIMENSIONS = (
 # Metrics are specific measurements or analysis modes inside a dimension.  They
 # are not accepted as top-level business dimensions.
 CANONICAL_METRICS = (
-    "current_price", "net_margin", "sales_growth_rate", "cost_breakdown", "freshness",
+    "current_price", "net_profit", "net_margin", "roi", "recommendation_score",
+    "risk_level", "sales_growth_rate", "cost_breakdown", "freshness",
 )
 
 INTENT_ALLOWED_DIMENSIONS = {
+    "product_filter": frozenset({
+        "filters", "profit", "roi", "risk", "competition", "compliance",
+        "recommendation", "data_quality",
+    }),
     "provenance_fact": frozenset({
         "price", "profit", "provenance", "sales_snapshot", "data_sufficiency", "freshness",
     }),
     "calculation_explanation": frozenset({"profit", "roi", "calculation", "evidence"}),
-    "decision_explanation": frozenset({"decision_reason", "evidence"}),
+    "decision_explanation": frozenset({
+        "decision_reason", "evidence", "freshness", "recommendation",
+        "profit", "risk", "compliance", "decision",
+    }),
     "data_quality_answer": frozenset({"price", "freshness"}),
     "data_quality_policy": frozenset({"data_quality", "freshness", "policy"}),
     "product_price": frozenset({"price"}),
     "product_detail": frozenset({"price", "profit", "roi", "risk", "detail"}),
     "product_comparison": frozenset({
         "identity", "price", "profit", "roi", "demand", "competition", "compliance", "risk",
+        "recommendation", "decision",
     }),
     "profit_comparison": frozenset({"profit", "roi"}),
     "selection_recommendation": frozenset({
@@ -60,6 +69,8 @@ INTENT_ALLOWED_DIMENSIONS = {
 # These are aliases for provider-emitted enum values, not natural-language query
 # patterns.  Keep the table deliberately finite.
 DIMENSION_ALIASES = {
+    "analysis": ("detail",),
+    "product_analysis": ("detail",),
     "profitability": ("profit",),
     "profit_analysis": ("profit",),
     "net_profit_margin": ("profit",),
@@ -67,6 +78,10 @@ DIMENSION_ALIASES = {
     "margin": ("profit",),
     "cost_breakdown": ("profit",),
     "cost_structure": ("profit",),
+    "cost": ("profit",),
+    "costs": ("profit",),
+    "cost_analysis": ("profit",),
+    "cost_components": ("profit",),
     "profit_calculation": ("profit", "calculation"),
     "calculation_explanation": ("calculation",),
     "calculation_method": ("calculation",),
@@ -82,6 +97,8 @@ DIMENSION_ALIASES = {
 METRIC_ALIASES = {
     "price": "current_price",
     "sale_price": "current_price",
+    "profit": "net_profit",
+    "profit_amount": "net_profit",
     "net_profit_margin": "net_margin",
     "profit_margin": "net_margin",
     "margin": "net_margin",
@@ -95,7 +112,11 @@ METRIC_ALIASES = {
 
 METRIC_TO_DIMENSIONS = {
     "current_price": ("price",),
+    "net_profit": ("profit",),
     "net_margin": ("profit",),
+    "roi": ("roi",),
+    "recommendation_score": ("recommendation",),
+    "risk_level": ("risk",),
     "sales_growth_rate": ("sales_snapshot", "data_sufficiency"),
     "cost_breakdown": ("profit",),
     "freshness": ("freshness",),
@@ -107,6 +128,10 @@ DIMENSION_TO_METRIC = {
     "margin": "net_margin",
     "cost_breakdown": "cost_breakdown",
     "cost_structure": "cost_breakdown",
+    "cost": "cost_breakdown",
+    "costs": "cost_breakdown",
+    "cost_analysis": "cost_breakdown",
+    "cost_components": "cost_breakdown",
     "data_freshness": "freshness",
     "recency": "freshness",
     "price_freshness": "freshness",

@@ -8,6 +8,7 @@ from collections.abc import Iterable
 
 from app.db.models import ConversationSession, Product
 from app.schemas.agent import ContextSnapshot, QueryUnderstanding, ReferenceResolutionResult
+from app.agent.task_state import load_task_state
 
 
 _SELECTION_REFERENCE = re.compile(
@@ -80,6 +81,7 @@ def build_context_snapshot(
         last_preference_order=list(state.get("last_preference_order") or [])[:10],
         last_negative_scope=list(state.get("last_negative_scope") or [])[:10],
         context_warnings=list(dict.fromkeys(warnings)),
+        task_state=load_task_state(state, {item.id for item in products}),
     )
 
 
@@ -125,6 +127,41 @@ def resolve_context_reference(
             inherited_dimensions=inherited, confidence=1,
         )
 
+    if (
+        understanding.operation == "REFINE"
+        and understanding.ordinal_reference is None
+        and not _ORDINAL.search(query)
+        and snapshot.task_state.active_comparison_set
+    ):
+        candidates = snapshot.task_state.active_comparison_set.product_ids
+        if candidates:
+            return ReferenceResolutionResult(
+                product_ids=candidates, source="session_state", reference_expression="active_comparison_set",
+                inherited_dimensions=inherited, confidence=0.98,
+            )
+    if understanding.operation == "RECOVER" and snapshot.task_state.active_entities:
+        return ReferenceResolutionResult(
+            product_ids=snapshot.task_state.active_entities, source="session_state",
+            reference_expression="resolved_task_entities", inherited_dimensions=inherited, confidence=0.98,
+        )
+
+    if understanding.operation == "EXPLAIN_RANKING" and snapshot.task_state.active_result_set:
+        ranked = snapshot.task_state.active_result_set.product_ids[:2]
+        if len(ranked) == 2:
+            return ReferenceResolutionResult(
+                product_ids=ranked, source="session_state", reference_expression="active_ranking_top_two",
+                inherited_dimensions=inherited, confidence=1,
+            )
+
+    recommendation = snapshot.task_state.active_recommendation
+    if recommendation and understanding.requires_context and understanding.intent in {
+        "decision_explanation", "provenance_fact", "data_quality_answer", "selection_recommendation",
+    }:
+        return ReferenceResolutionResult(
+            product_ids=[recommendation.selected_product_id], source="session_state",
+            reference_expression="active_recommendation", inherited_dimensions=inherited, confidence=1,
+        )
+
     selection_reference = bool(_SELECTION_REFERENCE.search(query)) and not bool(_IGNORE_SELECTION.search(query))
     if selection_reference:
         if snapshot.current_selected_product_ids:
@@ -132,6 +169,12 @@ def resolve_context_reference(
                 product_ids=snapshot.current_selected_product_ids, source="ui_selection",
                 reference_expression=_SELECTION_REFERENCE.search(query).group(0),
                 inherited_dimensions=inherited, confidence=0.98,
+            )
+        if snapshot.task_state.active_result_set and snapshot.task_state.active_result_set.product_ids:
+            return ReferenceResolutionResult(
+                product_ids=snapshot.task_state.active_result_set.product_ids,
+                source="session_state", reference_expression=_SELECTION_REFERENCE.search(query).group(0),
+                inherited_dimensions=inherited, confidence=0.96,
             )
         return ReferenceResolutionResult(
             source="ui_selection", reference_expression=_SELECTION_REFERENCE.search(query).group(0),
@@ -146,11 +189,18 @@ def resolve_context_reference(
             reference_expression="single_selection_price_scenario", inherited_dimensions=inherited, confidence=0.98,
         )
 
-    ordinal = _ordinal_index(query, len(snapshot.last_comparison_order))
+    task_order = (
+        snapshot.task_state.active_comparison_set.product_ids
+        if snapshot.task_state.active_comparison_set else
+        snapshot.task_state.active_result_set.product_ids
+        if snapshot.task_state.active_result_set else []
+    )
+    ordinal_order = snapshot.last_comparison_order or task_order
+    ordinal = _ordinal_index(query, len(ordinal_order))
     if ordinal is not None:
-        if 0 <= ordinal < len(snapshot.last_comparison_order):
+        if 0 <= ordinal < len(ordinal_order):
             return ReferenceResolutionResult(
-                product_ids=[snapshot.last_comparison_order[ordinal]], source="ordinal_reference",
+                product_ids=[ordinal_order[ordinal]], source="ordinal_reference",
                 reference_expression=_ORDINAL.search(query).group(0), inherited_dimensions=inherited, confidence=1,
             )
         return ReferenceResolutionResult(
@@ -159,7 +209,7 @@ def resolve_context_reference(
         )
 
     if _ONE_ONLY.search(query):
-        candidates = snapshot.last_comparison_order or snapshot.last_comparison_product_ids
+        candidates = snapshot.last_comparison_order or snapshot.last_comparison_product_ids or task_order
         if candidates:
             return ReferenceResolutionResult(
                 product_ids=candidates, source="last_comparison", reference_expression=_ONE_ONLY.search(query).group(0),
@@ -167,7 +217,7 @@ def resolve_context_reference(
             )
 
     if _LAST_COMPARISON_REFERENCE.search(query):
-        candidates = snapshot.last_comparison_order or snapshot.last_comparison_product_ids
+        candidates = snapshot.last_comparison_order or snapshot.last_comparison_product_ids or task_order
         if candidates:
             return ReferenceResolutionResult(
                 product_ids=candidates, source="last_comparison",

@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from app.agent.entity_resolution import EntityResolution, normalize_entity, query_mentions, resolve_entity
 from app.agent.tool_registry import TOOL_REGISTRY
-from app.schemas.agent import ContextSnapshot, QueryUnderstanding, SemanticContextPacket
+from app.schemas.agent import ContextSnapshot, QueryUnderstanding, SemanticContextPacket, SemanticTaskContextPacket
 from app.schemas.semantic_vocabulary import (
     INTENT_ALLOWED_DIMENSIONS,
     METRIC_TO_DIMENSIONS,
@@ -19,7 +19,8 @@ from app.schemas.semantic_vocabulary import (
 REFERENCE = re.compile(
     r"刚才那个(?:商品|产品)?|刚才(?:那|这)(?:两个|几个)(?:商品|产品|候选)?|这个(?:商品|产品|价格|利润|指标|数据|数)?|那个(?:商品|产品)?|"
     r"这几个(?:商品|产品|候选)?|这两个(?:商品|产品|候选)?|这些(?:商品|产品|候选)?|"
-    r"我选的这些|它|第[一二两三四五六七八九十\d]+个|前一个|后一个|那利润(?:呢)?|现在比较(?:一下)?"
+    r"我选的这些|它|第[一二两三四五六七八九十\d]+个|前一个|后一个|那利润(?:呢)?|现在比较(?:一下)?|"
+    r"剩下(?:的|那个|那些)?|已找到(?:的|那个|那些)?|没找到(?:的|那个|那些)?"
 )
 SEMANTIC_TYPES = {"provenance_fact", "calculation_explanation", "decision_explanation", "data_quality_answer", "data_quality_policy"}
 SEMANTIC_HANDOFF_TOOLS = ("get_product", "calculate_profit", "get_sales_trend")
@@ -79,15 +80,16 @@ def _reject(rule_id: str, reason_code: str, field: str | None, *, safe_detail: s
 def semantic_policy(intent, dimensions, selected=()):
     from app.agent.intent_engine import ParsedIntent, _policy
     tools = () if intent in {"data_quality_policy", "compliance_policy", "recommendation_policy", "unknown"} else (
+        ("filter_products",) if intent == "product_filter" else
         ("compare_products",) if intent == "product_comparison" else
         ("compare_products", "calculate_profit") if intent == "profit_comparison" else
-        ("compare_products",) if intent == "selection_recommendation" else
+        ("filter_products", "compare_products") if intent == "selection_recommendation" else
         ("get_product", "get_sales_trend") if "sales_snapshot" in dimensions else
         ("get_product", "calculate_profit") if intent == "calculation_explanation" else
         ("get_product", "calculate_profit") if intent == "product_detail" and ({"profit", "roi"} & set(dimensions)) else
         ("get_product",)
     )
-    budget = 10 if intent == "data_quality_answer" else 11 if intent == "profit_comparison" else len(tools)
+    budget = 10 if intent == "data_quality_answer" else 11 if intent == "profit_comparison" else 1 if intent == "selection_recommendation" else len(tools)
     return ParsedIntent(intent, selected_product_ids=tuple(selected), policy=_policy(tools, budget, tuple(dimensions), selection="ignore" if not tools else "query_first", fast=True))
 
 
@@ -96,6 +98,8 @@ def semantic_intent(query, selected=(), context_snapshot: ContextSnapshot | None
     q = query.casefold()
     previous_dimensions = tuple(context_snapshot.last_requested_dimensions) if context_snapshot else ()
     previous_fact = context_snapshot.last_fact_dimension if context_snapshot else None
+    if re.search(r"过期|新鲜|时效|旧了", q) and re.search(r"推荐|维持|继续", q):
+        return semantic_policy("decision_explanation", ("decision_reason", "evidence", "freshness", "recommendation"), selected)
     if "完整度" in q and re.search(r"代表|意味|等于|足够|可靠|靠谱|直接.*上架|就.*上架", q):
         return semantic_policy("data_quality_policy", ("data_quality", "policy"))
     if re.search(r"过期|旧了|多久.*采|何时.*采|什么时候.*采|前采", q) and re.search(r"作为.*依据|能否.*使用|还能.*用|是否.*可信", q) and not re.search(r"这个|那个|它|具体|商品名|product[_ -]?id", q):
@@ -104,7 +108,7 @@ def semantic_intent(query, selected=(), context_snapshot: ContextSnapshot | None
         return semantic_policy("decision_explanation", ("decision_reason", "evidence"), selected)
     if re.search(r"为什么|为何|主要卡在", q) and re.search(r"推荐|上架|不能上|卡在", q):
         return semantic_policy("decision_explanation", ("decision_reason", "evidence"), selected)
-    if re.search(r"怎么算|如何算|怎么.*(?:算|得|来)|计算(?:依据|公式|过程)|如何.*计算|亏在哪些成本|成本.*构成|利润依据", q) and re.search(r"利润|roi|%|％|指标|这个数|成本", q):
+    if re.search(r"怎么算|如何算|怎么.*(?:算|得|来)|计算(?:依据|公式|过程)|如何.*计算|亏在哪些成本|成本.*构成|成本.*(?:最大|最高|主要|前[一二两三四五六七八九十\d]+|top)|利润依据", q) and re.search(r"利润|roi|%|％|指标|这个数|成本", q):
         return semantic_policy("calculation_explanation", ("profit", "roi", "calculation", "evidence"), selected)
     if re.search(r"过期|新鲜|旧了|多久.*采|何时.*采|什么时候.*采|现在.*还能用", q):
         dims = ("price", "freshness") if re.search(r"价格|售价", q) else ("freshness",)
@@ -146,6 +150,8 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         mentions = [m for m in mentions if not any(m == ref or m.startswith(ref + "的") for ref in references)]
     dims = list(parsed.policy.requested_dimensions)
     metrics = [field for field, tokens in (("current_price", ("价格", "售价")), ("net_margin", ("净利率", "利润率")), ("sales_growth_rate", ("增速", "增长率"))) if any(token in query for token in tokens)]
+    if re.search(r"成本.*(?:最大|最高|主要|前[一二两三四五六七八九十\d]+|top)", query, re.I):
+        metrics = list(dict.fromkeys([*metrics, "cost_breakdown"]))
     resolved = [resolve_entity(products, mention) for mention in mentions]
     # Default detail is high confidence only for a bare name or explicit detail verb.
     known_detail = bool(mentions) and not re.search(r"为什么|怎么|哪里|是否|[?？]|\b(?:why|how)\b", query, re.I) and (
@@ -166,7 +172,25 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         # instead of asserting NOT_FOUND before the task is understood.
         or (bool(mentions) and not any(item.resolved for item in resolved) and parsed.name == "product_detail")
     )
-    semantic_complex = bool(re.search(r"哪个好|如果只能留一个|利润优先|风险其次|你怎么看|为什么这么低", query)) or contextual_handoff
+    comparison_refine_signal = bool(
+        context_snapshot
+        and context_snapshot.task_state.active_comparison_set
+        and re.search(r"只比较|只看|只保留|仅比较|再加|加上", query)
+    )
+    task_operation_signal = comparison_refine_signal or bool(re.search(
+        r"(?:取消|移除|删除|去掉|重新|重跑|再次执行|其他.*不变|排序|重排|优先|"
+        r"第[一二两三四五六七八九十\d]+个|这些结果|刚才.*条件|"
+        r"(?:这些|这批|这几个|当前结果).*(?:最高|最低|最大|最小|最多|最少)|"
+        r"(?:第一|榜首).*(?:第二).*(?:为什么|为何|原因)|"
+        r"成本.*(?:最大|最高|主要|前[一二两三四五六七八九十\d]+|top)|"
+        r"忽略.*(?:没找到|不存在)|只分析.*(?:剩下|已找到)|推荐.*(?:继续调研|调查)|"
+        r"(?:改|调整).*(?:净利率|利润率|竞争|风险|合规|条件)|"
+        r"(?:净利率|利润率|竞争|风险|合规|条件).*(?:改|调整)|"
+        r"假设|如果.*(?:降低|增加|减少)|换成.*(?:看|分析)|不是|改口|"
+        r"不做|不要|不分析|无需|不需要|不比较)",
+        query,
+    ))
+    semantic_complex = bool(re.search(r"哪个好|如果只能留一个|利润优先|风险其次|你怎么看|为什么这么低", query)) or contextual_handoff or task_operation_signal
     # A catalogue entity is evidence about identity, not evidence that the rule
     # router understood the user's task. Only a recognized deterministic grammar
     # may take the fast path; all other meaningful utterances need semantic handoff.
@@ -184,13 +208,14 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         parsed = semantic_policy("unknown", ())
     understanding = QueryUnderstanding(
         intent=parsed.name, question_type=parsed.name,
-        entity_mentions=mentions, references=references, metrics=metrics,
+        entity_mentions=mentions, entity_roles=["EXPLICIT_PRODUCT" for _ in mentions], references=references, metrics=metrics,
         metric_values=[float(v) for v in re.findall(r"([+-]?\d+(?:\.\d+)?)\s*[%％]", query)],
         requested_dimensions=dims if supported else [],
         comparison_requested="comparison" in parsed.name,
         explanation_requested=parsed.name in {"calculation_explanation", "decision_explanation"},
         provenance_requested=parsed.name == "provenance_fact", calculation_requested=parsed.name == "calculation_explanation",
         policy_requested="policy" in parsed.name, requires_context=bool(references) or (not mentions and parsed.policy.selection_mode != "ignore"),
+        requires_task_state=task_operation_signal,
         confidence=0.95 if parsed.recognized else 0.65 if any(item.resolved for item in resolved) else 0.4,
         route=route, planned_tools=list(parsed.policy.allowed_tools),
     )
@@ -211,6 +236,31 @@ def build_semantic_context_packet(
         + snapshot.last_resolved_product_ids
         + snapshot.last_comparison_order
     ))
+    task = snapshot.task_state
+    task_entity_ids = list(dict.fromkeys(
+        task.active_entities
+        + (task.active_result_set.product_ids if task.active_result_set else [])
+        + (task.active_comparison_set.product_ids if task.active_comparison_set else [])
+    ))[:10]
+    result_count = len(task.active_result_set.product_ids) if task.active_result_set else 0
+    comparison_count = len(task.active_comparison_set.product_ids) if task.active_comparison_set else 0
+    task_context = SemanticTaskContextPacket(
+        active_task_type=task.task_type,
+        active_operation=task.operation,
+        active_entities_display_names=[names[item] for item in task_entity_ids if item in names],
+        result_set_count=result_count,
+        comparison_count=comparison_count,
+        active_filter_spec=task.filter_spec,
+        active_sort_spec=task.sort_spec,
+        active_dimensions=(task.active_comparison_set.dimensions if task.active_comparison_set else task.requested_dimensions),
+        ordinal_capacity=comparison_count or result_count,
+        has_pending_unresolved_entity=any(item.status in {"NOT_FOUND", "AMBIGUOUS", "LOW_CONFIDENCE"} for item in task.pending_entities),
+        pending_entity_statuses=[item.status for item in task.pending_entities],
+        has_active_recommendation=task.active_recommendation is not None,
+        recommendation_candidate_count=len(task.active_recommendation.candidate_product_ids) if task.active_recommendation else 0,
+        has_active_scenario=False,
+        last_successful_action=task.last_successful_action,
+    )
     return SemanticContextPacket(
         query=query,
         session_id=snapshot.session_id,
@@ -229,6 +279,7 @@ def build_semantic_context_packet(
         verified_product_names={item: names[item] for item in referenced_ids if item in names},
         allowed_tools=list(understanding.planned_tools or SEMANTIC_HANDOFF_TOOLS),
         max_tool_calls=10,
+        task_context=task_context,
         rule_understanding=understanding,
     )
 
@@ -271,17 +322,23 @@ def arbitrate_entity_mentions(products, understanding, query: str) -> EntityArbi
     roles: list[str] = []
     statuses: list[str] = []
     ignored = 0
-    for mention in understanding.entity_mentions:
-        result = resolve_entity(products, mention)
+    for index, mention in enumerate(understanding.entity_mentions):
         normalized = normalize_entity(mention)
         backend_explicit = bool(normalized) and any(
             normalized == candidate
             or (len(normalized) >= 3 and (normalized in candidate or candidate in normalized))
             for candidate in normalized_backend
         )
+        provider_role = understanding.entity_roles[index] if index < len(understanding.entity_roles) else None
+        if provider_role not in {None, "EXPLICIT_PRODUCT", "PRODUCT_ALIAS"} and not backend_explicit:
+            ignored += 1
+            roles.append(provider_role)
+            statuses.append("IGNORED_SEMANTIC_CANDIDATE")
+            continue
+        result = resolve_entity(products, mention)
         if result.resolved or backend_explicit:
             retained.append(result)
-            roles.append("EXPLICIT_PRODUCT")
+            roles.append("PRODUCT_ALIAS" if provider_role == "PRODUCT_ALIAS" else "EXPLICIT_PRODUCT")
             statuses.append(result.status)
         elif reference_signal or semantic_signal:
             ignored += 1
@@ -345,6 +402,33 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
             })
         else:
             _reject("SEM002", "LOW_CONFIDENCE_REQUIRES_CLARIFICATION", "confidence")
+    packet_get = (
+        context_packet.get
+        if isinstance(context_packet, dict)
+        else lambda key, default=None: getattr(context_packet, key, default)
+    ) if context_packet is not None else lambda key, default=None: default
+    ordinal_continuation = bool(
+        value.ordinal_reference
+        or re.search(r"第[一二两三四五六七八九十\d]+个|前一个|后一个", query)
+    )
+    if (
+        ordinal_continuation
+        and value.requires_context
+        and not value.entity_mentions
+        and _has_context_target(context_packet)
+        and not value.metrics
+        and value.metric is None
+    ):
+        inherited = normalize_semantic_values(packet_get("last_requested_dimensions", []))
+        inherited_dimensions = [
+            dimension for dimension in inherited.dimensions
+            if dimension in INTENT_ALLOWED_DIMENSIONS["product_detail"]
+        ]
+        value = value.model_copy(update={
+            "intent": "product_price" if inherited_dimensions == ["price"] else "product_detail",
+            "requested_dimensions": inherited_dimensions or ["detail"],
+            "clarification_required": False,
+        })
     if (
         value.intent == "unknown"
         and value.requires_context
@@ -378,6 +462,28 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
     ):
         value = value.model_copy(update={"intent": "product_detail", "comparison_required": False})
 
+    task_context = (
+        context_packet.get("task_context")
+        if isinstance(context_packet, dict)
+        else getattr(context_packet, "task_context", None)
+    ) if context_packet is not None else None
+    task_get = (
+        task_context.get
+        if isinstance(task_context, dict)
+        else lambda key, default=None: getattr(task_context, key, default)
+    )
+    if (
+        value.operation in {"RECOVER", "REFINE"}
+        and task_context is not None
+        and task_get("has_pending_unresolved_entity", False)
+        and task_get("active_task_type", "") in {"product_comparison", "profit_comparison"}
+    ):
+        value = value.model_copy(update={
+            "intent": "product_detail",
+            "operation": "RECOVER",
+            "comparison_required": False,
+        })
+
     normalized = normalize_semantic_values(value.requested_dimensions, value.metrics, value.metric)
     if normalized.unknown_dimensions:
         _reject("SEM004", "INVALID_DIMENSION", "requested_dimensions")
@@ -389,6 +495,33 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         "metrics": list(normalized.metrics),
         "metric": normalized.metric,
     })
+    # A provider can correctly identify the cost-breakdown metric while using
+    # the broader product-detail task label.  The metric is more specific than
+    # that label, so normalize it into the existing deterministic calculation
+    # contract before intent-scope validation.  Product identity and every
+    # amount remain backend-owned.
+    if normalized.metric == "cost_breakdown":
+        value = value.model_copy(update={
+            "intent": "calculation_explanation",
+            "explanation_requested": True,
+            "calculation_requested": True,
+            "requires_tools": True,
+        })
+    # A RECOVER operation can collapse a partially resolved comparison into a
+    # single-product task.  In that transition, comparison-only dimensions are
+    # no longer applicable.  Narrow them against the canonical single-product
+    # contract; product identity and business facts remain backend-owned.
+    if (
+        value.operation in {"RECOVER", "REFINE"}
+        and value.intent == "product_detail"
+        and task_context is not None
+        and task_get("has_pending_unresolved_entity", False)
+    ):
+        narrowed = [
+            dimension for dimension in value.requested_dimensions
+            if dimension in INTENT_ALLOWED_DIMENSIONS["product_detail"]
+        ]
+        value = value.model_copy(update={"requested_dimensions": narrowed or ["detail"]})
     if not value.requested_dimensions and value.intent == "product_price":
         value = value.model_copy(update={"requested_dimensions": ["price"]})
     if not value.requested_dimensions or not set(value.requested_dimensions) <= INTENT_ALLOWED_DIMENSIONS[value.intent]:
@@ -412,7 +545,7 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
     contextual_target = value.requires_context and _has_context_target(context_packet)
     downstream_clarification = (
         not value.entity_mentions and not value.references and not contextual_target
-        and value.intent not in {"data_quality_policy", "selection_recommendation"}
+        and value.intent not in {"data_quality_policy", "product_filter", "selection_recommendation"}
     )
     parsed = semantic_policy(value.intent, value.requested_dimensions, selected)
     unknown_tools = [tool for tool in value.planned_tools if TOOL_REGISTRY.get(tool) is None]
@@ -421,7 +554,11 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
     backend_tools = list(parsed.policy.allowed_tools)
     advisory_mismatch = [tool for tool in dict.fromkeys(value.planned_tools) if tool not in parsed.policy.allowed_tools]
     value = value.model_copy(update={"route": "SEMANTIC_PLANNER", "planner_calls": 1, "failure_code": None,
-                                    "requires_context": not value.entity_mentions and parsed.policy.selection_mode != "ignore",
+                                    "requires_context": value.requires_context or (
+                                        not value.entity_mentions
+                                        and parsed.policy.selection_mode != "ignore"
+                                        and value.intent != "selection_recommendation"
+                                    ),
                                     "requires_tools": bool(backend_tools),
                                     "clarification_required": value.clarification_required or downstream_clarification,
                                     "clarification_reason": value.clarification_reason or (

@@ -19,7 +19,7 @@ COST_LABELS = {
 
 
 def _money(value) -> str:
-    return f"{float(value or 0):.2f} RUB"
+    return "未知" if value is None else f"{float(value):.2f} RUB"
 
 
 def _rate(value) -> str:
@@ -59,10 +59,14 @@ def _profit_answer(title: str, analysis: dict) -> str:
 
 def _calculation_answer(title: str, analysis: dict) -> str:
     calculation = analysis.get("calculation_evidence") or {}
+    required = ("sale_price", "total_cost", "result", "roi")
+    if any(calculation.get(field) is None for field in required):
+        return f"{title}本轮没有取得完整的后端计算依据，因此不展示可能误导的 0 值；请重新执行利润计算。"
     items = _business_cost_items(calculation)
     lines = [
         f"{title}当前单件净利润约 {_money(calculation.get('result', analysis.get('net_profit')))}，净利率约 {_rate(calculation.get('net_margin', analysis.get('net_margin')))}。",
         f"计算逻辑：售价 {_money(calculation.get('sale_price'))} - 成本合计 {_money(calculation.get('total_cost'))} = 净利润 {_money(calculation.get('result'))}。",
+        f"ROI 计算：净利润 {_money(calculation.get('result'))} ÷ 成本合计 {_money(calculation.get('total_cost'))} = {_rate(calculation.get('roi'))}。",
     ]
     if items:
         lines.append("实际计入的成本：" + "；".join(_cost_item_text(item) for item in items) + "。")
@@ -71,7 +75,7 @@ def _calculation_answer(title: str, analysis: dict) -> str:
 
 def _cost_breakdown_answer(title: str, analysis: dict) -> str:
     calculation = analysis.get("calculation_evidence") or {}
-    items = _business_cost_items(calculation)
+    items = _business_cost_items(calculation, limit=3)
     if not items:
         return f"{title}目前没有足够的后端成本输入，暂时无法判断主要成本压力。" + _evidence_gap_text(calculation)
     lines = [f"{title}目前成本压力主要来自以下几项："]
@@ -85,6 +89,14 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
     intent = understanding.intent
     if intent not in SEMANTIC_TYPES | {"unknown", "product_detail"}:
         return
+    if intent == "selection_recommendation":
+        # Candidate discovery and the recommendation gate already produced a
+        # complete deterministic decision report.  A semantic interpretation
+        # must not replace that report merely because no single-product view
+        # was materialized for a catalogue-wide filter.
+        return
+    if understanding.operation in {"ARGMAX", "ARGMIN", "EXPLAIN_RANKING"}:
+        return
     if intent == "product_detail" and not ({"profit", "roi"} & set(understanding.requested_dimensions)):
         # Risk facts and snapshot sufficiency already have narrower, validated
         # response contracts in the deterministic backend renderer.  The
@@ -92,8 +104,10 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
         return
     if entity_blocked:
         return
-    payload.update(decision_summary={}, decision_status="NOT_APPLICABLE", human_review_required=False,
-                   requires_human_review=False, warnings=[], risks=[], missing_data=[], next_actions=[], evidence=[], trust_notices=[])
+    reset = {"warnings": [], "risks": [], "missing_data": [], "next_actions": [], "evidence": [], "trust_notices": []}
+    if intent != "decision_explanation":
+        reset.update(decision_summary={}, decision_status="NOT_APPLICABLE", human_review_required=False, requires_human_review=False)
+    payload.update(**reset)
     payload["display_scope"] = ["answer", "evidence", "source", "tool_summary", *understanding.requested_dimensions]
     if intent == "unknown":
         payload.update(response_type="clarification", task_completed=False,
@@ -123,6 +137,7 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
             notices = [item.model_dump() for item in evidence_notices([FieldEvidence.model_validate(f) for f in fields])]
             payload["trust_notices"].extend(notices)
             title = view["title"]
+            recommendation = (payload.get("task_state") or {}).get("active_recommendation") or {}
             if intent == "calculation_explanation":
                 calculation = analysis.get("calculation_evidence") or {}
                 if understanding.metric == "cost_breakdown" and calculation.get("cost_breakdown"):
@@ -132,17 +147,45 @@ def scope_semantic_response(payload, views, understanding, entity_blocked):
             elif intent == "decision_explanation":
                 product = next(p for p in payload["products"] if p["id"] == view["id"])
                 payload["decision_status"] = product["decision_status"]
-                reasons = [item.get("message", "") for item in analysis.get("risks", []) if item.get("code") not in {"STATIC_SALES_GROWTH_DECLINE", "DECLINING_DEMAND"}]
-                missing = analysis.get("missing_data") or []
-                text = f"当前决策状态 {product['decision_status']}。依据：" + "；".join(reasons)
-                if missing:
-                    text += "；缺失证据：" + "、".join(str(item.get("label") or item.get("field") or item.get("message") or "未命名证据") for item in missing)
-                if not reasons and not missing:
-                    text += "当前保存分析未列出额外阻断原因，不假设存在‘不推荐’结论。"
+                if "freshness" in dimensions and recommendation:
+                    critical_names = set(recommendation.get("evidence_fields") or [])
+                    critical = [field for field in fields if not critical_names or field.get("field") in critical_names]
+                    stale = [field.get("field") for field in critical if (field.get("freshness") or {}).get("status") == "STALE"]
+                    unknown = [field.get("field") for field in critical if (field.get("freshness") or {}).get("status") == "UNKNOWN"]
+                    if stale or unknown:
+                        affected = "、".join([*stale, *unknown][:8]) or "关键字段"
+                        text = f"不会直接维持正式推荐。{affected}的时效已过期或无法确认，后端策略会把该结论降级为证据不足/人工复核，重新采集并通过推荐门禁后才能恢复。"
+                    else:
+                        text = f"当前推荐所用关键字段均在已配置有效期内，但这只代表时效通过；决策状态仍为 {product['decision_status']}，最终动作继续由人工审核。"
+                elif recommendation:
+                    text = (
+                        f"当前选择它是因为后端候选排序中推荐度为 {product['score']:.1f}，"
+                        f"净利率 {product['current_margin_rate']:.1%}、风险 {product['risk_level']}、"
+                        f"合规状态 {product['compliance_status']}，推荐门禁结果为 {product['decision_status']}。"
+                        "这是继续调研建议，不替代最终人工决策。"
+                    )
+                else:
+                    reasons = [item.get("message", "") for item in analysis.get("risks", []) if item.get("code") not in {"STATIC_SALES_GROWTH_DECLINE", "DECLINING_DEMAND"}]
+                    missing = analysis.get("missing_data") or []
+                    text = f"当前决策状态 {product['decision_status']}。依据：" + "；".join(reasons)
+                    if missing:
+                        text += "；缺失证据：" + "、".join(str(item.get("label") or item.get("field") or item.get("message") or "未命名证据") for item in missing)
+                    if not reasons and not missing:
+                        text += "当前保存分析未列出额外阻断原因，不假设存在‘不推荐’结论。"
             elif intent == "data_quality_answer":
                 groups = {status: [f["field"] for f in fields if f.get("freshness", {}).get("status") == status] for status in ("FRESH", "STALE", "UNKNOWN")}
                 text = "；".join(f"{status}（{len(names)}项）：{'、'.join(names) or '无'}" for status, names in groups.items())
                 text += "。FRESH仅表示在当前有效期内，不代表真实性已认证；UNKNOWN不是新鲜。"
+            elif intent == "provenance_fact" and recommendation:
+                lines = []
+                for field in fields:
+                    freshness = (field.get("freshness") or {}).get("status", "UNKNOWN")
+                    derived = "派生指标" if field.get("derived_from") else "原始/录入字段"
+                    mock = "Mock" if field.get("is_mock") else str(field.get("source_type") or "unknown")
+                    lines.append(f"{field.get('field')}：{field.get('provider', 'unknown')}，{derived}，{mock}，时效 {freshness}")
+                text = "当前推荐证据来源：" + "；".join(lines[:12]) + "。"
+                if not lines:
+                    text = "当前推荐结果没有可验证的字段来源，不能把推荐视为已证实事实。"
             else:
                 if "sales_snapshot" in dimensions:
                     suff = payload.get("data_sufficiency") or {}

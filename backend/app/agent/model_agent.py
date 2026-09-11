@@ -12,6 +12,7 @@ from app.agent.query_understanding import (
     understand_query, validate_semantic_plan,
 )
 from app.agent.tools import rule_agent_ask
+from app.agent.task_state import task_mutation_intent
 from app.db.models import ConversationSession
 from app.repositories.products import ProductRepository
 from app.schemas.agent import GroundedReasoningOutput
@@ -109,6 +110,26 @@ async def dual_model_agent_ask(
         selection_bound_session_id=selection_bound_session_id,
     )
     parsed, understanding = understand_query(query, products, selected_product_ids, snapshot)
+    mutation_result = task_mutation_intent(
+        query, snapshot.task_state, selected_product_ids or (), understanding.entity_mentions,
+    )
+    if mutation_result:
+        parsed, mutation = mutation_result
+        understanding = understanding.model_copy(update={
+            "intent": parsed.name,
+            "task_type": snapshot.task_state.task_type or parsed.name,
+            "operation": mutation["operation"],
+            "filter_updates": mutation.get("filter_updates", {}),
+            "sort_updates": mutation.get("sort_updates", []),
+            "metric": mutation.get("metric", understanding.metric),
+            "metrics": [mutation["metric"]] if mutation.get("metric") else understanding.metrics,
+            "requires_task_state": True,
+            "requires_context": mutation.get("requires_context", False),
+            "requested_dimensions": list(parsed.policy.requested_dimensions),
+            "planned_tools": list(parsed.policy.allowed_tools),
+            "route": "DETERMINISTIC_FAST_PATH" if mutation.get("deterministic") else "SEMANTIC_PLANNER",
+            "failure_code": None,
+        })
     router = build_model_router()
     decision = router.semantic_route(understanding, policy=execution_policy)
     if decision.route == "DETERMINISTIC_FAST_PATH":

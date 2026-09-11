@@ -27,7 +27,7 @@ CASES = (
     EvalCase("推荐度阈值筛选", "企业有哪些商品分数达到60以上？", {"min_score": 60, "sort_by": "recommendation_score", "sort_direction": "desc"}, 100),
     EvalCase("Top5优先级", "从候选池选出最值得测试的5个商品，并说明证据和缺口。", {"sort_by": "recommendation_score", "sort_direction": "desc"}, 5),
     EvalCase("数据缺失阻断", "哪些商品因为数据不完整不能进入最终审核？", {"completeness": "incomplete", "sort_by": "completeness", "sort_direction": "asc"}, 100),
-    EvalCase("利润与竞争约束", "找利润30%以上，竞争低于40的商品。", {"min_margin_rate": 0.30, "max_market_saturation": 40, "sort_by": "margin_rate", "sort_direction": "desc"}, 100),
+    EvalCase("利润与竞争约束", "找利润30%以上，竞争低于40的商品。", {"min_margin_rate": 0.30, "max_competition_score": 40, "sort_by": "margin_rate", "sort_direction": "desc"}, 100),
 )
 
 

@@ -37,14 +37,16 @@ class FilterProductsInput(ToolInput):
     min_margin_rate: float | None = Field(default=None, ge=-1, le=1)
     min_roi: float | None = Field(default=None, ge=-10, le=100)
     max_market_saturation: float | None = Field(default=None, ge=0, le=100)
+    max_competition_score: float | None = Field(default=None, ge=0, le=100)
     brand: str = Field(default="", max_length=255)
     category: str = Field(default="", max_length=500)
     lifecycle_status: str = Field(default="", max_length=32)
     risk_level: Literal["", "low", "medium", "high"] = ""
+    excluded_risk_levels: list[Literal["low", "medium", "high"]] = Field(default_factory=list, max_length=3)
     compliance_status: Literal["", "approved", "pending", "rejected"] = ""
     completeness: Literal["all", "complete", "incomplete"] = "all"
     updated_since: datetime | None = None
-    sort_by: Literal["recommendation_score", "completeness", "updated_at", "margin_rate"] = "recommendation_score"
+    sort_by: Literal["recommendation_score", "completeness", "updated_at", "margin_rate", "net_profit", "risk"] = "recommendation_score"
     sort_direction: Literal["asc", "desc"] = "desc"
     limit: int = Field(default=20, ge=1, le=100)
 

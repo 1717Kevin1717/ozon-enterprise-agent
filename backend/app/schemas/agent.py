@@ -36,6 +36,118 @@ ContextSource = Literal[
     "last_resolved_entity", "ordinal_reference", "session_state", "none", "conflict", "invalid",
 ]
 
+TaskOperation = Literal[
+    "CREATE", "CONTINUE", "SWITCH", "REFINE", "ADD_CONSTRAINT",
+    "UPDATE_CONSTRAINT", "REMOVE_CONSTRAINT", "REORDER", "RERUN",
+    "INSPECT", "COMPARE", "RECOMMEND", "EXPLAIN", "RECOVER",
+    "SIMULATE", "CANCEL",
+    "ARGMAX", "ARGMIN", "EXPLAIN_RANKING",
+]
+
+EntityRole = Literal[
+    "EXPLICIT_PRODUCT", "PRODUCT_ALIAS", "PRONOUN_REFERENCE",
+    "ORDINAL_REFERENCE", "RESULT_SET_REFERENCE", "COMPARISON_REFERENCE",
+    "TASK_REFERENCE", "SOURCE_SCOPE", "METRIC_REFERENCE", "NON_ENTITY_TEXT",
+]
+
+
+class ResultSetState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_ids: list[str] = Field(default_factory=list, max_length=100)
+    source_task_type: str
+    filter_spec: dict[str, Any] = Field(default_factory=dict)
+    sort_spec: list[str] = Field(default_factory=list, max_length=10)
+    ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    source_task_revision: int = Field(default=0, ge=0)
+    created_turn: int = Field(ge=1)
+
+
+class TaskEntitySlot(BaseModel):
+    """Session-local entity resolution outcome retained for safe recovery."""
+
+    model_config = ConfigDict(extra="forbid")
+    mention: str = Field(min_length=1, max_length=300)
+    status: Literal[
+        "EXACT_MATCH", "NORMALIZED_MATCH", "UNIQUE_ALIAS_MATCH",
+        "FUZZY_UNIQUE_MATCH", "AMBIGUOUS", "NOT_FOUND", "LOW_CONFIDENCE",
+    ]
+    product_id: str | None = None
+    display_name: str | None = None
+
+
+class ComparisonState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_ids: list[str] = Field(default_factory=list, max_length=10)
+    dimensions: list[str] = Field(default_factory=list, max_length=10)
+    revision: int = Field(default=1, ge=1)
+    created_turn: int = Field(default=1, ge=1)
+    source_task: str = "product_comparison"
+
+
+class RecommendationState(BaseModel):
+    """Backend-owned recommendation result retained for follow-up references."""
+
+    model_config = ConfigDict(extra="forbid")
+    selected_product_id: str
+    selected_product_display_name: str = ""
+    candidate_product_ids: list[str] = Field(default_factory=list, max_length=100)
+    ordered_candidates: list[str] = Field(default_factory=list, max_length=100)
+    recommendation_score: float | None = None
+    decision_status: str = "REVIEW_REQUIRED"
+    gate_status: str = "REVIEW_REQUIRED"
+    requested_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    evidence_fields: list[str] = Field(default_factory=list, max_length=50)
+    freshness_summary: dict[str, int] = Field(default_factory=dict)
+    readiness_summary: dict[str, Any] = Field(default_factory=dict)
+    requires_human_review: bool = True
+    source_task_revision: int = Field(default=0, ge=0)
+
+
+class TaskState(BaseModel):
+    """Session-scoped, backend-controlled task continuity; never LLM facts."""
+
+    model_config = ConfigDict(extra="forbid")
+    schema_version: str = "task-state-v1"
+    task_id: str = ""
+    revision: int = Field(default=0, ge=0)
+    task_type: str = ""
+    operation: TaskOperation = "CREATE"
+    status: Literal["EMPTY", "ACTIVE", "COMPLETED", "NEEDS_CLARIFICATION"] = "EMPTY"
+    active_entities: list[str] = Field(default_factory=list, max_length=10)
+    pending_entities: list[TaskEntitySlot] = Field(default_factory=list, max_length=10)
+    active_result_set: ResultSetState | None = None
+    active_comparison_set: ComparisonState | None = None
+    active_recommendation: RecommendationState | None = None
+    filter_spec: dict[str, Any] = Field(default_factory=dict)
+    sort_spec: list[str] = Field(default_factory=list, max_length=10)
+    ranking_spec: list[str] = Field(default_factory=list, max_length=10)
+    requested_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    source_scope: str = "enterprise_catalog"
+    last_successful_action: str | None = None
+    last_execution_product_ids: list[str] = Field(default_factory=list, max_length=100)
+    pending_clarification: str | None = None
+
+
+class SemanticTaskContextPacket(BaseModel):
+    """Anonymous task metadata exposed to semantic providers; never business facts."""
+
+    model_config = ConfigDict(extra="forbid")
+    active_task_type: str = ""
+    active_operation: TaskOperation = "CREATE"
+    active_entities_display_names: list[str] = Field(default_factory=list, max_length=10)
+    result_set_count: int = Field(default=0, ge=0, le=100)
+    comparison_count: int = Field(default=0, ge=0, le=10)
+    active_filter_spec: dict[str, Any] = Field(default_factory=dict)
+    active_sort_spec: list[str] = Field(default_factory=list, max_length=10)
+    active_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    ordinal_capacity: int = Field(default=0, ge=0, le=100)
+    has_pending_unresolved_entity: bool = False
+    pending_entity_statuses: list[str] = Field(default_factory=list, max_length=10)
+    has_active_recommendation: bool = False
+    recommendation_candidate_count: int = Field(default=0, ge=0, le=100)
+    has_active_scenario: bool = False
+    last_successful_action: str | None = None
+
 
 class ContextTarget(BaseModel):
     """A verified product identity that can be referenced by a later turn."""
@@ -74,6 +186,7 @@ class ContextSnapshot(BaseModel):
     last_preference_order: list[str] = Field(default_factory=list, max_length=10)
     last_negative_scope: list[str] = Field(default_factory=list, max_length=10)
     context_warnings: list[str] = Field(default_factory=list, max_length=10)
+    task_state: TaskState = Field(default_factory=TaskState)
 
 
 class ReferenceResolutionResult(BaseModel):
@@ -98,6 +211,7 @@ class QueryUnderstanding(BaseModel):
     model_config = ConfigDict(extra="forbid")
     intent: IntentName
     task_type: str = ""
+    operation: TaskOperation = "CREATE"
     question_type: str = ""
     entity_mentions: list[str] = Field(
         default_factory=list,
@@ -107,6 +221,7 @@ class QueryUnderstanding(BaseModel):
             "never pronouns, ordinal references, metrics, dimensions, or references to a previous result."
         ),
     )
+    entity_roles: list[EntityRole] = Field(default_factory=list, max_length=10)
     references: list[str] = Field(default_factory=list, max_length=10)
     reference_slots: list[ContextSource] = Field(default_factory=list, max_length=10)
     reference_field: str | None = None
@@ -124,6 +239,10 @@ class QueryUnderstanding(BaseModel):
         description=f"Business analysis areas; canonical values: {', '.join(CANONICAL_DIMENSIONS)}",
     )
     constraints: dict[str, Any] = Field(default_factory=dict)
+    filter_updates: dict[str, Any] = Field(default_factory=dict)
+    sort_updates: list[str] = Field(default_factory=list, max_length=10)
+    result_set_reference: bool = False
+    ordinal_reference: int | None = Field(default=None, ge=1, le=100)
     negative_scope: list[str] = Field(default_factory=list, max_length=20)
     preference_order: list[str] = Field(default_factory=list, max_length=10)
     comparison_requested: bool = False
@@ -133,6 +252,7 @@ class QueryUnderstanding(BaseModel):
     calculation_requested: bool = False
     policy_requested: bool = False
     requires_context: bool = False
+    requires_task_state: bool = False
     requires_tools: bool = False
     requires_reasoning: bool = False
     clarification_required: bool = False
@@ -205,6 +325,7 @@ class SemanticContextPacket(BaseModel):
     verified_product_names: dict[str, str] = Field(default_factory=dict)
     allowed_tools: list[str] = Field(default_factory=list, max_length=20)
     max_tool_calls: int = Field(default=0, ge=0, le=20)
+    task_context: SemanticTaskContextPacket = Field(default_factory=SemanticTaskContextPacket)
     rule_understanding: QueryUnderstanding
 
 
@@ -414,6 +535,7 @@ class AgentRunResult(BaseModel):
     decision_status: str = "NOT_APPLICABLE"
     decision_summary: dict[str, Any] = Field(default_factory=dict)
     data_sufficiency: DataSufficiencyResult | None = None
+    task_state: TaskState = Field(default_factory=TaskState)
 
     # Compatibility fields retained for the existing API and UI during V2 migration.
     mode: str

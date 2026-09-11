@@ -13,6 +13,7 @@ from app.agent.context import build_context_snapshot, resolve_context_reference
 from app.agent.query_understanding import arbitrate_entity_mentions, build_semantic_context_packet, understand_query, semantic_fallback, semantic_policy
 from app.agent.intent_engine import ParsedIntent, parse_intent
 from app.agent.runtime import AgentRunState
+from app.agent.task_state import evolve_task_state, task_mutation_intent
 from app.agent.tool_registry import TOOL_REGISTRY
 from app.db.models import AgentRun, ConversationMessage, ConversationSession, Memory, Product, uid
 from app.repositories.products import ProductRepository, product_view
@@ -93,6 +94,8 @@ async def filter_products(repo: ProductRepository, role: str, **filters: Any) ->
             continue
         if criteria.get("max_market_saturation") is not None and float(view.get("market_saturation") or 0) > float(criteria["max_market_saturation"]):
             continue
+        if criteria.get("max_competition_score") is not None and float(analysis.get("competition_score") or 0) >= float(criteria["max_competition_score"]):
+            continue
         if criteria.get("brand") and str(criteria["brand"]).casefold() not in str(view.get("brand") or "").casefold():
             continue
         if criteria.get("category") and str(criteria["category"]).casefold() not in str(view.get("category_path") or "").casefold():
@@ -100,6 +103,8 @@ async def filter_products(repo: ProductRepository, role: str, **filters: Any) ->
         if criteria.get("lifecycle_status") and view.get("lifecycle_status") != criteria["lifecycle_status"]:
             continue
         if criteria.get("risk_level") and str(analysis.get("risk_level") or "").casefold() != criteria["risk_level"]:
+            continue
+        if str(analysis.get("risk_level") or "").casefold() in set(criteria.get("excluded_risk_levels") or []):
             continue
         if criteria.get("compliance_status"):
             compliance = str(view.get("compliance_status") or "").casefold()
@@ -124,6 +129,8 @@ async def filter_products(repo: ProductRepository, role: str, **filters: Any) ->
             "completeness": float((analysis.get("evidence_completeness") or {}).get("percent") or 0),
             "updated_at": item.get("updated_at") or datetime.min,
             "margin_rate": float(item.get("current_margin_rate") or analysis.get("net_margin") or 0),
+            "net_profit": float(analysis.get("net_profit") or 0),
+            "risk": {"low": 0, "medium": 1, "high": 2}.get(str(analysis.get("risk_level") or "").casefold(), 3),
         }
         return mapping.get(str(criteria.get("sort_by") or "recommendation_score"), mapping["recommendation_score"])
 
@@ -614,6 +621,22 @@ async def agent_v1_ask(
         selection_bound_session_id=selection_bound_session_id,
     )
     parsed, understanding = (parsed_override, understanding_override) if understanding_override is not None else understand_query(query, all_products, selected_product_ids, context_snapshot)
+    task_mutation = task_mutation_intent(
+        query, context_snapshot.task_state, selected_product_ids or (), understanding.entity_mentions,
+    )
+    if task_mutation:
+        parsed, mutation = task_mutation
+        understanding = understanding.model_copy(update={
+            "intent": parsed.name, "task_type": context_snapshot.task_state.task_type or parsed.name,
+            "operation": mutation["operation"], "filter_updates": mutation["filter_updates"],
+            "requires_task_state": True, "requires_context": mutation.get("requires_context", False),
+            "requested_dimensions": list(parsed.policy.requested_dimensions),
+            "planned_tools": list(parsed.policy.allowed_tools),
+            "metric": mutation.get("metric", understanding.metric),
+            "metrics": [mutation["metric"]] if mutation.get("metric") else understanding.metrics,
+            "sort_updates": mutation.get("sort_updates", understanding.sort_updates),
+            "route": "DETERMINISTIC_FAST_PATH" if mutation.get("deterministic") else "SEMANTIC_PLANNER",
+        })
     if understanding.route == "SEMANTIC_PLANNER" and not understanding.planner_calls:
         if semantic_planner is not None:
             packet = build_semantic_context_packet(query, understanding, context_snapshot, all_products)
@@ -622,6 +645,24 @@ async def agent_v1_ask(
             parsed, understanding = await semantic_fallback(query, understanding, None, selected_product_ids or ())
         else:
             understanding = understanding.model_copy(update={"route": "DETERMINISTIC_FAST_PATH"})
+    if task_mutation:
+        # Provider interpretation is advisory; the backend applies the validated
+        # mutation to the session-scoped normalized task contract.
+        parsed, mutation = task_mutation_intent(
+            query, context_snapshot.task_state, selected_product_ids or (), understanding.entity_mentions,
+        ) or task_mutation
+        understanding = understanding.model_copy(update={
+            "intent": parsed.name, "task_type": context_snapshot.task_state.task_type or parsed.name,
+            "operation": mutation["operation"], "filter_updates": mutation["filter_updates"],
+            "requires_task_state": True, "requires_context": mutation.get("requires_context", False),
+            "requested_dimensions": list(parsed.policy.requested_dimensions),
+            "planned_tools": list(parsed.policy.allowed_tools),
+            "metric": mutation.get("metric", understanding.metric),
+            "metrics": [mutation["metric"]] if mutation.get("metric") else understanding.metrics,
+            "sort_updates": mutation.get("sort_updates", understanding.sort_updates),
+            "route": "DETERMINISTIC_FAST_PATH" if mutation.get("deterministic") else understanding.route,
+            "failure_code": None if mutation.get("deterministic") else understanding.failure_code,
+        })
     if understanding.references and not understanding.entity_mentions:
         reference_field = "current_price" if "这个价格" in query else context_snapshot.last_fact_dimension
         understanding = understanding.model_copy(update={"reference_field": reference_field})
@@ -703,6 +744,38 @@ async def agent_v1_ask(
     )
     if entity_blocked:
         event(trace, "entity_resolution_blocked", "entity_resolver", "存在未解析实体，本次不执行商品工具或部分比较。")
+    elif understanding.operation in {"ARGMAX", "ARGMIN"} and context_snapshot.task_state.active_result_set:
+        ids = context_snapshot.task_state.active_result_set.product_ids
+        result = await execute(
+            "compare_products", {"product_ids": ids}, lambda: compare_products(repo, ids, role),
+            "已从当前结果集读取后端指标并确定极值商品。",
+        )
+        candidates = result.get("data", []) if result.get("success") else []
+        metric = understanding.metric or "recommendation_score"
+
+        def extreme_value(view: dict[str, Any]):
+            analysis = view.get("analysis") or {}
+            return {
+                "net_profit": float(analysis.get("net_profit") or 0),
+                "net_margin": float(analysis.get("net_margin") or view.get("current_margin_rate") or 0),
+                "roi": float(analysis.get("roi") or 0),
+                "recommendation_score": float(analysis.get("recommendation_score") or 0),
+                "risk_level": {"low": 0, "medium": 1, "high": 2}.get(str(analysis.get("risk_level") or "").casefold(), 3),
+            }.get(metric, float(analysis.get("recommendation_score") or 0))
+
+        if candidates:
+            chooser = min if understanding.operation == "ARGMIN" else max
+            views = [chooser(candidates, key=lambda item: (extreme_value(item), str(item.get("id") or "")))]
+            matched_count_override = 1
+            total_count_override = len(candidates)
+            displayed_count_override = 1
+    elif understanding.operation == "EXPLAIN_RANKING" and context_snapshot.task_state.active_result_set:
+        ids = context_snapshot.task_state.active_result_set.product_ids[:2]
+        result = await execute(
+            "compare_products", {"product_ids": ids}, lambda: compare_products(repo, ids, role),
+            "已读取当前排名前两项的后端指标。",
+        )
+        views = result.get("data", []) if result.get("success") else []
     elif parsed.name == "company_product_count":
         result = await execute("count_products", {}, lambda: count_products(repo, role), "已统计当前企业商品主档总数。")
         matched_count_override = int((result.get("data") or {}).get("count") or 0)
@@ -714,14 +787,34 @@ async def agent_v1_ask(
             if detail.get("success"):
                 views.append(detail["data"])
     elif parsed.name == "product_filter":
-        args = {**parsed.filters, "limit": parsed.limit}
-        result = await execute("filter_products", args, lambda: filter_products(repo, role, **args), "已按用户明确条件完成确定性筛选。")
-        views = result.get("data", []) if result.get("success") else []
-        if result.get("success"):
-            filter_criteria = result.get("criteria") or {}
-            matched_count_override = int(result.get("matched_count", len(views)))
-            total_count_override = int(result.get("total_count", matched_count_override))
-            displayed_count_override = int(result.get("displayed_count", len(views)))
+        if understanding.operation == "INSPECT":
+            filter_criteria = dict(context_snapshot.task_state.filter_spec)
+            matched_count_override = len(context_snapshot.task_state.last_execution_product_ids)
+            total_count_override = matched_count_override
+            displayed_count_override = 0
+        else:
+            args = {**parsed.filters, "limit": parsed.limit}
+            result = await execute("filter_products", args, lambda: filter_products(repo, role, **args), "已按用户明确条件完成确定性筛选。")
+            views = result.get("data", []) if result.get("success") else []
+            if result.get("success"):
+                filter_criteria = result.get("criteria") or {}
+                matched_count_override = int(result.get("matched_count", len(views)))
+                total_count_override = int(result.get("total_count", matched_count_override))
+                displayed_count_override = int(result.get("displayed_count", len(views)))
+                ranking = understanding.sort_updates
+                if ranking:
+                    def ranking_value(view: dict[str, Any], field: str):
+                        analysis = view.get("analysis") or {}
+                        return {
+                            "risk": {"low": 0, "medium": 1, "high": 2}.get(str(analysis.get("risk_level") or "").casefold(), 3),
+                            "net_profit": float(analysis.get("net_profit") or 0),
+                            "margin_rate": float(analysis.get("net_margin") or view.get("current_margin_rate") or 0),
+                            "recommendation_score": float(analysis.get("recommendation_score") or 0),
+                        }.get(field, 0)
+
+                    for item in reversed(ranking):
+                        field, _, direction = item.partition(":")
+                        views.sort(key=lambda view, field=field: ranking_value(view, field), reverse=direction != "asc")
     elif parsed.name == "selection_recommendation":
         if targets:
             ids = [item.id for item in targets[:10]]
@@ -779,14 +872,20 @@ async def agent_v1_ask(
             detail = await execute("get_product", {"product_id": target.id}, lambda: get_product(repo, target.id, role), f"已读取 {target.title}。")
             if detail.get("success"):
                 views = [detail["data"]]
-            if "profit" in parsed.policy.requested_dimensions:
+            if {"profit", "roi", "calculation"} & set(parsed.policy.requested_dimensions):
                 profit_result = await execute("calculate_profit", {"product_id": target.id}, lambda: calculate_profit(repo, target.id, role), f"已核算 {target.title} 的利润与 ROI。")
                 if views:
                     merge_profit_calculation(views[0], profit_result)
 
     products = [_agent_product(view) for view in views]
     response_type = _response_type(parsed, resolution, products, data_sufficiency)
-    if context_resolution.requires_clarification and parsed.policy.selection_mode != "ignore":
+    if understanding.operation in {"ARGMAX", "ARGMIN"} and products:
+        response_type = "product_detail"
+    elif understanding.operation == "EXPLAIN_RANKING" and len(products) == 2:
+        response_type = "comparison_result"
+    # Portfolio discovery does not require a pre-existing product referent.
+    # Only entity-scoped tasks may be blocked by missing entity context.
+    if entity_scoped and context_resolution.requires_clarification:
         response_type = "clarification"
     display_scope = _display_scope(response_type, parsed.policy.requested_dimensions)
     missing_data: list[dict[str, Any]] = []
@@ -894,6 +993,45 @@ async def agent_v1_ask(
         answer = "不能直接上架。合规未通过属于硬性阻断（BLOCKED），必须补齐材料并由人工重新审核通过后，才可进入上架流程。"
     elif parsed.name == "recommendation_policy":
         answer = "不是。相对排名第一只表示候选集中表现最好，不代表达到正式推荐标准。评分、相对排名、正式推荐状态和最终上架决策彼此独立；合规失败、证据不足或高风险均不能被‘必须推荐一个’绕过。"
+    elif understanding.operation in {"ARGMAX", "ARGMIN"} and products:
+        product = products[0]
+        metric = understanding.metric or "recommendation_score"
+        label, value = {
+            "net_profit": ("单件净利润", f"{product['net_profit']:.2f} {product['currency']}"),
+            "net_margin": ("净利率", f"{product['current_margin_rate']:.1%}"),
+            "roi": ("ROI", f"{product['roi']:.1%}"),
+            "risk_level": ("风险等级", product["risk_level"]),
+            "recommendation_score": ("推荐度", f"{product['score']:.1f}"),
+        }.get(metric, ("推荐度", f"{product['score']:.1f}"))
+        extreme = "最低" if understanding.operation == "ARGMIN" else "最高"
+        answer = f"在当前结果集的 {total_count_override or 0} 个商品中，{product['title']} 的{label}{extreme}，当前值为 {value}。结论来自后端对当前 ResultSet 的确定性计算。"
+    elif understanding.operation == "EXPLAIN_RANKING" and len(products) == 2:
+        first, second = products
+        ranking = context_snapshot.task_state.ranking_spec or [
+            f"{context_snapshot.task_state.active_result_set.sort_spec[0]}:{context_snapshot.task_state.active_result_set.sort_spec[1]}"
+            if context_snapshot.task_state.active_result_set and len(context_snapshot.task_state.active_result_set.sort_spec) >= 2
+            else "recommendation_score:desc"
+        ]
+
+        def ranking_fact(product: dict[str, Any], spec: str) -> str:
+            field = spec.split(":", 1)[0]
+            return {
+                "risk": f"风险 {product['risk_level']}",
+                "net_profit": f"净利润 {product['net_profit']:.2f} {product['currency']}",
+                "margin_rate": f"净利率 {product['current_margin_rate']:.1%}",
+                "recommendation_score": f"推荐度 {product['score']:.1f}",
+            }.get(field, f"推荐度 {product['score']:.1f}")
+
+        order_label = "，其次".join(
+            {"risk": "风险由低到高", "net_profit": "净利润由高到低", "margin_rate": "净利率由高到低", "recommendation_score": "推荐度由高到低"}.get(item.split(":", 1)[0], item)
+            for item in ranking
+        )
+        first_values = "；".join(ranking_fact(first, item) for item in ranking)
+        second_values = "；".join(ranking_fact(second, item) for item in ranking)
+        answer = f"当前排序规则是{order_label}。第一名 {first['title']}：{first_values}；第二名 {second['title']}：{second_values}。因此前者按当前后端排序键排在后者之前。"
+    elif parsed.name == "product_filter" and understanding.operation == "INSPECT":
+        visible = ", ".join(f"{key}={value}" for key, value in filter_criteria.items() if value not in (None, "", [], "all")) or "无显式条件"
+        answer = f"当前筛选条件：{visible}。条件来自本会话的规范化 TaskState。"
     elif parsed.name == "product_filter":
         answer = f"符合全部条件的商品共有 {matched_count_override or 0} 个，清单与数量来自同一次后端 AND 筛选结果。"
     elif parsed.name == "selection_recommendation":
@@ -981,6 +1119,47 @@ async def agent_v1_ask(
     scoped_actions = _unique(actions)
     if response_type == "decision_report" and not scoped_actions:
         scoped_actions = ["查看商品证据后，由企业审核人决定是否进入下一阶段。"]
+    recommendation_state = None
+    if parsed.name == "selection_recommendation" and products and response_type == "decision_report":
+        evidence_fields = list(dict.fromkeys(
+            field.get("field")
+            for item in evidence
+            for field in item.get("fields", [])
+            if field.get("field")
+        ))
+        freshness_summary: dict[str, int] = {}
+        for item in evidence:
+            for field in item.get("fields", []):
+                status = str((field.get("freshness") or {}).get("status") or "UNKNOWN")
+                freshness_summary[status] = freshness_summary.get(status, 0) + 1
+        selected = products[0]
+        recommendation_state = {
+            "selected_product_id": selected["id"],
+            "selected_product_display_name": selected["title"],
+            "candidate_product_ids": [item["id"] for item in products],
+            "ordered_candidates": [item["id"] for item in products],
+            "recommendation_score": selected["score"],
+            "decision_status": selected["decision_status"],
+            "gate_status": selected["decision_status"],
+            "requested_dimensions": list(parsed.policy.requested_dimensions),
+            "evidence_fields": evidence_fields,
+            "freshness_summary": freshness_summary,
+            "readiness_summary": {
+                "missing_data_count": len(missing_data),
+                "formal_recommendation": decision_summary.get("formal_recommendation"),
+            },
+            "requires_human_review": human_review_required,
+            "source_task_revision": context_snapshot.task_state.revision + 1,
+        }
+    next_task_state = evolve_task_state(
+        context_snapshot.task_state, intent=parsed.name, operation=understanding.operation,
+        turn_index=context_snapshot.turn_index, product_ids=[item["id"] for item in products],
+        filters=filter_criteria or parsed.filters, dimensions=list(parsed.policy.requested_dimensions),
+        task_completed=response_type not in {"clarification", "not_found", "error"},
+        resolved_product_ids=explicit_ids, requested_entities=resolution.requested_entities,
+        ranking_spec=understanding.sort_updates,
+        recommendation=recommendation_state,
+    )
     payload = {
         "run_id": run_id, "session_id": session_id, "response_type": response_type, "answer": answer,
         "understanding": understanding.model_dump(mode="json"),
@@ -1002,6 +1181,7 @@ async def agent_v1_ask(
         "tool_call_count": state.actual_tool_calls,
         "duplicate_tool_execution": state.duplicate_tool_execution, "requested_dimensions": list(parsed.policy.requested_dimensions), "display_scope": display_scope, "selection_source": target_source, "context_source": context_source,
         "decision_status": decision_status, "decision_summary": decision_summary, "data_sufficiency": data_sufficiency,
+        "task_state": next_task_state.model_dump(mode="json"),
         "mode": "provider_semantic_handoff" if response_mode == "model_success" else "zhipu_controlled_function_calling" if response_mode == "glm_success" else "agent_v3_deterministic_fallback" if response_mode == "deterministic_fallback" else "agent_v3_rule_engine",
         "conclusion": answer, "trace": trace, "simulation": simulation, "data_completeness": (views[0].get("analysis") or {}).get("evidence_completeness") if views else None,
         "provider_notice": provider_notice, "model_summary": model_summary,
@@ -1048,6 +1228,8 @@ async def agent_v1_ask(
     last_resolved_ids = list(previous_state.get("last_resolved_product_ids") or conversation.last_product_ids or [])
     if successful_context and targets:
         last_resolved_ids = [item.id for item in targets[:10]]
+    elif successful_context and parsed.name == "selection_recommendation" and products:
+        last_resolved_ids = [products[0]["id"]]
     comparison_ids = list(previous_state.get("last_comparison_product_ids") or [])
     comparison_order = list(previous_state.get("last_comparison_order") or [])
     if successful_context and parsed.name in {"profit_comparison", "product_comparison"} and len(targets) >= 2:
@@ -1075,6 +1257,7 @@ async def agent_v1_ask(
         "last_fact_dimension": current_dimension,
         "last_preference_order": understanding.preference_order or previous_state.get("last_preference_order") or [],
         "last_negative_scope": understanding.negative_scope or previous_state.get("last_negative_scope") or [],
+        "task_state": validated["task_state"],
     }
     answer = validated["answer"]
     if not conversation.goal_summary:

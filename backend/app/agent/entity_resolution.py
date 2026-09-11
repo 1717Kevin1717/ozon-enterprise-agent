@@ -25,6 +25,19 @@ _FIELD_SUFFIX = re.compile(
 )
 _REFERENCE = re.compile(r"(?:(?:和|与)?(?:刚才|当前|已选|那个|这个|那两个|这两个|这几个|这些|我选的这些|这\d+个|这四个|它|对比中心|第[一二两三四五六七八九十\d]+个|前一个|后一个|那利润|现在比较)(?:那|这|的)?(?:几个|两个)?(?:商品|产品|候选)?(?:相比|一下|呢)?)\Z")
 _GENERIC = {"商品", "产品", "用品", "电子产品", "桌面", "收纳", "东西"}
+_ACTION_SUFFIX = re.compile(
+    r"(?:详细|全面|综合)?(?:对比|比较|分析|评估|查看|看看|看一下)(?:一下|看看)?$|"
+    r"(?:哪个|哪一个|谁)(?:更|最)?(?:值得做|赚钱|好|合适).*$|"
+    r"(?:哪个|哪一个|谁)(?:更|最)?$",
+    re.I,
+)
+_TASK_LEVEL_QUERY = re.compile(
+    r"^(?:请|帮我|帮忙|给我)?\s*(?:找|筛选|选出|推荐|保留|返回).*(?:商品|候选|利润率|净利率|竞争|风险|合规|评分|排序)|"
+    r"^(?:请|帮我|帮忙|给我)?\s*(?:从\s*)?(?:公司|企业)?商品库(?:中|里)?\s*(?:找|筛选|选出|推荐|返回).*(?:商品|候选|利润率|净利率|竞争|风险|合规|评分|排序)|"
+    r"^(?:把|将)?\s*(?:结果|筛选条件|当前条件|刚才的任务).*(?:排序|重排|改|调整|取消|移除|执行|查看)|"
+    r"^(?:如果|若)?\s*(?:关键)?(?:资料|证据|字段).*(?:过期|时效|新鲜).*(?:推荐|维持)",
+    re.I,
+)
 
 
 def query_mentions(query: str, protected_names: tuple[str, ...] = ()) -> list[str]:
@@ -35,11 +48,22 @@ def query_mentions(query: str, protected_names: tuple[str, ...] = ()) -> list[st
             marker = f"__ENTITY_{len(protected)}__"
             text = text.replace(name, marker)
             protected[marker] = name
+    if not protected and _TASK_LEVEL_QUERY.search(text):
+        return []
+    text = re.sub(
+        r"^(?:请|帮我|帮忙|给我)?\s*(?:从\s*)?(?:公司|企业)?商品库(?:中|里)?\s*(?:找|筛选|选出|查询|推荐|返回)?\s*",
+        "",
+        text,
+        flags=re.I,
+    )
     # Percent values in metric questions are not model/pack-size digits. Names
     # already protected above retain legitimate 65W / 4件装 specifications.
     text = re.sub(r"(?:的)?\s*[+-]?\d+(?:\.\d+)?\s*[%％]", "", text)
     text = re.sub(r"^(?:先别看|不要看|不看|忽略|排除)[^,，;；]+[,，;；]\s*", "", text)
-    text = re.sub(r"^(?:(?:请问|请|帮我|帮忙|查看|查询|分析一下|分析|比较|对比|如果|假如|把|将|从|换成|改成)\s*)+", "", text)
+    text = re.sub(
+        r"^(?:(?:请问|请|帮我|帮忙|查看|查询|(?:详细|全面|综合)?(?:分析一下|分析|比较|对比)|如果|假如|把|将|从|换成|改成)\s*)+",
+        "", text,
+    )
     text = _FIELD_SUFFIX.split(text, maxsplit=1)[0]
     text = re.split(r"[,，;；]", text, maxsplit=1)[0].strip(" 的：:。？！?!\"“”")
     text = re.sub(r"(?:这|那)(?:个|条|项)$", "", text).rstrip(" 的")
@@ -51,8 +75,9 @@ def query_mentions(query: str, protected_names: tuple[str, ...] = ()) -> list[st
         part = part.strip(" 的呢：:。？！?!\"“”")
         for marker, name in protected.items():
             part = part.replace(marker, name)
+        part = _ACTION_SUFFIX.sub("", part).rstrip(" 的呢：:。？！?!\"“”")
         if part and not _REFERENCE.fullmatch(part) and not re.search(
-            r"^(?:不是|我主要看|我想看|这几个里面谁|这些商品(?:里)?谁|现在比较|用对比中心|排第[一二两三四五六七八九十\d]+个|如果只能留一个|一个商品|某个商品|先别看)", part
+            r"^(?:不是|我主要看|我想看|这几个里面(?:谁)?|这些商品(?:里)?(?:谁)?|现在比较|用对比中心|排第[一二两三四五六七八九十\d]+个|如果只能留一个|一个商品|某个商品|先别看)", part
         ):
             restored.append(part)
     return list(dict.fromkeys(restored))

@@ -32,7 +32,15 @@ def test_business_constraints_are_parsed_as_backend_filters():
     parsed = parse_intent("找利润率30%以上，竞争低于40的商品")
     assert parsed.name == "product_filter"
     assert parsed.filters["min_margin_rate"] == 0.30
-    assert parsed.filters["max_market_saturation"] == 40
+    assert parsed.filters["max_competition_score"] == 40
+
+
+def test_colloquial_profit_percentage_is_a_margin_constraint():
+    parsed = parse_intent("筛选利润30%以上且竞争低于40的候选")
+
+    assert parsed.name == "product_filter"
+    assert parsed.filters["min_margin_rate"] == 0.30
+    assert parsed.filters["max_competition_score"] == 40
 
 
 def test_score_threshold_answer_returns_exact_count_and_sorted_products(monkeypatch):

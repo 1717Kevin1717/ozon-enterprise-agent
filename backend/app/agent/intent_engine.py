@@ -79,14 +79,24 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
     profit_only = comparison_words and not full_comparison and any(token in positive_scope for token in ("利润", "roi")) and not any(token in positive_scope for token in ("需求", "竞争", "合规", "风险", "趋势"))
     count_question = bool(re.search(r"(?:公司|企业|商品库)?.*?(?:一共|总共|共有|总数).*?(?:多少|几).*?(?:商品|候选)|(?:公司|企业).*?(?:多少|几).*?(?:商品|候选)", normalized))
     compliance_policy = "合规" in lowered and any(token in lowered for token in ("能上架", "可以上架", "能不能上架", "没通过", "未通过", "失败", "先卖", "补审核"))
-    price_lookup = any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "多少钱", "现在售价")) and not any(token in lowered for token in ("调整", "改为", "模拟"))
+    price_lookup = (
+        any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "多少钱", "现在售价"))
+        or bool(re.search(r"(?:价格|售价)(?:是)?(?:多少|如何|怎么样|呢|[？?])", lowered))
+    ) and not any(token in lowered for token in ("调整", "改为", "模拟"))
     risk_fact = bool(re.search(r"风险(?:等级|级别).*(?:多少|什么|如何)", lowered)) and not comparison_words and not any(token in lowered for token in ("上架", "推荐", "决策", "筛选"))
     snapshot_question = any(token in lowered for token in ("销量快照", "上涨还是下降", "未来销量趋势", "销量趋势"))
     score_threshold = _number_after([r"(?:分数|评分|推荐度).*?(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上|达到|大于|>=)", r"(\d+(?:\.\d+)?)\s*(?:分)?\s*(?:以上|及以上)"], normalized)
     proposed_price = _number_after([r"(?:售价|价格|定价).*?(?:到|为|=)\s*(\d+(?:\.\d+)?)", r"(\d+(?:\.\d+)?)\s*(?:rub|卢布)"], normalized)
     top_limit = _number_after([r"(?:最值得|优先|前|top|推荐)\s*(\d+)\s*(?:个|件|款)?", r"选出.*?(\d+)\s*(?:个|件|款)"], normalized)
+    filter_limit = _number_after([r"(?:找|给|返回|筛出|保留)\s*(\d+)\s*(?:个|件|款)"], normalized)
     limit = max(1, min(20, int(top_limit or 10)))
-    min_margin_percent = _number_after([r"(?:净?利润(?:率)?|毛利率).*?(\d+(?:\.\d+)?)\s*%\s*(?:以上|及以上|大于|≥|>=)?", r"(?:净?利润(?:率)?|毛利率).*?(?:达到|大于|≥|>=)\s*(\d+(?:\.\d+)?)"], normalized)
+    # A percentage after the colloquial "利润" is a margin constraint, while
+    # absolute-profit questions remain handled by the normal profit intent.
+    margin_term = r"(?:净利率|净利润率|利润率|毛利率|净利润|利润)"
+    min_margin_percent = _number_after([
+        margin_term + r".*?(\d+(?:\.\d+)?)\s*%\s*(?:以上|及以上|大于|≥|>=)?",
+        margin_term + r".*?(?:达到|大于|≥|>=)\s*(\d+(?:\.\d+)?)",
+    ], normalized)
     max_saturation = _number_after([r"(?:竞争|饱和度).*?(?:低于|小于|不超过|≤|<=)\s*(\d+(?:\.\d+)?)", r"(?:竞争|饱和度).*?(\d+(?:\.\d+)?)\s*(?:以下|以内)"], normalized)
     category = _category_filter(normalized)
     risk_level = (
@@ -130,7 +140,7 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
         raw_filters: dict[str, Any] = {"sort_by": "margin_rate" if min_margin_percent is not None else "recommendation_score", "sort_direction": "desc"}
         if score_threshold is not None: raw_filters["min_score"] = score_threshold
         if min_margin_percent is not None: raw_filters["min_margin_rate"] = min_margin_percent / 100
-        if max_saturation is not None: raw_filters["max_market_saturation"] = max_saturation
+        if max_saturation is not None: raw_filters["max_competition_score"] = max_saturation
         if risk_level: raw_filters["risk_level"] = risk_level
         if compliance_status: raw_filters["compliance_status"] = compliance_status
         if category: raw_filters["category"] = category
@@ -141,7 +151,7 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
         if compliance_status: dimensions.append("compliance")
         if max_saturation is not None: dimensions.append("competition")
         if score_threshold is not None: dimensions.append("recommendation_score")
-        return ParsedIntent("product_filter", filters=filters, limit=100, plan=({"tool": "filter_products", "purpose": "按用户明确条件确定性筛选"},), policy=_policy(("filter_products",), 1, tuple(dimensions), fast=True))
+        return ParsedIntent("product_filter", filters=filters, limit=max(1, min(100, int(filter_limit or 100))), plan=({"tool": "filter_products", "purpose": "按用户明确条件确定性筛选"},), policy=_policy(("filter_products",), 1, tuple(dimensions), fast=True))
     if top_limit is not None or any(token in lowered for token in ("最值得上架", "最值得测试", "优先测试", "高潜", "推荐几个", "好的商品", "推荐商品")):
         filters = {"sort_by": "recommendation_score", "sort_direction": "desc"}
         if category: filters["category"] = category

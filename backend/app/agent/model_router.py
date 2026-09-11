@@ -144,6 +144,9 @@ def build_model_router() -> ModelRouter:
 
 def semantic_context_slots(packet: dict) -> dict:
     """Remove tenant/session/product identities before any external semantic call."""
+    task = dict(packet.get("task_context") or {})
+    entity_count = len(task.pop("active_entities_display_names", []) or [])
+    task["active_entity_slots"] = [f"T{index + 1}" for index in range(entity_count)]
     return {
         "available_sources": [
             source for source, key in (
@@ -162,6 +165,7 @@ def semantic_context_slots(packet: dict) -> dict:
         "comparison_slot_count": len(packet.get("last_comparison_order") or []),
         "comparison_slots": [f"P{index + 1}" for index, _ in enumerate(packet.get("last_comparison_order") or [])],
         "ordinal_slots": [f"P{index + 1}" for index, _ in enumerate(packet.get("last_comparison_order") or [])],
+        "task_context": task,
         "allowed_tools": packet.get("allowed_tools") or [],
     }
 
