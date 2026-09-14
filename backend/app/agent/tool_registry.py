@@ -59,6 +59,17 @@ class CompareProductsInput(ToolInput):
     product_ids: list[str] = Field(min_length=2, max_length=10)
 
 
+class AnalyzeCollectionInput(ToolInput):
+    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
+    product_ids: list[str] = Field(default_factory=list, max_length=100)
+    top_k: int = Field(default=3, ge=1, le=20)
+    ranking_dimensions: list[Literal[
+        "recommendation", "profit", "roi", "risk", "demand", "competition", "compliance"
+    ]] = Field(default_factory=lambda: ["recommendation"], max_length=10)
+    require_gate_pass: bool = True
+    exclude_insufficient_data: bool = False
+
+
 class SimulatePriceInput(ProductIdInput):
     proposed_price: float = Field(gt=0, le=10_000_000)
 
@@ -93,6 +104,13 @@ class FilterProductsOutput(ListToolOutput):
 
 class CompareProductsOutput(ListToolOutput):
     warning: str = ""
+
+
+class AnalyzeCollectionOutput(ListToolOutput):
+    collection_analysis: dict[str, Any]
+    member_count: int = Field(ge=0)
+    eligible_count: int = Field(ge=0)
+    displayed_count: int = Field(ge=0)
 
 
 class HistoricalFailuresOutput(ListToolOutput):
@@ -265,6 +283,14 @@ TOOL_REGISTRY = ToolRegistry(
             CompareProductsOutput,
             "product.read",
             READ_ROLES,
+        ),
+        _spec(
+            "analyze_collection",
+            "按后端门禁、确定性评分和证据质量分析当前企业候选集合；不足 Top-K 时不补入未通过门禁的商品。",
+            AnalyzeCollectionInput,
+            AnalyzeCollectionOutput,
+            "product.analyze",
+            ANALYSIS_ROLES,
         ),
         _spec(
             "get_product_history",

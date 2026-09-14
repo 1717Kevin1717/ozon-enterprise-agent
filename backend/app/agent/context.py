@@ -12,7 +12,7 @@ from app.agent.task_state import load_task_state
 
 
 _SELECTION_REFERENCE = re.compile(
-    r"这几个|这两个|这些(?:商品|产品|候选)?|我选的这些|已选(?:商品|产品|候选)?|"
+    r"这几个|这两个|这三个|这些(?:商品|产品|候选)?|我选的这些|已选(?:商品|产品|候选)?|"
     r"对比中心|现在比较(?:一下|这些)?|用对比中心|哪些数据"
 )
 _IGNORE_SELECTION = re.compile(
@@ -153,6 +153,19 @@ def resolve_context_reference(
                 inherited_dimensions=inherited, confidence=1,
             )
 
+    if (
+        understanding.operation == "EXPLAIN_RANKING"
+        and snapshot.task_state.active_collection
+        and re.search(r"(?:第一|第一个|榜首).*(?:第二|第二个)|(?:第二|第二个).*(?:第一|第一个|榜首)", query)
+    ):
+        ranked = snapshot.task_state.active_collection.top_product_ids[:2]
+        if len(ranked) == 2:
+            return ReferenceResolutionResult(
+                product_ids=ranked, source="session_state",
+                reference_expression="active_collection_top_two",
+                inherited_dimensions=inherited, confidence=1,
+            )
+
     recommendation = snapshot.task_state.active_recommendation
     if recommendation and understanding.requires_context and understanding.intent in {
         "decision_explanation", "provenance_fact", "data_quality_answer", "selection_recommendation",
@@ -192,6 +205,8 @@ def resolve_context_reference(
     task_order = (
         snapshot.task_state.active_comparison_set.product_ids
         if snapshot.task_state.active_comparison_set else
+        snapshot.task_state.active_collection.top_product_ids
+        if snapshot.task_state.active_collection else
         snapshot.task_state.active_result_set.product_ids
         if snapshot.task_state.active_result_set else []
     )
@@ -241,6 +256,13 @@ def resolve_context_reference(
             return ReferenceResolutionResult(
                 product_ids=snapshot.current_selected_product_ids, source="ui_selection",
                 reference_expression=singular.group(0), inherited_dimensions=inherited, confidence=0.96,
+            )
+        focused = snapshot.task_state.focused_collection_member
+        if focused:
+            return ReferenceResolutionResult(
+                product_ids=[focused.product_id], source="session_state",
+                reference_expression="focused_collection_member",
+                inherited_dimensions=inherited, confidence=0.98,
             )
         for source, candidates in (
             ("last_explicit_entity", snapshot.last_explicit_product_ids),

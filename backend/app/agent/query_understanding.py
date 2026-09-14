@@ -1,5 +1,6 @@
 """Intent-first decomposition over existing routing; no enterprise facts here."""
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 
@@ -12,6 +13,7 @@ from app.schemas.semantic_vocabulary import (
     INTENT_ALLOWED_DIMENSIONS,
     METRIC_TO_DIMENSIONS,
     SEMANTIC_PLANNER_INTENTS,
+    allowed_dimensions_for,
     normalize_semantic_values,
 )
 
@@ -22,8 +24,23 @@ REFERENCE = re.compile(
     r"我选的这些|它|第[一二两三四五六七八九十\d]+个|前一个|后一个|那利润(?:呢)?|现在比较(?:一下)?|"
     r"剩下(?:的|那个|那些)?|已找到(?:的|那个|那些)?|没找到(?:的|那个|那些)?"
 )
+COLLECTION_REFERENCE = re.compile(r"候选池|候选集合|商品池|当前候选|这批(?:商品|候选)?|公司商品库|企业商品库|当前(?:结果|集合)|刚才(?:那批|那些|的结果)")
 SEMANTIC_TYPES = {"provenance_fact", "calculation_explanation", "decision_explanation", "data_quality_answer", "data_quality_policy"}
 SEMANTIC_HANDOFF_TOOLS = ("get_product", "calculate_profit", "get_sales_trend")
+REFERENCE_SLOT_ALIASES = {
+    "active_collection": "session_state",
+    "current_collection": "session_state",
+    "collection_state": "session_state",
+    "active_collection_ranking": "session_state",
+    "collection_ranking": "session_state",
+    "current_ranking": "session_state",
+    "ranking_state": "session_state",
+    "active_result_set": "session_state",
+    "ordinal": "ordinal_reference",
+    "ordinal_pair": "ordinal_reference",
+    "rank_pair": "ordinal_reference",
+    "ranked_members": "ordinal_reference",
+}
 
 
 class SemanticPlannerFailure(RuntimeError):
@@ -46,6 +63,7 @@ class SemanticPlanValidationFailure(ValueError):
         field: str | None,
         stage: str,
         safe_detail: str | None = None,
+        diagnostics: dict | None = None,
     ):
         super().__init__(reason_code)
         self.failure_code = failure_code
@@ -54,6 +72,7 @@ class SemanticPlanValidationFailure(ValueError):
         self.field = field
         self.stage = stage
         self.safe_detail = safe_detail
+        self.diagnostics = diagnostics or {}
 
 
 @dataclass(frozen=True)
@@ -66,7 +85,14 @@ class EntityArbitration:
     ignored_semantic_candidate_count: int = 0
 
 
-def _reject(rule_id: str, reason_code: str, field: str | None, *, safe_detail: str | None = None):
+def _reject(
+    rule_id: str,
+    reason_code: str,
+    field: str | None,
+    *,
+    safe_detail: str | None = None,
+    diagnostics: dict | None = None,
+):
     raise SemanticPlanValidationFailure(
         failure_code="SEMANTIC_PLAN_VALIDATION_FAILED",
         rule_id=rule_id,
@@ -74,7 +100,123 @@ def _reject(rule_id: str, reason_code: str, field: str | None, *, safe_detail: s
         field=field,
         stage="SEMANTIC_VALIDATE",
         safe_detail=safe_detail,
+        diagnostics=diagnostics,
     )
+
+
+_COLLECTION_TASK_SIGNAL = re.compile(
+    r"(?:最值得|优先|推荐|挑|选出|前[一二三四五六七八九十\d]+|top\s*\d+|"
+    r"证据|缺口|还缺|资料|进一步(?:验证|研究|调研)|商品方向)",
+    re.I,
+)
+_EXPLICIT_FILTER_SIGNAL = re.compile(
+    r"(?:筛选|筛出|只保留|排除|剔除|过滤|满足.*条件|"
+    r"(?:大于|小于|高于|低于|不低于|不高于|超过|至少|至多|>=|<=|>|<|=)\s*\d)",
+    re.I,
+)
+
+
+def _safe_semantic_diagnostics(value, normalized) -> dict:
+    """Keep finite semantic labels only; never persist provider prose or facts."""
+    raw_dimensions = [
+        str(item).strip()[:64]
+        for item in value.requested_dimensions
+        if isinstance(item, str) and item.strip()
+    ][:20]
+    return {
+        "semantic_operation": value.operation,
+        "reference_slots": list(value.reference_slots)[:10],
+        "raw_requested_dimensions": raw_dimensions,
+        "canonical_requested_dimensions": list(normalized.dimensions)[:20],
+        "normalization_failures": list(normalized.unknown_dimensions)[:20],
+    }
+
+
+def _anchor_collection_semantics(query: str, value: QueryUnderstanding) -> QueryUnderstanding:
+    """Stabilize provider task labels for explicit collection-analysis language."""
+    has_collection = bool(COLLECTION_REFERENCE.search(query))
+    has_collection_task = bool(_COLLECTION_TASK_SIGNAL.search(query))
+    if not (has_collection and has_collection_task) or _EXPLICIT_FILTER_SIGNAL.search(query):
+        return value
+
+    dimensions = ["recommendation", "decision"]
+    for dimension, pattern in (
+        ("profit", r"利润|净利率|赚钱|盈利"),
+        ("roi", r"\broi\b"),
+        ("risk", r"风险"),
+        ("demand", r"需求|销量|趋势"),
+        ("competition", r"竞争"),
+        ("compliance", r"合规"),
+        ("provenance", r"来源|出处|可追溯"),
+        ("freshness", r"时效|新鲜度|最近更新"),
+    ):
+        if re.search(pattern, query, re.I):
+            dimensions.append(dimension)
+    gaps = bool(re.search(r"证据|缺口|缺失|还缺|资料|数据不足|不完整", query))
+    if gaps:
+        dimensions.extend(["evidence", "evidence_gap"])
+
+    top_match = re.search(r"(?:前|top|推荐|选出|挑).*?(\d+)\s*(?:个|件|款)?", query, re.I)
+    chinese_top = next(
+        (count for word, count in (("一个", 1), ("两个", 2), ("三个", 3), ("四个", 4), ("五个", 5)) if word in query),
+        None,
+    )
+    top_k = value.top_k or (max(1, min(20, int(top_match.group(1)))) if top_match else chinese_top)
+    operation = "RECOMMEND_TOP_K" if top_k else "IDENTIFY_EVIDENCE_GAPS" if gaps else "ANALYZE_COLLECTION"
+    return value.model_copy(update={
+        "intent": "collection_analysis",
+        "task_type": "collection_analysis",
+        "question_type": "collection_analysis",
+        "operation": operation,
+        "requested_dimensions": list(dict.fromkeys(dimensions)),
+        "top_k": top_k,
+        "evidence_gap_requested": gaps,
+        "clarification_required": False,
+    })
+
+
+def _anchor_active_collection_ranking(
+    query: str,
+    value: QueryUnderstanding,
+    task_context,
+) -> QueryUnderstanding:
+    """Bind ordinal ranking explanations to the active collection revision."""
+    task_get = (
+        task_context.get
+        if isinstance(task_context, dict)
+        else lambda key, default=None: getattr(task_context, key, default)
+    ) if task_context is not None else lambda key, default=None: default
+    has_collection = bool(task_get("collection_member_count", 0))
+    has_ranking = bool(task_get("has_collection_ranking_state", False))
+    ordinal_pair = bool(re.search(
+        r"(?:第一|第一个|第1|榜首).*(?:第二|第二个|第2)|"
+        r"(?:第二|第二个|第2).*(?:第一|第一个|第1|榜首)",
+        query,
+    ))
+    asks_reason = bool(re.search(r"为什么|为何|原因|依据|怎么排", query))
+    if not (has_collection and has_ranking and ordinal_pair and asks_reason):
+        return value
+
+    dimensions = list(task_get("collection_ranking_dimensions", []) or [])
+    if not dimensions:
+        dimensions = ["recommendation"]
+    slots = list(dict.fromkeys([*value.reference_slots, "session_state", "ordinal_reference"]))
+    return value.model_copy(update={
+        "intent": "collection_analysis",
+        "task_type": "collection_analysis",
+        "question_type": "collection_analysis",
+        "operation": "EXPLAIN_RANKING",
+        "collection_reference": "current_collection",
+        "requested_dimensions": dimensions,
+        "reference_slots": slots,
+        "ordinal_reference": 1,
+        "ordinal_references": [1, 2],
+        "top_k": 2,
+        "requires_context": True,
+        "requires_task_state": True,
+        "requires_reasoning": False,
+        "clarification_required": False,
+    })
 
 
 def semantic_policy(intent, dimensions, selected=()):
@@ -84,13 +226,15 @@ def semantic_policy(intent, dimensions, selected=()):
         ("compare_products",) if intent == "product_comparison" else
         ("compare_products", "calculate_profit") if intent == "profit_comparison" else
         ("filter_products", "compare_products") if intent == "selection_recommendation" else
+        ("analyze_collection",) if intent == "collection_analysis" else
         ("get_product", "get_sales_trend") if "sales_snapshot" in dimensions else
         ("get_product", "calculate_profit") if intent == "calculation_explanation" else
         ("get_product", "calculate_profit") if intent == "product_detail" and ({"profit", "roi"} & set(dimensions)) else
         ("get_product",)
     )
-    budget = 10 if intent == "data_quality_answer" else 11 if intent == "profit_comparison" else 1 if intent == "selection_recommendation" else len(tools)
-    return ParsedIntent(intent, selected_product_ids=tuple(selected), policy=_policy(tools, budget, tuple(dimensions), selection="ignore" if not tools else "query_first", fast=True))
+    budget = 10 if intent == "data_quality_answer" else 11 if intent == "profit_comparison" else 1 if intent in {"selection_recommendation", "collection_analysis"} else len(tools)
+    selection = "ignore" if not tools or intent == "collection_analysis" else "query_first"
+    return ParsedIntent(intent, selected_product_ids=tuple(selected), policy=_policy(tools, budget, tuple(dimensions), selection=selection, fast=True))
 
 
 def semantic_intent(query, selected=(), context_snapshot: ContextSnapshot | None = None):
@@ -98,6 +242,19 @@ def semantic_intent(query, selected=(), context_snapshot: ContextSnapshot | None
     q = query.casefold()
     previous_dimensions = tuple(context_snapshot.last_requested_dimensions) if context_snapshot else ()
     previous_fact = context_snapshot.last_fact_dimension if context_snapshot else None
+    single_recommendation = bool(re.search(r"推荐\s*(?:一|1)个", q)) and not re.search(r"证据|缺口|分析.*集合|分析.*池", q)
+    implicit_collection_request = bool(re.search(r"哪些.*最值得.*(?:验证|研究|调研)", q))
+    if (COLLECTION_REFERENCE.search(q) or implicit_collection_request) and not single_recommendation and re.search(r"分析|研究|方向|最值得|推荐|优先|挑|前[一二三四五\d]+|证据|缺口|资料|重排|重新?排|验证", q):
+        dimensions = ["recommendation", "decision"]
+        for dimension, pattern in (
+            ("profit", r"利润|净利率|赚钱"), ("roi", r"\broi\b"), ("risk", r"风险"),
+            ("demand", r"需求|销量|趋势"), ("competition", r"竞争"), ("compliance", r"合规"),
+        ):
+            if re.search(pattern, q, re.I):
+                dimensions.append(dimension)
+        if re.search(r"证据|缺口|缺失|资料|数据不足", q):
+            dimensions.extend(["evidence", "evidence_gap"])
+        return semantic_policy("collection_analysis", tuple(dict.fromkeys(dimensions)), selected)
     if re.search(r"过期|新鲜|时效|旧了", q) and re.search(r"推荐|维持|继续", q):
         return semantic_policy("decision_explanation", ("decision_reason", "evidence", "freshness", "recommendation"), selected)
     if "完整度" in q and re.search(r"代表|意味|等于|足够|可靠|靠谱|直接.*上架|就.*上架", q):
@@ -143,6 +300,43 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
     parsed = parse_intent(query, selected, context_snapshot)
     names = tuple(value for p in products for value in (p.title, p.id, p.external_product_id, p.sku) if value)
     references = list(dict.fromkeys(REFERENCE.findall(query)))
+    collection_match = COLLECTION_REFERENCE.search(query)
+    collection_reference = None
+    if collection_match:
+        has_active_collection = bool(context_snapshot and context_snapshot.task_state.active_collection)
+        collection_reference = (
+            "candidate_pool" if re.search(r"候选池|候选集合|商品池|当前候选", collection_match.group(0)) or (
+                not has_active_collection and re.search(r"这批(?:商品|候选)?", collection_match.group(0))
+            ) else
+            "company_catalog" if re.search(r"公司商品库|企业商品库", collection_match.group(0)) else
+            "active_result_set" if re.search(r"当前结果|刚才.*结果", collection_match.group(0)) else
+            "current_collection"
+        )
+    elif parsed.name == "collection_analysis":
+        collection_reference = "candidate_pool"
+    elif context_snapshot and context_snapshot.task_state.active_collection and re.search(r"第[一二两三四五六七八九十\d]+个|这几个|这三个|重新?排|重排|缺什么证据|证据缺口|只看", query):
+        collection_reference = "current_collection"
+    orphan_collection_followup = bool(
+        context_snapshot
+        and not context_snapshot.task_state.active_collection
+        and not context_snapshot.task_state.active_comparison_set
+        and not context_snapshot.task_state.active_result_set
+        and re.search(r"第[一二两三四五六七八九十\d]+个|第一名|第二名|第三名", query)
+        and re.search(r"缺.*(?:证据|资料|数据)|为什么|为何|原因|依据", query)
+    )
+    if orphan_collection_followup:
+        wants_gaps = bool(re.search(r"缺.*(?:证据|资料|数据)", query))
+        parsed = semantic_policy(
+            "collection_analysis",
+            ("evidence", "evidence_gap") if wants_gaps else ("recommendation", "decision"),
+        )
+        collection_reference = "current_collection"
+    top_match = re.search(r"(?:前|top|推荐|选出|找出).*?(\d+)\s*(?:个|件|款)?", query, re.I)
+    chinese_top = next((value for text, value in (("三个", 3), ("两个", 2), ("五个", 5), ("四个", 4), ("一个", 1)) if text in query), None)
+    chinese_rank = next((value for text, value in (("前一", 1), ("前二", 2), ("前三", 3), ("前四", 4), ("前五", 5)) if text in query), None)
+    top_k = max(1, min(20, int(top_match.group(1)))) if top_match else chinese_top or chinese_rank
+    evidence_gap_requested = bool(re.search(r"证据缺口|缺.*(?:证据|资料|数据)|数据不足", query))
+    exclude_insufficient_data = bool(re.search(r"排除|不要|去掉|剔除", query) and re.search(r"证据不足|数据不足|不充分|INSUFFICIENT", query, re.I))
     mentions = query_mentions(query, names) if parsed.policy.selection_mode != "ignore" else []
     # A reference is contextual metadata, not a literal catalogue lookup.
     mentions = [m for m in mentions if not REFERENCE.fullmatch(m) and m not in {"这个", "那个", "那些", "这", "那", "哪些", "哪些还是新鲜"}]
@@ -190,7 +384,7 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         r"不做|不要|不分析|无需|不需要|不比较)",
         query,
     ))
-    semantic_complex = bool(re.search(r"哪个好|如果只能留一个|利润优先|风险其次|你怎么看|为什么这么低", query)) or contextual_handoff or task_operation_signal
+    semantic_complex = bool(re.search(r"哪个好|如果只能留一个|利润优先|风险其次|你怎么看|为什么这么低", query)) or contextual_handoff or task_operation_signal or parsed.name == "collection_analysis"
     # A catalogue entity is evidence about identity, not evidence that the rule
     # router understood the user's task. Only a recognized deterministic grammar
     # may take the fast path; all other meaningful utterances need semantic handoff.
@@ -206,11 +400,20 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         if not any(item.resolved for item in resolved):
             mentions = []
         parsed = semantic_policy("unknown", ())
+    operation = "ANALYZE_COLLECTION" if parsed.name == "collection_analysis" else "CREATE"
+    if parsed.name == "collection_analysis" and top_k:
+        operation = "RECOMMEND_TOP_K"
+    if orphan_collection_followup:
+        operation = "IDENTIFY_EVIDENCE_GAPS" if evidence_gap_requested else "EXPLAIN_RANKING"
+    if orphan_collection_followup:
+        route = "DETERMINISTIC_FAST_PATH"
     understanding = QueryUnderstanding(
         intent=parsed.name, question_type=parsed.name,
         entity_mentions=mentions, entity_roles=["EXPLICIT_PRODUCT" for _ in mentions], references=references, metrics=metrics,
         metric_values=[float(v) for v in re.findall(r"([+-]?\d+(?:\.\d+)?)\s*[%％]", query)],
-        requested_dimensions=dims if supported else [],
+        requested_dimensions=dims if supported else [], collection_reference=collection_reference,
+        top_k=top_k, evidence_gap_requested=evidence_gap_requested,
+        exclude_insufficient_data=exclude_insufficient_data, operation=operation,
         comparison_requested="comparison" in parsed.name,
         explanation_requested=parsed.name in {"calculation_explanation", "decision_explanation"},
         provenance_requested=parsed.name == "provenance_fact", calculation_requested=parsed.name == "calculation_explanation",
@@ -241,9 +444,12 @@ def build_semantic_context_packet(
         task.active_entities
         + (task.active_result_set.product_ids if task.active_result_set else [])
         + (task.active_comparison_set.product_ids if task.active_comparison_set else [])
+        + (task.active_collection.top_product_ids if task.active_collection else [])
     ))[:10]
     result_count = len(task.active_result_set.product_ids) if task.active_result_set else 0
     comparison_count = len(task.active_comparison_set.product_ids) if task.active_comparison_set else 0
+    collection_count = len(task.active_collection.product_ids) if task.active_collection else 0
+    collection_top_count = len(task.active_collection.top_product_ids) if task.active_collection else 0
     task_context = SemanticTaskContextPacket(
         active_task_type=task.task_type,
         active_operation=task.operation,
@@ -252,12 +458,19 @@ def build_semantic_context_packet(
         comparison_count=comparison_count,
         active_filter_spec=task.filter_spec,
         active_sort_spec=task.sort_spec,
-        active_dimensions=(task.active_comparison_set.dimensions if task.active_comparison_set else task.requested_dimensions),
-        ordinal_capacity=comparison_count or result_count,
+        active_dimensions=(task.active_comparison_set.dimensions if task.active_comparison_set else task.active_collection.requested_dimensions if task.active_collection else task.requested_dimensions),
+        ordinal_capacity=comparison_count or collection_top_count or result_count,
         has_pending_unresolved_entity=any(item.status in {"NOT_FOUND", "AMBIGUOUS", "LOW_CONFIDENCE"} for item in task.pending_entities),
         pending_entity_statuses=[item.status for item in task.pending_entities],
         has_active_recommendation=task.active_recommendation is not None,
         recommendation_candidate_count=len(task.active_recommendation.candidate_product_ids) if task.active_recommendation else 0,
+        active_collection_type=task.active_collection.collection_type if task.active_collection else "",
+        collection_member_count=collection_count,
+        collection_top_count=collection_top_count,
+        collection_top_k=task.active_collection.top_k if task.active_collection else 0,
+        collection_ranking_dimensions=task.active_collection.ranking_dimensions if task.active_collection else [],
+        has_focused_collection_member=task.focused_collection_member is not None,
+        has_collection_ranking_state=bool(task.active_collection and task.active_collection.ranked_product_ids),
         has_active_scenario=False,
         last_successful_action=task.last_successful_action,
     )
@@ -371,14 +584,43 @@ def _has_context_target(context_packet) -> bool:
 
 def validate_semantic_plan(raw, query, selected=(), context_packet=None):
     try:
-        value = QueryUnderstanding.model_validate_json(raw) if isinstance(raw, str) else QueryUnderstanding.model_validate(raw)
-    except ValidationError as exc:
-        error = exc.errors(include_url=False, include_context=False)[0] if exc.errors() else {}
-        field = ".".join(str(part) for part in error.get("loc", ())) or "root"
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        raw_slots = payload.get("reference_slots")
+        if isinstance(raw_slots, list):
+            normalized_slots = []
+            for raw_slot in raw_slots:
+                slot = re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", str(raw_slot).strip().casefold())).strip("_")
+                normalized_slots.append(REFERENCE_SLOT_ALIASES.get(slot, slot))
+            payload["reference_slots"] = list(dict.fromkeys(normalized_slots))
+        ordinal_value = payload.get("ordinal_reference")
+        plural_value = payload.get("ordinal_references")
+        if isinstance(ordinal_value, list):
+            if plural_value not in (None, [], ordinal_value):
+                raise ValueError("conflicting ordinal reference shapes")
+            payload["ordinal_references"] = ordinal_value
+            payload["ordinal_reference"] = ordinal_value[0] if ordinal_value else None
+        elif plural_value is not None and not isinstance(plural_value, list):
+            payload["ordinal_references"] = [plural_value]
+        value = QueryUnderstanding.model_validate(payload)
+        ordinals = list(dict.fromkeys(value.ordinal_references or ([value.ordinal_reference] if value.ordinal_reference else [])))
+        updates = {"ordinal_references": ordinals}
+        if ordinals and value.ordinal_reference is None:
+            updates["ordinal_reference"] = ordinals[0]
+        if value.intent == "collection_analysis" and len(ordinals) >= 2 and value.operation == "COMPARE_COLLECTION_MEMBERS":
+            updates["operation"] = "EXPLAIN_RANKING"
+        value = value.model_copy(update=updates)
+    except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        if isinstance(exc, ValidationError):
+            error = exc.errors(include_url=False, include_context=False)[0] if exc.errors() else {}
+            field = ".".join(str(part) for part in error.get("loc", ())) or "root"
+            reason = str(error.get("type") or "STRUCTURAL_SCHEMA_INVALID")
+        else:
+            field = "ordinal_references" if "ordinal" in str(exc).casefold() else "root"
+            reason = "STRUCTURAL_SCHEMA_INVALID"
         raise SemanticPlanValidationFailure(
             failure_code="SCHEMA_VALIDATION_FAILED",
             rule_id="SEM000",
-            reason_code=str(error.get("type") or "STRUCTURAL_SCHEMA_INVALID"),
+            reason_code=reason,
             field=field,
             stage="SCHEMA_VALIDATE",
         ) from exc
@@ -407,8 +649,29 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         if isinstance(context_packet, dict)
         else lambda key, default=None: getattr(context_packet, key, default)
     ) if context_packet is not None else lambda key, default=None: default
+
+    # Canonicalize and reject genuinely unknown provider enum values before any
+    # task anchoring.  This prevents a collection anchor from hiding an invalid
+    # dimension while still accepting finite aliases deterministically.
+    initial_normalized = normalize_semantic_values(
+        value.requested_dimensions, value.metrics, value.metric,
+    )
+    initial_diagnostics = _safe_semantic_diagnostics(value, initial_normalized)
+    if initial_normalized.unknown_dimensions:
+        _reject(
+            "SEM004", "INVALID_DIMENSION", "requested_dimensions",
+            diagnostics=initial_diagnostics,
+        )
+    if initial_normalized.unknown_metrics:
+        field = "metric" if value.metric and not value.metrics else "metrics"
+        initial_diagnostics["normalization_failures"] = list(initial_normalized.unknown_metrics)[:20]
+        _reject("SEM004", "INVALID_METRIC", field, diagnostics=initial_diagnostics)
+    value = _anchor_collection_semantics(query, value)
+    value = _anchor_active_collection_ranking(query, value, packet_get("task_context", {}))
+
     ordinal_continuation = bool(
         value.ordinal_reference
+        or value.ordinal_references
         or re.search(r"第[一二两三四五六七八九十\d]+个|前一个|后一个", query)
     )
     if (
@@ -449,6 +712,33 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
             _reject("SEM003", "INCONSISTENT_CLARIFICATION", "clarification_required")
         return semantic_policy("unknown", ()), value.model_copy(update={"route": "CLARIFICATION", "planner_calls": 1})
 
+    if value.intent == "collection_analysis" and value.collection_reference is None:
+        match = COLLECTION_REFERENCE.search(query)
+        current_task = packet_get("task_context", {}) or {}
+        current_task_get = current_task.get if isinstance(current_task, dict) else lambda key, default=None: getattr(current_task, key, default)
+        has_active_collection = bool(current_task_get("collection_member_count", 0))
+        reference = (
+            "candidate_pool" if match and (
+                re.search(r"候选池|候选集合|商品池|当前候选", match.group(0))
+                or (not has_active_collection and re.search(r"这批(?:商品|候选)?", match.group(0)))
+            ) else
+            "company_catalog" if match and re.search(r"公司商品库|企业商品库", match.group(0)) else
+            "active_result_set" if match and re.search(r"当前结果|刚才.*结果", match.group(0)) else
+            "current_collection" if match or current_task_get("collection_member_count", 0) or re.search(r"第[一二两三四五六七八九十\d]+个|第一名|第二名|第三名|这批|这几个|这三个", query) else
+            "candidate_pool"
+        )
+        value = value.model_copy(update={"collection_reference": reference})
+    if value.intent == "collection_analysis":
+        top_match = re.search(r"(?:前|top|推荐|选出|找出).*?(\d+)\s*(?:个|件|款)?", query, re.I)
+        chinese_top = next((count for word, count in (("一个", 1), ("两个", 2), ("三个", 3), ("四个", 4), ("五个", 5)) if word in query), None)
+        chinese_rank = next((count for word, count in (("前一", 1), ("前二", 2), ("前三", 3), ("前四", 4), ("前五", 5)) if word in query), None)
+        top_k = value.top_k or (max(1, min(20, int(top_match.group(1)))) if top_match else chinese_top or chinese_rank)
+        gaps = value.evidence_gap_requested or bool(re.search(r"证据缺口|缺.*(?:证据|资料|数据)|数据不足", query))
+        updates = {"top_k": top_k, "evidence_gap_requested": gaps}
+        if top_k and value.operation in {"CREATE", "ANALYZE_COLLECTION"}:
+            updates["operation"] = "RECOMMEND_TOP_K"
+        value = value.model_copy(update=updates)
+
     # Scope can be narrowed deterministically when a provider labels an ordinary
     # single-product profit inquiry as a comparison while explicitly saying no
     # comparison was requested.  Two explicit entities or a typed prior-comparison
@@ -486,10 +776,15 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
 
     normalized = normalize_semantic_values(value.requested_dimensions, value.metrics, value.metric)
     if normalized.unknown_dimensions:
-        _reject("SEM004", "INVALID_DIMENSION", "requested_dimensions")
+        _reject(
+            "SEM004", "INVALID_DIMENSION", "requested_dimensions",
+            diagnostics=_safe_semantic_diagnostics(value, normalized),
+        )
     if normalized.unknown_metrics:
         field = "metric" if value.metric and not value.metrics else "metrics"
-        _reject("SEM004", "INVALID_METRIC", field)
+        diagnostics = _safe_semantic_diagnostics(value, normalized)
+        diagnostics["normalization_failures"] = list(normalized.unknown_metrics)[:20]
+        _reject("SEM004", "INVALID_METRIC", field, diagnostics=diagnostics)
     value = value.model_copy(update={
         "requested_dimensions": list(normalized.dimensions),
         "metrics": list(normalized.metrics),
@@ -524,8 +819,14 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         value = value.model_copy(update={"requested_dimensions": narrowed or ["detail"]})
     if not value.requested_dimensions and value.intent == "product_price":
         value = value.model_copy(update={"requested_dimensions": ["price"]})
-    if not value.requested_dimensions or not set(value.requested_dimensions) <= INTENT_ALLOWED_DIMENSIONS[value.intent]:
-        _reject("SEM004", "INVALID_DIMENSION", "requested_dimensions")
+    if not value.requested_dimensions and value.intent == "collection_analysis":
+        value = value.model_copy(update={"requested_dimensions": ["recommendation", "decision"]})
+    allowed_dimensions = allowed_dimensions_for(value.intent, value.operation)
+    if not value.requested_dimensions or not set(value.requested_dimensions) <= allowed_dimensions:
+        _reject(
+            "SEM004", "INVALID_DIMENSION", "requested_dimensions",
+            diagnostics=_safe_semantic_diagnostics(value, normalized),
+        )
     if set(value.requested_dimensions) & set(value.negative_scope):
         _reject("SEM005", "CONFLICTING_SCOPE", "negative_scope")
     if any(not mention.strip() or mention not in query or re.search(r"为什么|怎么|来自哪里|[?？]", mention) for mention in value.entity_mentions):
@@ -545,11 +846,16 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
     contextual_target = value.requires_context and _has_context_target(context_packet)
     downstream_clarification = (
         not value.entity_mentions and not value.references and not contextual_target
-        and value.intent not in {"data_quality_policy", "product_filter", "selection_recommendation"}
+        and value.intent not in {"data_quality_policy", "product_filter", "selection_recommendation", "collection_analysis"}
     )
     parsed = semantic_policy(value.intent, value.requested_dimensions, selected)
     unknown_tools = [tool for tool in value.planned_tools if TOOL_REGISTRY.get(tool) is None]
-    if unknown_tools:
+    # Collection tool suggestions are advisory: a valid collection frame must
+    # not fail merely because a provider invents a tool label.  The unknown
+    # label is retained as a mismatch and never reaches execution; the backend
+    # still supplies the sole authorized plan.  Other intent families keep the
+    # strict SEM009 rejection boundary.
+    if unknown_tools and value.intent != "collection_analysis":
         _reject("SEM009", "UNSUPPORTED_ACTION", "planned_tools")
     backend_tools = list(parsed.policy.allowed_tools)
     advisory_mismatch = [tool for tool in dict.fromkeys(value.planned_tools) if tool not in parsed.policy.allowed_tools]
@@ -557,7 +863,7 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
                                     "requires_context": value.requires_context or (
                                         not value.entity_mentions
                                         and parsed.policy.selection_mode != "ignore"
-                                        and value.intent != "selection_recommendation"
+                                        and value.intent not in {"selection_recommendation", "collection_analysis"}
                                     ),
                                     "requires_tools": bool(backend_tools),
                                     "clarification_required": value.clarification_required or downstream_clarification,

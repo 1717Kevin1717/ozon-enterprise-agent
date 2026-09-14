@@ -17,12 +17,14 @@ CANONICAL_INTENTS = (
     "profit_comparison", "product_comparison", "compliance_policy", "recommendation_policy",
     "selection_recommendation", "provenance_fact", "calculation_explanation",
     "decision_explanation", "data_quality_answer", "data_quality_policy", "unknown",
+    "collection_analysis",
 )
 
 SEMANTIC_PLANNER_INTENTS = frozenset({
     "product_price", "product_filter", "product_detail", "product_comparison", "profit_comparison",
     "selection_recommendation", "provenance_fact", "calculation_explanation",
     "decision_explanation", "data_quality_answer", "data_quality_policy", "unknown",
+    "collection_analysis",
 })
 
 CANONICAL_DIMENSIONS = (
@@ -30,6 +32,7 @@ CANONICAL_DIMENSIONS = (
     "competition", "compliance", "recommendation", "decision", "provenance",
     "sales_snapshot", "data_sufficiency", "calculation", "evidence",
     "decision_reason", "freshness", "data_quality", "policy",
+    "evidence_gap",
 )
 
 # Metrics are specific measurements or analysis modes inside a dimension.  They
@@ -64,6 +67,36 @@ INTENT_ALLOWED_DIMENSIONS = {
     "selection_recommendation": frozenset({
         "recommendation", "decision", "profit", "risk", "compliance",
     }),
+    "collection_analysis": frozenset({
+        "recommendation", "decision", "profit", "roi", "risk", "demand",
+        "competition", "compliance", "evidence", "evidence_gap", "data_quality",
+        "provenance", "freshness",
+    }),
+}
+
+# Collection operations share an intent but not an unlimited analysis scope.
+# This registry validates provider vocabulary only; ranking and all catalogue
+# facts remain deterministic backend responsibilities.
+COLLECTION_OPERATION_ALLOWED_DIMENSIONS = {
+    "ANALYZE_COLLECTION": INTENT_ALLOWED_DIMENSIONS["collection_analysis"],
+    "RECOMMEND_TOP_K": INTENT_ALLOWED_DIMENSIONS["collection_analysis"],
+    "IDENTIFY_EVIDENCE_GAPS": frozenset({
+        "evidence", "evidence_gap", "data_quality", "provenance", "freshness",
+        "recommendation", "decision",
+    }),
+    "RERANK_COLLECTION": frozenset({
+        "recommendation", "decision", "profit", "roi", "risk", "demand",
+        "competition", "compliance",
+    }),
+    "COMPARE_COLLECTION_MEMBERS": frozenset({
+        "recommendation", "decision", "profit", "roi", "risk", "demand",
+        "competition", "compliance", "evidence", "provenance", "freshness",
+    }),
+    "EXPLAIN_RANKING": frozenset({
+        "recommendation", "decision", "profit", "roi", "risk", "demand",
+        "competition", "compliance", "evidence", "evidence_gap", "data_quality",
+        "provenance", "freshness",
+    }),
 }
 
 # These are aliases for provider-emitted enum values, not natural-language query
@@ -92,6 +125,31 @@ DIMENSION_ALIASES = {
     "price_recency": ("price", "freshness"),
     "source": ("provenance",),
     "source_traceability": ("provenance",),
+    "evidence_gaps": ("evidence_gap",),
+    "evidence_gap_analysis": ("evidence_gap",),
+    "missing_evidence": ("evidence_gap",),
+    "insufficient_evidence": ("evidence_gap",),
+    "evidence_insufficiency": ("evidence_gap",),
+    "missing_data": ("evidence_gap",),
+    "missing_information": ("evidence_gap",),
+    "information_gap": ("evidence_gap",),
+    "incomplete_data": ("evidence_gap", "data_quality"),
+    "data_gaps": ("evidence_gap",),
+    "data_gap": ("evidence_gap",),
+    "data_gap_analysis": ("evidence_gap",),
+    "data_completeness": ("data_quality",),
+    "evidence_quality": ("data_quality",),
+    "source_gap": ("provenance", "evidence_gap"),
+    "provenance_gap": ("provenance", "evidence_gap"),
+    "missing_provenance": ("provenance", "evidence_gap"),
+    "source_quality": ("provenance", "data_quality"),
+    "证据缺口": ("evidence_gap",),
+    "数据缺口": ("evidence_gap",),
+    "缺什么数据": ("evidence_gap",),
+    "缺哪些关键证据": ("evidence_gap",),
+    "证据不足": ("evidence_gap",),
+    "数据哪里不完整": ("evidence_gap", "data_quality"),
+    "来源不足": ("provenance", "evidence_gap"),
 }
 
 METRIC_ALIASES = {
@@ -150,7 +208,14 @@ class SemanticValueNormalization:
 
 def _enum_value(value: str) -> str:
     """Normalize enum spelling only; never inspect user query text."""
-    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.strip().casefold())).strip("_")
+    return re.sub(r"_+", "_", re.sub(r"[^\w]+", "_", value.strip().casefold())).strip("_")
+
+
+def allowed_dimensions_for(intent: str, operation: str | None = None) -> frozenset[str]:
+    """Return the finite dimension contract for an intent/operation pair."""
+    if intent == "collection_analysis" and operation in COLLECTION_OPERATION_ALLOWED_DIMENSIONS:
+        return COLLECTION_OPERATION_ALLOWED_DIMENSIONS[operation]
+    return INTENT_ALLOWED_DIMENSIONS.get(intent, frozenset())
 
 
 def _unique(values: Iterable[str]) -> tuple[str, ...]:
@@ -208,6 +273,9 @@ def semantic_output_contract() -> str:
             "metrics": list(CANONICAL_METRICS),
             "intent_allowed_dimensions": {
                 key: sorted(values) for key, values in INTENT_ALLOWED_DIMENSIONS.items()
+            },
+            "collection_operation_allowed_dimensions": {
+                key: sorted(values) for key, values in COLLECTION_OPERATION_ALLOWED_DIMENSIONS.items()
             },
             "layering": {
                 "intent": "task type",

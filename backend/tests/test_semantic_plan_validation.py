@@ -12,6 +12,8 @@ from app.schemas.semantic_vocabulary import (
     CANONICAL_DIMENSIONS,
     CANONICAL_METRICS,
     INTENT_ALLOWED_DIMENSIONS,
+    allowed_dimensions_for,
+    normalize_semantic_values,
     semantic_output_contract,
 )
 from app.agent.tool_registry import TOOL_REGISTRY
@@ -52,6 +54,72 @@ def understanding_for(query, **updates):
         context_packet={"last_explicit_product_ids": ["opaque-context-slot"]},
     )
     return understood
+
+
+def collection_ranking_plan(**updates):
+    values = {
+        "operation": "EXPLAIN_RANKING",
+        "requested_dimensions": ["profit", "risk"],
+        "planned_tools": ["analyze_collection"],
+        "references": ["第一名", "第二名"],
+        "reference_slots": ["session_state", "ordinal_reference"],
+        "requires_context": True,
+    }
+    values.update(updates)
+    return plan("collection_analysis", **values)
+
+
+def test_collection_ranking_canonical_single_ordinal_schema():
+    _, understood = validate_semantic_plan(
+        collection_ranking_plan(ordinal_reference=1),
+        "第一名为什么领先第二名",
+        context_packet={"task_context": {"collection_member_count": 3}},
+    )
+    assert understood.ordinal_reference == 1
+    assert understood.ordinal_references == [1]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"ordinal_reference": [1, 2]},
+        {
+            "ordinal_references": [1, 2],
+            "operation": "COMPARE_COLLECTION_MEMBERS",
+            "reference_slots": ["active_collection_ranking", "ordinal_pair"],
+        },
+    ],
+)
+def test_collection_ranking_equivalent_ordinal_pair_shapes_are_normalized(shape):
+    _, understood = validate_semantic_plan(
+        collection_ranking_plan(**shape),
+        "第一名为什么领先第二名",
+        context_packet={"task_context": {"collection_member_count": 3}},
+    )
+    assert understood.ordinal_reference == 1
+    assert understood.ordinal_references == [1, 2]
+    assert understood.operation == "EXPLAIN_RANKING"
+    assert set(understood.reference_slots) <= {"session_state", "ordinal_reference"}
+
+
+def test_collection_ranking_invalid_ordinal_pair_shape_is_rejected():
+    with pytest.raises(SemanticPlanValidationFailure) as exc:
+        validate_semantic_plan(
+            collection_ranking_plan(ordinal_reference={"first": 1, "second": 2}),
+            "第一名为什么领先第二名",
+            context_packet={"task_context": {"collection_member_count": 3}},
+        )
+    assert exc.value.failure_code == "SCHEMA_VALIDATION_FAILED"
+
+
+def test_collection_ranking_unknown_reference_slot_is_still_rejected():
+    with pytest.raises(SemanticPlanValidationFailure) as exc:
+        validate_semantic_plan(
+            collection_ranking_plan(reference_slots=["unbounded_provider_reference"]),
+            "第一名为什么领先第二名",
+            context_packet={"task_context": {"collection_member_count": 3}},
+        )
+    assert exc.value.failure_code == "SCHEMA_VALIDATION_FAILED"
 
 
 def test_e01_resolved_explicit_product_remains_authoritative_with_old_context():
@@ -480,6 +548,111 @@ def test_unknown_provider_dimension_still_fails_sem004():
     assert (caught.value.rule_id, caught.value.reason_code, caught.value.field) == (
         "SEM004", "INVALID_DIMENSION", "requested_dimensions",
     )
+    assert caught.value.diagnostics["normalization_failures"] == ["quantum_market_signal"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("evidence_gap", ("evidence_gap",)),
+        ("Evidence Gap Analysis", ("evidence_gap",)),
+        ("missing_information", ("evidence_gap",)),
+        ("data completeness", ("data_quality",)),
+        ("source_gap", ("provenance", "evidence_gap")),
+        ("证据缺口", ("evidence_gap",)),
+        ("数据哪里不完整", ("evidence_gap", "data_quality")),
+    ],
+)
+def test_semantic_dimension_aliases_normalize_to_canonical_values(raw, expected):
+    normalized = normalize_semantic_values([raw])
+
+    assert normalized.dimensions == expected
+    assert normalized.unknown_dimensions == ()
+
+
+def test_mixed_canonical_and_alias_dimensions_are_deduplicated():
+    normalized = normalize_semantic_values([
+        "recommendation", "missing_data", "evidence_gap", "source traceability",
+    ])
+
+    assert normalized.dimensions == ("recommendation", "evidence_gap", "provenance")
+    assert normalized.unknown_dimensions == ()
+
+
+def test_collection_operation_dimension_registry_uses_existing_canonical_terms():
+    top_k = allowed_dimensions_for("collection_analysis", "RECOMMEND_TOP_K")
+    gaps = allowed_dimensions_for("collection_analysis", "IDENTIFY_EVIDENCE_GAPS")
+
+    assert {"recommendation", "profit", "risk", "evidence_gap", "data_quality", "freshness", "provenance"} <= top_k
+    assert {"evidence", "evidence_gap", "data_quality", "freshness", "provenance"} <= gaps
+    assert not ({"quantum_signal", "provider_free_text"} & top_k)
+
+
+@pytest.mark.parametrize(
+    "provider_frame",
+    [
+        plan("collection_analysis", operation="ANALYZE_COLLECTION", requested_dimensions=["recommendation", "evidence_gap"]),
+        plan("collection_analysis", operation="RECOMMEND_TOP_K", requested_dimensions=["recommendation", "missing_data"]),
+        plan("product_filter", operation="CREATE", requested_dimensions=["recommendation", "evidence_gaps"]),
+        plan("unknown", operation="CREATE", requested_dimensions=["recommendation", "data_gap_analysis"], clarification_required=True),
+        plan("collection_analysis", operation="ANALYZE_COLLECTION", requested_dimensions=["decision", "证据缺口"]),
+        plan("product_filter", operation="CREATE", requested_dimensions=["recommendation", "missing_information"]),
+        plan("collection_analysis", operation="RECOMMEND_TOP_K", requested_dimensions=["recommendation", "source_gap"]),
+        plan("collection_analysis", operation="CREATE", requested_dimensions=["recommendation", "data_completeness"]),
+        plan("product_filter", operation="CREATE", requested_dimensions=["recommendation", "incomplete_data"]),
+        plan("unknown", operation="CREATE", requested_dimensions=["recommendation", "evidence_quality"], clarification_required=True),
+    ],
+)
+def test_collection_semantic_anchor_is_repeatable_across_legal_frame_variants(provider_frame):
+    parsed, understood = validate_semantic_plan(
+        provider_frame,
+        "请分析当前候选池里最值得继续研究的三个商品方向，并说明证据缺口",
+    )
+
+    assert parsed.name == understood.intent == "collection_analysis"
+    assert understood.operation == "RECOMMEND_TOP_K"
+    assert understood.collection_reference == "candidate_pool"
+    assert understood.top_k == 3
+    assert understood.evidence_gap_requested is True
+    assert understood.requested_dimensions == ["recommendation", "decision", "evidence", "evidence_gap"]
+    assert understood.planned_tools == ["analyze_collection"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "请分析候选集合中最值得进一步验证的三个方向，并列出资料缺口",
+        "从当前候选里挑三个优先研究对象，同时说明还缺哪些证据",
+        "候选池前3个值得调研的方向有哪些，数据哪里不完整",
+        "这批候选最值得研究的三个是什么，还需要补充什么资料",
+    ],
+)
+def test_collection_analysis_paraphrases_share_one_backend_intent(query):
+    parsed, understood = validate_semantic_plan(
+        plan("product_filter", requested_dimensions=["recommendation", "missing_information"]),
+        query,
+    )
+
+    assert parsed.name == understood.intent == "collection_analysis"
+    assert understood.operation == "RECOMMEND_TOP_K"
+    assert understood.evidence_gap_requested is True
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "找净利率超过30%且低风险的商品",
+        "从公司商品库筛出利润高于1000且低风险的商品",
+        "在候选池里只保留合规通过并且净利率不低于20%的商品",
+    ],
+)
+def test_explicit_constraint_queries_remain_product_filters(query):
+    parsed, understood = validate_semantic_plan(
+        plan("product_filter", requested_dimensions=["filters", "profit", "risk", "compliance"]),
+        query,
+    )
+
+    assert parsed.name == understood.intent == "product_filter"
 
 
 def test_t01_profit_semantic_uses_backend_profit_plan():
@@ -525,6 +698,24 @@ def test_t05_unknown_tool_suggestion_remains_sem009():
             "商品甲利润如何",
         )
     assert (caught.value.rule_id, caught.value.reason_code) == ("SEM009", "UNSUPPORTED_ACTION")
+
+
+def test_collection_unknown_tool_suggestion_is_advisory_and_never_executed():
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "collection_analysis",
+            operation="RECOMMEND_TOP_K",
+            requested_dimensions=["recommendation", "evidence_gap"],
+            planned_tools=["provider_invented_collection_tool"],
+            top_k=3,
+        ),
+        "当前候选池里挑三个值得研究的方向，并说明证据缺口",
+    )
+
+    assert parsed.policy.allowed_tools == ("analyze_collection",)
+    assert understood.planned_tools == ["analyze_collection"]
+    assert understood.advisory_tool_mismatch == ["provider_invented_collection_tool"]
+    assert "provider_invented_collection_tool" not in understood.planned_tools
 
 
 def test_t06_registered_irrelevant_advisory_tool_is_ignored_not_executed():

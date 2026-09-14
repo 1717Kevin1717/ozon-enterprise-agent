@@ -43,6 +43,7 @@ def _policy(tools: tuple[str, ...], max_calls: int, dimensions: tuple[str, ...],
         "count_products", "filter_products", "search_products", "get_product", "compare_products", "calculate_profit",
         "get_sales_trend", "get_price_trend", "analyze_competition", "simulate_price_change",
         "find_historical_failures", "search_company_memory", "search_company_knowledge",
+        "analyze_collection",
     }
     return IntentPolicy(tools, max_calls, dimensions, selection, tuple(sorted(known - set(tools))), fast)
 
@@ -90,6 +91,13 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
     top_limit = _number_after([r"(?:最值得|优先|前|top|推荐)\s*(\d+)\s*(?:个|件|款)?", r"选出.*?(\d+)\s*(?:个|件|款)"], normalized)
     filter_limit = _number_after([r"(?:找|给|返回|筛出|保留)\s*(\d+)\s*(?:个|件|款)"], normalized)
     limit = max(1, min(20, int(top_limit or 10)))
+    collection_scope = bool(re.search(r"候选池|候选集合|商品池|当前候选|这批(?:商品|候选)?|公司商品库|企业商品库|当前(?:结果|集合)", normalized))
+    single_recommendation = bool(re.search(r"推荐\s*(?:一|1)个", normalized)) and not re.search(r"证据|缺口|分析.*集合|分析.*池", normalized)
+    collection_analysis = collection_scope and not single_recommendation and bool(re.search(
+        r"分析|研究|方向|推荐|优先|最值得|挑|前\s*[一二三四五\d]+|top\s*\d+|证据缺口|缺.*(?:证据|资料|数据)|重新?排|重排",
+        normalized,
+        re.I,
+    ))
     # A percentage after the colloquial "利润" is a margin constraint, while
     # absolute-profit questions remain handled by the normal profit intent.
     margin_term = r"(?:净利率|净利润率|利润率|毛利率|净利润|利润)"
@@ -125,6 +133,21 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
         return ParsedIntent("compliance_policy", plan=(), policy=_policy((), 0, ("compliance", "decision"), fast=True))
     if ranking_policy or recommendation_gate_policy:
         return ParsedIntent("recommendation_policy", plan=(), policy=_policy((), 0, ("recommendation_policy", "decision"), fast=True))
+    if collection_analysis:
+        dimensions = ["recommendation", "decision"]
+        for dimension, pattern in (
+            ("profit", r"利润|净利率|赚钱"), ("roi", r"\broi\b"), ("risk", r"风险"),
+            ("demand", r"需求|销量|趋势"), ("competition", r"竞争"), ("compliance", r"合规"),
+        ):
+            if re.search(pattern, normalized, re.I):
+                dimensions.append(dimension)
+        if re.search(r"证据|缺口|缺失|资料|数据不足", normalized):
+            dimensions.extend(["evidence", "evidence_gap"])
+        return ParsedIntent(
+            "collection_analysis", limit=limit if top_limit else 3,
+            plan=({"tool": "analyze_collection", "purpose": "按后端门禁、评分和证据质量分析候选集合"},),
+            policy=_policy(("analyze_collection",), 1, tuple(dict.fromkeys(dimensions)), fast=False),
+        )
     if price_lookup:
         return ParsedIntent("product_price", selected_product_ids=selected, plan=({"tool": "get_product", "purpose": "读取唯一解析商品的价格字段"},), policy=_policy(("get_product",), 1, ("price",), selection="query_first", fast=True))
     if risk_fact:

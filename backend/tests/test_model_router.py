@@ -107,7 +107,7 @@ def test_model_router_capabilities_and_multimodal_boundary():
     deepseek = MockProvider("deepseek", reasoning=True)
     router = ModelRouter([qwen, deepseek], primary_name="qwen", reasoning_name="deepseek")
 
-    assert [item.provider_name for item in router.semantic_candidates()] == ["qwen", "deepseek"]
+    assert [item.provider_name for item in router.semantic_candidates()] == ["qwen"]
     assert [item.provider_name for item in router.semantic_candidates(has_multimodal_input=True)] == ["qwen"]
     assert qwen.capabilities.supports_multimodal
     assert not deepseek.capabilities.supports_multimodal
@@ -192,14 +192,31 @@ def test_p03_qwen_only_semantic_validation_failure_never_calls_fallback(determin
     assert result["fallback_reason"] == "SEMANTIC_PLAN_VALIDATION_FAILED"
 
 
-def test_p04_auto_keeps_existing_semantic_fallback_order():
+def test_p04_auto_semantic_route_uses_primary_only():
     qwen = MockProvider("qwen")
     deepseek = MockProvider("deepseek", reasoning=True)
     router = ModelRouter([qwen, deepseek], primary_name="qwen", reasoning_name="deepseek")
 
     candidates = router.semantic_candidates(policy=ProviderExecutionPolicy("AUTO"))
 
-    assert [item.provider_name for item in candidates] == ["qwen", "deepseek"]
+    assert [item.provider_name for item in candidates] == ["qwen"]
+
+
+def test_explicit_semantic_fallback_is_opt_in_and_qwen_only_still_excludes_it():
+    qwen = MockProvider("qwen")
+    deepseek = MockProvider("deepseek", reasoning=True)
+    router = ModelRouter(
+        [qwen, deepseek],
+        primary_name="qwen",
+        reasoning_name="deepseek",
+        semantic_fallback_name="deepseek",
+    )
+
+    assert [item.provider_name for item in router.semantic_candidates()] == ["qwen", "deepseek"]
+    assert [
+        item.provider_name
+        for item in router.semantic_candidates(policy=ProviderExecutionPolicy("QWEN_ONLY"))
+    ] == ["qwen"]
 
 
 def test_p05_request_constraint_overrides_global_auto_candidate_set():
@@ -210,7 +227,7 @@ def test_p05_request_constraint_overrides_global_auto_candidate_set():
     auto = router.semantic_candidates()
     constrained = router.semantic_candidates(policy=ProviderExecutionPolicy("QWEN_ONLY"))
 
-    assert [item.provider_name for item in auto] == ["qwen", "deepseek"]
+    assert [item.provider_name for item in auto] == ["qwen"]
     assert [item.provider_name for item in constrained] == ["qwen"]
 
 
@@ -313,7 +330,7 @@ def test_nl04_nl05_contextual_profit_routes_qwen_then_backend(deterministic_clie
     assert {item["tool_name"] for item in result["tool_results"]} == {"get_product", "calculate_profit"}
 
 
-def test_qwen_technical_failure_falls_back_once_to_deepseek(deterministic_client, monkeypatch):
+def test_qwen_semantic_failure_preserves_primary_error_without_reasoner_fallback(deterministic_client, monkeypatch):
     headers, items = seed(deterministic_client, "model-router-fallback")
     target = by_title(items, "桌面理线器")
     query = target["title"] + "目前挂的什么价"
@@ -323,14 +340,35 @@ def test_qwen_technical_failure_falls_back_once_to_deepseek(deterministic_client
 
     result = ask(deterministic_client, headers, query)
 
-    assert len(qwen.calls) == 1 and len(deepseek.calls) == 1
-    assert result["active_provider"] == "deepseek"
-    assert result["response_type"] == "simple_fact"
+    assert len(qwen.calls) == 1 and deepseek.calls == []
+    assert result["active_provider"] == "deterministic_planner"
+    assert result["response_type"] == "clarification"
     assert result["fallback_used"] is True
     assert result["fallback_reason"] == "NETWORK_TIMEOUT"
     assert result["requested_provider"] == "qwen"
-    assert result["fallback_provider"] == "deepseek"
-    assert [item["status"] for item in result["provider_calls"]] == ["failed", "success"]
+    assert result["fallback_provider"] is None
+    assert [item["status"] for item in result["provider_calls"]] == ["failed"]
+
+
+def test_sem004_diagnostics_are_safe_and_reasoner_is_not_called(deterministic_client, monkeypatch):
+    headers, items = seed(deterministic_client, "model-router-sem004-diagnostics")
+    target = by_title(items, "桌面理线器")
+    invalid = frame("product_detail", ["unsupported_signal"], [], mentions=[target["title"]])
+    qwen = MockProvider("qwen", [invalid])
+    deepseek = MockProvider("deepseek", [frame("product_detail", ["profit"], [], context=True)], reasoning=True)
+    install_router(monkeypatch, ModelRouter([qwen, deepseek], primary_name="qwen", reasoning_name="deepseek"))
+
+    result = ask(deterministic_client, headers, target["title"] + "情况如何")
+
+    assert len(qwen.calls) == 1
+    assert deepseek.calls == []
+    assert result["fallback_reason"] == "SEMANTIC_PLAN_VALIDATION_FAILED"
+    audit = result["provider_calls"][0]
+    assert audit["validation_rule_id"] == "SEM004"
+    assert audit["semantic_operation"] == "CREATE"
+    assert audit["raw_requested_dimensions"] == ["unsupported_signal"]
+    assert audit["canonical_requested_dimensions"] == []
+    assert audit["normalization_failures"] == ["unsupported_signal"]
 
 
 def test_provider_transport_diagnostics_reach_agent_audit(deterministic_client, monkeypatch):

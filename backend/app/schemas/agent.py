@@ -23,6 +23,7 @@ ResponseType = Literal[
     "product_detail",
     "filter_result",
     "comparison_result",
+    "collection_report",
     "decision_report",
     "policy_answer",
     "insufficient_data",
@@ -42,6 +43,8 @@ TaskOperation = Literal[
     "INSPECT", "COMPARE", "RECOMMEND", "EXPLAIN", "RECOVER",
     "SIMULATE", "CANCEL",
     "ARGMAX", "ARGMIN", "EXPLAIN_RANKING",
+    "ANALYZE_COLLECTION", "RECOMMEND_TOP_K", "IDENTIFY_EVIDENCE_GAPS",
+    "RERANK_COLLECTION", "COMPARE_COLLECTION_MEMBERS",
 ]
 
 EntityRole = Literal[
@@ -103,6 +106,33 @@ class RecommendationState(BaseModel):
     source_task_revision: int = Field(default=0, ge=0)
 
 
+class CollectionState(BaseModel):
+    """Session-local collection membership and ordering; never cached business facts."""
+
+    model_config = ConfigDict(extra="forbid")
+    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
+    product_ids: list[str] = Field(default_factory=list, max_length=100)
+    ranked_product_ids: list[str] = Field(default_factory=list, max_length=100)
+    top_product_ids: list[str] = Field(default_factory=list, max_length=20)
+    top_k: int = Field(default=3, ge=1, le=20)
+    ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    requested_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    require_gate_pass: bool = True
+    exclude_insufficient_data: bool = False
+    source_task_revision: int = Field(default=0, ge=0)
+    created_turn: int = Field(default=1, ge=1)
+
+
+class FocusedCollectionMemberState(BaseModel):
+    """A member focus never replaces the source collection or its ordering."""
+
+    model_config = ConfigDict(extra="forbid")
+    product_id: str
+    original_ordinal: int = Field(ge=1)
+    source_collection_revision: int = Field(default=0, ge=0)
+    focus_operation: Literal["EXPLAIN_RANKING", "IDENTIFY_EVIDENCE_GAPS"]
+
+
 class TaskState(BaseModel):
     """Session-scoped, backend-controlled task continuity; never LLM facts."""
 
@@ -118,6 +148,8 @@ class TaskState(BaseModel):
     active_result_set: ResultSetState | None = None
     active_comparison_set: ComparisonState | None = None
     active_recommendation: RecommendationState | None = None
+    active_collection: CollectionState | None = None
+    focused_collection_member: FocusedCollectionMemberState | None = None
     filter_spec: dict[str, Any] = Field(default_factory=dict)
     sort_spec: list[str] = Field(default_factory=list, max_length=10)
     ranking_spec: list[str] = Field(default_factory=list, max_length=10)
@@ -145,6 +177,13 @@ class SemanticTaskContextPacket(BaseModel):
     pending_entity_statuses: list[str] = Field(default_factory=list, max_length=10)
     has_active_recommendation: bool = False
     recommendation_candidate_count: int = Field(default=0, ge=0, le=100)
+    active_collection_type: str = ""
+    collection_member_count: int = Field(default=0, ge=0, le=100)
+    collection_top_count: int = Field(default=0, ge=0, le=20)
+    collection_top_k: int = Field(default=0, ge=0, le=20)
+    collection_ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    has_focused_collection_member: bool = False
+    has_collection_ranking_state: bool = False
     has_active_scenario: bool = False
     last_successful_action: str | None = None
 
@@ -242,7 +281,14 @@ class QueryUnderstanding(BaseModel):
     filter_updates: dict[str, Any] = Field(default_factory=dict)
     sort_updates: list[str] = Field(default_factory=list, max_length=10)
     result_set_reference: bool = False
+    collection_reference: Literal[
+        "candidate_pool", "active_result_set", "company_catalog", "current_collection"
+    ] | None = None
+    top_k: int | None = Field(default=None, ge=1, le=20)
+    evidence_gap_requested: bool = False
+    exclude_insufficient_data: bool = False
     ordinal_reference: int | None = Field(default=None, ge=1, le=100)
+    ordinal_references: list[int] = Field(default_factory=list, max_length=10)
     negative_scope: list[str] = Field(default_factory=list, max_length=20)
     preference_order: list[str] = Field(default_factory=list, max_length=10)
     comparison_requested: bool = False
@@ -299,6 +345,11 @@ class ProviderCallAudit(BaseModel):
     validation_rule_id: str | None = None
     validation_reason_code: str | None = None
     validation_field: str | None = None
+    semantic_operation: str | None = None
+    reference_slots: list[str] = Field(default_factory=list, max_length=10)
+    raw_requested_dimensions: list[str] = Field(default_factory=list, max_length=20)
+    canonical_requested_dimensions: list[str] = Field(default_factory=list, max_length=20)
+    normalization_failures: list[str] = Field(default_factory=list, max_length=20)
     latency_ms: int | None = Field(default=None, ge=0)
     token_usage: dict[str, Any] = Field(default_factory=dict)
 
@@ -482,6 +533,54 @@ class AgentEvidence(BaseModel):
         return self
 
 
+class CollectionEvidenceGap(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: Literal[
+        "MISSING", "STALE", "LOW_CONFIDENCE", "NO_PROVENANCE",
+        "INSUFFICIENT_SAMPLE", "NEEDS_HUMAN_REVIEW",
+    ]
+    field: str = ""
+    dimension: str = ""
+    reason: str
+    next_action: str
+
+
+class CollectionCandidateResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: str
+    title: str
+    relative_rank: int = Field(ge=1)
+    original_ordinal: int | None = Field(default=None, ge=1)
+    source_collection_revision: int | None = Field(default=None, ge=0)
+    decision_status: str
+    eligible: bool
+    recommendation_score: float
+    ranking_reasons: list[str] = Field(default_factory=list, max_length=20)
+    key_positives: list[str] = Field(default_factory=list, max_length=20)
+    main_risks: list[str] = Field(default_factory=list, max_length=20)
+    evidence_gaps: list[CollectionEvidenceGap] = Field(default_factory=list, max_length=100)
+    next_evidence_actions: list[str] = Field(default_factory=list, max_length=20)
+
+
+class CollectionAnalysisResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
+    member_count: int = Field(ge=0)
+    eligible_count: int = Field(ge=0)
+    requested_top_k: int = Field(ge=1, le=20)
+    returned_top_k: int = Field(ge=0, le=20)
+    shortfall: int = Field(ge=0, le=20)
+    ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
+    require_gate_pass: bool = True
+    exclude_insufficient_data: bool = False
+    member_product_ids: list[str] = Field(default_factory=list, max_length=100)
+    ranked_product_ids: list[str] = Field(default_factory=list, max_length=100)
+    top_product_ids: list[str] = Field(default_factory=list, max_length=20)
+    candidates: list[CollectionCandidateResult] = Field(default_factory=list, max_length=20)
+    ineligible_status_counts: dict[str, int] = Field(default_factory=dict)
+    notice: str = ""
+
+
 class AgentRunResult(BaseModel):
     """Stable response contract shared by GLM and deterministic fallback."""
 
@@ -535,6 +634,7 @@ class AgentRunResult(BaseModel):
     decision_status: str = "NOT_APPLICABLE"
     decision_summary: dict[str, Any] = Field(default_factory=dict)
     data_sufficiency: DataSufficiencyResult | None = None
+    collection_analysis: CollectionAnalysisResult | None = None
     task_state: TaskState = Field(default_factory=TaskState)
 
     # Compatibility fields retained for the existing API and UI during V2 migration.

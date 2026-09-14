@@ -6,7 +6,10 @@ from uuid import uuid4
 
 from app.agent.intent_engine import ParsedIntent, _policy
 from app.agent.tool_registry import FilterProductsInput
-from app.schemas.agent import ComparisonState, RecommendationState, ResultSetState, TaskEntitySlot, TaskState
+from app.schemas.agent import (
+    CollectionState, ComparisonState, FocusedCollectionMemberState,
+    RecommendationState, ResultSetState, TaskEntitySlot, TaskState,
+)
 
 
 _TASK_NOUN = re.compile(r"筛选|条件|结果|排序|排名|比较|对比|任务")
@@ -22,6 +25,15 @@ _RANKING_REASON = re.compile(r"(?=.*(?:第一|榜首|第1))(?=.*(?:第二|第2))
 _RECOMMENDATION_REASON = re.compile(r"为什么|为何|原因|依据")
 _RECOMMENDATION_EVIDENCE = re.compile(r"来源|来自|出处|追溯")
 _RECOMMENDATION_FRESHNESS = re.compile(r"过期|新鲜|时效|多久|旧了")
+_COLLECTION_ORDINAL = re.compile(r"第[一二两三四五六七八九十\d]+个|第一名|第二名|第三名")
+_COLLECTION_GAPS = re.compile(r"证据缺口|缺什么证据|还缺.*(?:证据|资料|数据)|数据不足")
+_COLLECTION_RERANK = re.compile(r"重排|重新?排|只看|优先")
+_RANKING_MUTATION = re.compile(r"重新?排|再排|重排|排序|只看|优先|权重")
+_STRONG_RANKING_MUTATION = re.compile(r"重新?排|再排|重排|排序")
+_FILTER_CONSTRAINT = re.compile(
+    r"重新筛|筛出|筛选|只保留|排除|剔除|(?:高于|低于|大于|小于|至少|不低于|不高于|不超过|等于|=|>|<)\s*\d",
+    re.I,
+)
 _ENTITY_STATUSES = {
     "EXACT_MATCH", "NORMALIZED_MATCH", "UNIQUE_ALIAS_MATCH", "FUZZY_UNIQUE_MATCH",
     "AMBIGUOUS", "NOT_FOUND", "LOW_CONFIDENCE",
@@ -39,6 +51,15 @@ def _comparison_dimensions(query: str, current: list[str]) -> list[str]:
     if re.search(r"再加|加上|补充", query):
         return list(dict.fromkeys([*current, *found]))
     return found
+
+
+def is_collection_rerank_query(query: str) -> bool:
+    """Recognize ranking mutation syntax without turning filter constraints into reranks."""
+    return bool(
+        _RANKING_MUTATION.search(query)
+        and _comparison_dimensions(query, [])
+        and not _FILTER_CONSTRAINT.search(query)
+    )
 
 
 def load_task_state(raw_state: dict | None, valid_product_ids: set[str]) -> TaskState:
@@ -59,6 +80,11 @@ def load_task_state(raw_state: dict | None, valid_product_ids: set[str]) -> Task
         recommendation.ordered_candidates = [value for value in recommendation.ordered_candidates if value in valid_product_ids]
         if recommendation.selected_product_id not in valid_product_ids:
             state.active_recommendation = None
+    if state.active_collection:
+        collection = state.active_collection
+        collection.product_ids = [value for value in collection.product_ids if value in valid_product_ids]
+        collection.ranked_product_ids = [value for value in collection.ranked_product_ids if value in valid_product_ids]
+        collection.top_product_ids = [value for value in collection.top_product_ids if value in valid_product_ids]
     for entity in state.pending_entities:
         if entity.product_id and entity.product_id not in valid_product_ids:
             entity.product_id = None
@@ -136,7 +162,20 @@ def _extreme_metric(query: str) -> tuple[str, str, str]:
 
 def task_mutation_intent(query: str, state: TaskState, selected=(), explicit_entity_mentions=()) -> tuple[ParsedIntent, dict] | None:
     """Recognize only structural task operations; never infer product identity."""
-    if state.status == "EMPTY":
+    rerank_requested = is_collection_rerank_query(query)
+    recommendation_policy_question = bool(
+        re.search(r"第一名|第1名|相对排名|排在第一", query)
+        and re.search(r"推荐|上架", query)
+        and re.search(r"代表|是不是|是否|意味着|等于", query)
+    )
+    orphan_collection_rerank = bool(
+        rerank_requested
+        and _STRONG_RANKING_MUTATION.search(query)
+        and not selected
+        and not explicit_entity_mentions
+        and not recommendation_policy_question
+    )
+    if state.status == "EMPTY" and not orphan_collection_rerank:
         return None
     operation = None
     filters = dict(state.filter_spec)
@@ -145,6 +184,55 @@ def task_mutation_intent(query: str, state: TaskState, selected=(), explicit_ent
         not explicit_entity_mentions and re.search(r"推荐|维持", query)
     )
     recommendation = state.active_recommendation if recommendation_reference else None
+    collection = state.active_collection
+    if collection:
+        dimensions = _comparison_dimensions(query, collection.ranking_dimensions)
+        evidence_requested = bool(_COLLECTION_GAPS.search(query))
+        exclude_insufficient = bool(re.search(r"排除|不要|去掉|剔除", query) and re.search(r"证据不足|数据不足|不充分|INSUFFICIENT", query, re.I))
+        operation = None
+        if evidence_requested and (_COLLECTION_ORDINAL.search(query) or re.search(r"它|这个|该商品|刚才", query)):
+            operation = "IDENTIFY_EVIDENCE_GAPS"
+        elif rerank_requested and dimensions:
+            operation = "RERANK_COLLECTION"
+        elif exclude_insufficient:
+            operation = "REFINE"
+        elif _COLLECTION_ORDINAL.search(query) and re.search(r"为什么|为何|原因|依据", query):
+            operation = "EXPLAIN_RANKING"
+        elif re.search(r"这(?:三|几)个.*(?:人工|调研|研究)|哪个.*(?:人工|调研|研究)", query):
+            operation = "RECOMMEND_TOP_K"
+        if operation:
+            requested = tuple(dict.fromkeys([
+                *(dimensions or collection.requested_dimensions or ["recommendation", "decision"]),
+                *(["evidence", "evidence_gap"] if evidence_requested else []),
+            ]))
+            parsed = ParsedIntent(
+                "collection_analysis", limit=collection.top_k,
+                plan=({"tool": "analyze_collection", "purpose": "按当前集合状态重新执行后端门禁、排序与证据缺口分析"},),
+                policy=_policy(("analyze_collection",), 1, requested, selection="ignore"),
+            )
+            return parsed, {
+                "operation": operation, "filter_updates": {}, "requires_task_state": True,
+                "requires_context": True, "sort_updates": dimensions,
+                "collection_reference": "current_collection",
+                "exclude_insufficient_data": exclude_insufficient,
+            }
+    if (
+        orphan_collection_rerank
+        and not state.active_result_set
+        and not state.active_comparison_set
+    ):
+        dimensions = _comparison_dimensions(query, [])
+        parsed = ParsedIntent(
+            "collection_analysis",
+            plan=({"tool": "analyze_collection", "purpose": "按当前集合状态重新执行后端排序"},),
+            policy=_policy(("analyze_collection",), 1, tuple(dimensions), selection="ignore", fast=True),
+        )
+        return parsed, {
+            "operation": "RERANK_COLLECTION", "filter_updates": {},
+            "requires_task_state": True, "requires_context": True,
+            "sort_updates": dimensions, "collection_reference": "current_collection",
+            "deterministic": True,
+        }
     if recommendation and _RECOMMENDATION_FRESHNESS.search(query) and re.search(r"推荐|维持|继续", query):
         parsed = ParsedIntent(
             "decision_explanation", selected_product_ids=(recommendation.selected_product_id,),
@@ -254,6 +342,7 @@ def evolve_task_state(
     product_ids: list[str], filters: dict, dimensions: list[str], task_completed: bool,
     resolved_product_ids: list[str] | None = None, requested_entities=(),
     ranking_spec: list[str] | None = None, recommendation: dict | None = None,
+    collection: dict | None = None,
 ) -> TaskState:
     if not task_completed:
         slots = []
@@ -274,7 +363,7 @@ def evolve_task_state(
         })
     task_id = previous.task_id or uuid4().hex
     revision = previous.revision + 1
-    if operation in {"INSPECT", "ARGMAX", "ARGMIN", "EXPLAIN_RANKING"}:
+    if operation in {"INSPECT", "ARGMAX", "ARGMIN", "EXPLAIN_RANKING"} and intent != "collection_analysis":
         return previous.model_copy(deep=True, update={
             "task_id": task_id, "revision": revision, "operation": operation,
             "active_entities": product_ids[:10] or previous.active_entities,
@@ -305,4 +394,34 @@ def evolve_task_state(
         )
     if intent == "selection_recommendation" and recommendation:
         state.active_recommendation = RecommendationState.model_validate(recommendation)
+    if intent == "collection_analysis" and collection:
+        if previous.active_collection and operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING"}:
+            state.active_collection = previous.active_collection.model_copy(deep=True)
+            if len(product_ids) == 1:
+                source_order = (
+                    previous.active_collection.top_product_ids
+                    or previous.active_collection.ranked_product_ids
+                    or previous.active_collection.product_ids
+                )
+                ordinal = source_order.index(product_ids[0]) + 1 if product_ids[0] in source_order else 1
+                state.focused_collection_member = FocusedCollectionMemberState(
+                    product_id=product_ids[0], original_ordinal=ordinal,
+                    source_collection_revision=previous.active_collection.source_task_revision,
+                    focus_operation=operation,
+                )
+        else:
+            state.active_collection = CollectionState(
+                collection_type=collection["collection_type"],
+                product_ids=collection.get("member_product_ids") or [],
+                ranked_product_ids=collection.get("ranked_product_ids") or [],
+                top_product_ids=collection.get("top_product_ids") or [],
+                top_k=collection.get("requested_top_k") or 3,
+                ranking_dimensions=collection.get("ranking_dimensions") or ["recommendation"],
+                requested_dimensions=dimensions[:10],
+                require_gate_pass=bool(collection.get("require_gate_pass", True)),
+                exclude_insufficient_data=bool(collection.get("exclude_insufficient_data", False)),
+                source_task_revision=revision,
+                created_turn=turn_index,
+            )
+            state.focused_collection_member = None
     return state

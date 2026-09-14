@@ -152,10 +152,12 @@ async def dual_model_agent_ask(
     provider_result = None
     requested_provider = router.primary_name
     failure_code = "PROVIDER_NOT_CONFIGURED"
+    primary_failure_code: str | None = None
     provider_failures: list[str] = []
     provider_calls: list[dict[str, Any]] = []
     primary = router.provider(requested_provider)
     if not primary or not primary.configured:
+        primary_failure_code = failure_code
         provider_failures.append(failure_code)
         provider_calls.append({
             "requested_provider": requested_provider, "actual_provider": requested_provider,
@@ -186,6 +188,7 @@ async def dual_model_agent_ask(
             break
         except ProviderFailure as exc:
             failure_code = exc.code
+            primary_failure_code = primary_failure_code or failure_code
             provider_failures.append(exc.code)
             provider_calls.append({
                 "requested_provider": requested_provider, "actual_provider": provider.provider_name,
@@ -196,6 +199,7 @@ async def dual_model_agent_ask(
             })
         except SemanticPlanValidationFailure as exc:
             failure_code = exc.failure_code
+            primary_failure_code = primary_failure_code or failure_code
             provider_failures.append(failure_code)
             provider_calls.append({
                 "requested_provider": requested_provider, "actual_provider": provider.provider_name,
@@ -205,9 +209,15 @@ async def dual_model_agent_ask(
                 "upstream_status": candidate.upstream_status if candidate else None,
                 "validation_rule_id": exc.rule_id, "validation_reason_code": exc.reason_code,
                 "validation_field": exc.field,
+                "semantic_operation": exc.diagnostics.get("semantic_operation"),
+                "reference_slots": exc.diagnostics.get("reference_slots", []),
+                "raw_requested_dimensions": exc.diagnostics.get("raw_requested_dimensions", []),
+                "canonical_requested_dimensions": exc.diagnostics.get("canonical_requested_dimensions", []),
+                "normalization_failures": exc.diagnostics.get("normalization_failures", []),
             })
         except (ValueError, TypeError) as exc:
             failure_code = "SEMANTIC_PLAN_VALIDATION_FAILED"
+            primary_failure_code = primary_failure_code or failure_code
             provider_failures.append(failure_code)
             provider_calls.append({
                 "requested_provider": requested_provider, "actual_provider": provider.provider_name,
@@ -223,6 +233,7 @@ async def dual_model_agent_ask(
         **item,
     } for item in provider_calls]
     if provider_result is None:
+        failure_code = primary_failure_code or failure_code
         parsed = semantic_policy("unknown", ())
         understanding = understanding.model_copy(update={
             "intent": "unknown", "question_type": "unknown", "route": "CLARIFICATION",

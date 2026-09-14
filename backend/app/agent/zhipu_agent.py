@@ -19,6 +19,7 @@ from app.agent.tools import (
     count_products,
     event,
     filter_products,
+    analyze_collection,
     find_historical_failures,
     get_product,
     get_sales_trend,
@@ -35,6 +36,7 @@ from app.repositories.products import ProductRepository
 ZHIPU_TOOL_NAMES = (
     "count_products",
     "filter_products",
+    "analyze_collection",
     "search_products",
     "get_product",
     "compare_products",
@@ -154,6 +156,8 @@ async def _dispatch_tool(session: AsyncSession, company_id: str, role: str, name
         return await count_products(repo, role)
     if name == "filter_products":
         return await filter_products(repo, role, **arguments)
+    if name == "analyze_collection":
+        return await analyze_collection(repo, role, **arguments)
     if name == "search_products":
         return await search_products(repo, arguments["keyword"], role)
     if name == "get_product":

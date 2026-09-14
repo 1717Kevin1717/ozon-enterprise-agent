@@ -182,6 +182,7 @@ async def _execute(case: GoldenCase) -> dict:
                 model_router = ModelRouter(
                     providers, primary_name="qwen", reasoning_name="deepseek",
                     data_mode="mock_only" if mode == "qwen_reasoning" else "disabled",
+                    semantic_fallback_name="deepseek" if mode == "qwen_timeout_deepseek" else None,
                 )
                 with patch.object(model_agent, "build_model_router", lambda: model_router):
                     result = await model_agent.dual_model_agent_ask(

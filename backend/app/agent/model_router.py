@@ -37,11 +37,20 @@ class ProviderExecutionPolicy:
 class ModelRouter:
     """Selects model responsibility; it never decides enterprise facts."""
 
-    def __init__(self, providers: list[ModelProvider], *, primary_name: str, reasoning_name: str, data_mode: str = "disabled"):
+    def __init__(
+        self,
+        providers: list[ModelProvider],
+        *,
+        primary_name: str,
+        reasoning_name: str,
+        data_mode: str = "disabled",
+        semantic_fallback_name: str | None = None,
+    ):
         self.providers = {provider.provider_name: provider for provider in providers}
         self.primary_name = primary_name
         self.reasoning_name = reasoning_name
         self.data_mode = data_mode
+        self.semantic_fallback_name = semantic_fallback_name
 
     def provider(self, name: str) -> ModelProvider | None:
         return self.providers.get(name)
@@ -52,7 +61,7 @@ class ModelRouter:
         has_multimodal_input: bool = False,
         policy: ProviderExecutionPolicy | None = None,
     ) -> list[ModelProvider]:
-        """Return the primary plus at most one fallback; never create a retry loop."""
+        """Return the primary and only an explicitly configured semantic fallback."""
         execution_policy = policy or ProviderExecutionPolicy()
         allowed_names = execution_policy.allowed_names(self.primary_name)
         if allowed_names is not None:
@@ -70,13 +79,15 @@ class ModelRouter:
             not has_multimodal_input or primary.capabilities.supports_multimodal
         ):
             result.append(primary)
-        if has_multimodal_input:
-            return result
-        fallback = self.provider(self.reasoning_name)
-        if not fallback or not fallback.configured or not fallback.capabilities.supports_tool_planning:
-            fallback = self.provider("zhipu")
-        if fallback and fallback.configured and fallback.capabilities.supports_tool_planning and fallback not in result:
-            result.append(fallback)
+        if not has_multimodal_input and self.semantic_fallback_name:
+            fallback = self.provider(self.semantic_fallback_name)
+            if (
+                fallback
+                and fallback.configured
+                and fallback.capabilities.supports_tool_planning
+                and fallback not in result
+            ):
+                result.append(fallback)
         return result[:2]
 
     def semantic_route(
@@ -145,6 +156,36 @@ def build_model_router() -> ModelRouter:
 def semantic_context_slots(packet: dict) -> dict:
     """Remove tenant/session/product identities before any external semantic call."""
     task = dict(packet.get("task_context") or {})
+    rule = dict(packet.get("rule_understanding") or {})
+    if rule.get("intent") == "collection_analysis" or task.get("active_task_type") == "collection_analysis":
+        references = list(packet.get("reference_candidates") or [])
+        available_sources = [
+            source for source, key in (
+                ("ui_selection", "current_selected_product_ids"),
+                ("last_explicit_entity", "last_explicit_product_ids"),
+                ("last_resolved_entity", "last_resolved_product_ids"),
+                ("last_comparison", "last_comparison_order"),
+            ) if packet.get(key)
+        ]
+        top_count = int(task.get("collection_top_count") or 0)
+        operation = rule.get("operation") or task.get("active_operation") or "ANALYZE_COLLECTION"
+        return {
+            "collection_type": task.get("active_collection_type") or rule.get("collection_reference") or "",
+            "collection_scope": rule.get("collection_reference") or "current_collection",
+            "operation": operation,
+            "top_k": rule.get("top_k") or task.get("collection_top_k") or None,
+            "requested_dimensions": list(rule.get("requested_dimensions") or task.get("active_dimensions") or []),
+            "ranking_dimensions": list(rule.get("sort_updates") or task.get("collection_ranking_dimensions") or []),
+            "reference_role": available_sources,
+            "ordinal_reference": [item for item in references if "第" in item or "名" in item],
+            "has_active_collection": bool(task.get("active_collection_type")),
+            "has_focused_member": bool(task.get("has_focused_collection_member")),
+            "has_ranking_state": bool(task.get("has_collection_ranking_state")),
+            "evidence_gap_requested": bool(rule.get("evidence_gap_requested")),
+            "rerank_requested": operation == "RERANK_COLLECTION",
+            "item_slots": [f"ITEM_{index + 1}" for index in range(top_count)],
+            "allowed_tools": list(packet.get("allowed_tools") or []),
+        }
     entity_count = len(task.pop("active_entities_display_names", []) or [])
     task["active_entity_slots"] = [f"T{index + 1}" for index in range(entity_count)]
     return {

@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.tools import filter_products, rule_agent_ask
+from app.agent.tools import analyze_collection, filter_products, rule_agent_ask
 from app.db.models import AgentEvaluation, AgentRun
 from app.repositories.products import ProductRepository
 
@@ -25,7 +25,7 @@ class EvalCase:
 
 CASES = (
     EvalCase("推荐度阈值筛选", "企业有哪些商品分数达到60以上？", {"min_score": 60, "sort_by": "recommendation_score", "sort_direction": "desc"}, 100),
-    EvalCase("Top5优先级", "从候选池选出最值得测试的5个商品，并说明证据和缺口。", {"sort_by": "recommendation_score", "sort_direction": "desc"}, 5),
+    EvalCase("Top5优先级", "从候选池选出最值得测试的5个商品，并说明证据和缺口。", {}, 5, "analyze_collection"),
     EvalCase("数据缺失阻断", "哪些商品因为数据不完整不能进入最终审核？", {"completeness": "incomplete", "sort_by": "completeness", "sort_direction": "asc"}, 100),
     EvalCase("利润与竞争约束", "找利润30%以上，竞争低于40的商品。", {"min_margin_rate": 0.30, "max_competition_score": 40, "sort_by": "margin_rate", "sort_direction": "desc"}, 100),
 )
@@ -59,13 +59,20 @@ async def run_deterministic_suite(session: AsyncSession, company_id: str, user_i
     repo = ProductRepository(session, company_id)
     evaluations: list[AgentEvaluation] = []
     for case in CASES:
-        expected_result = await filter_products(repo, role, **case.filters, limit=case.limit)
+        if case.expected_tool == "analyze_collection":
+            expected_result = await analyze_collection(
+                repo, role, collection_type="candidate_pool", top_k=case.limit,
+                ranking_dimensions=["recommendation"], require_gate_pass=True,
+            )
+        else:
+            expected_result = await filter_products(repo, role, **case.filters, limit=case.limit)
         expected_ids = [str(item["id"]) for item in expected_result.get("data", [])]
+        expected_matched_count = int(expected_result.get("eligible_count", expected_result.get("matched_count", len(expected_ids))))
         actual = await rule_agent_ask(session, company_id, user_id, role, case.query, None, [], response_mode="rule_engine", provider_notice="本次为离线确定性回归评测，不调用外部模型。")
         actual_ids = [str(item["id"]) for item in actual.get("products", [])]
         tools = [str(item.get("tool")) for item in actual.get("trace", []) if item.get("event") == "tool_finished" and item.get("success")]
         answer_accuracy = _accuracy(expected_ids, actual_ids)
-        task_success = 1.0 if expected_ids == actual_ids and actual.get("matched_count") == len(expected_ids) else 0.0
+        task_success = 1.0 if expected_ids == actual_ids and actual.get("matched_count") == expected_matched_count else 0.0
         tool_accuracy = 1.0 if case.expected_tool in tools else 0.0
         completeness_values = [float(item.get("completeness") or 0) / 100 for item in actual.get("products", [])]
         data_completeness = round(sum(completeness_values) / len(completeness_values), 4) if completeness_values else 1.0
@@ -84,7 +91,7 @@ async def run_deterministic_suite(session: AsyncSession, company_id: str, user_i
             data_completeness=data_completeness,
             judge_mode="deterministic_no_llm",
             status=status,
-            details_json={"suite_version": EVAL_SUITE_VERSION, "source_badge": actual.get("source_badge"), "expected_count": len(expected_ids), "actual_count": len(actual_ids)},
+            details_json={"suite_version": EVAL_SUITE_VERSION, "source_badge": actual.get("source_badge"), "expected_count": expected_matched_count, "actual_count": actual.get("matched_count")},
         )
         session.add(row)
         evaluations.append(row)
