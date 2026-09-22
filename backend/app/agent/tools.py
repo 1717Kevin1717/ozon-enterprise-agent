@@ -10,14 +10,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.entity_resolution import EntityResolution, resolve_query_entities, resolution_message
 from app.agent.context import build_context_snapshot, resolve_context_reference
+from app.agent.collection_ranking import rank_collection
 from app.agent.query_understanding import arbitrate_entity_mentions, build_semantic_context_packet, understand_query, semantic_fallback, semantic_policy
 from app.agent.intent_engine import ParsedIntent, parse_intent
 from app.agent.runtime import AgentRunState
+from app.agent.scenario_state import (
+    ScenarioStateError, create_collection_scenario, create_scenario,
+    detect_stale_baseline, detect_stale_collection_baseline,
+    load_scenario_state, remove_override, reset_scenario, scenario_response_view,
+    update_scenario, update_scenario_ranking,
+)
 from app.agent.task_state import evolve_task_state, task_mutation_intent
 from app.agent.tool_registry import TOOL_REGISTRY
 from app.db.models import AgentRun, ConversationMessage, ConversationSession, Memory, Product, uid
 from app.repositories.products import ProductRepository, product_view
-from app.schemas.agent import validate_agent_answer
+from app.schemas.agent import ReferenceResolutionResult, validate_agent_answer
 from app.services.decision_engine import analyze, recommendation_gate_status, simulate_price, to_dict
 from app.services.knowledge_base import search_documents
 from app.services.provenance import FRESHNESS_MAX_AGE_DAYS, evidence_notices, scoped_fields, snapshot_view
@@ -533,17 +540,60 @@ def _collection_strengths_and_risks(view: dict[str, Any]) -> tuple[list[str], li
     return positives[:20], list(dict.fromkeys(risks))[:20]
 
 
-def _collection_metric(view: dict[str, Any], dimension: str) -> float:
+def _collection_metric_value(view: dict[str, Any], field: str):
     analysis = view.get("analysis") or {}
     return {
-        "recommendation": float(analysis.get("recommendation_score") or 0),
-        "profit": float(analysis.get("net_margin") or view.get("current_margin_rate") or 0),
+        "recommendation_score": float(analysis.get("recommendation_score") or 0),
+        "net_profit": float(analysis.get("net_profit") or 0),
+        "net_margin": float(analysis.get("net_margin") or view.get("current_margin_rate") or 0),
         "roi": float(analysis.get("roi") or 0),
-        "risk": {"low": 0.0, "medium": 1.0, "high": 2.0}.get(str(analysis.get("risk_level") or "").casefold(), 3.0),
-        "demand": float(analysis.get("demand_score") or 0),
+        "risk": {"low": 0, "medium": 1, "high": 2}.get(str(analysis.get("risk_level") or "").casefold(), 3),
         "competition": float(analysis.get("competition_score") or 0),
+        "demand": float(analysis.get("demand_score") or 0),
         "compliance": float(analysis.get("compliance_score") or 0),
-    }.get(dimension, float(analysis.get("recommendation_score") or 0))
+        "compliance_status": str(view.get("compliance_status") or "pending").casefold(),
+        "target_margin_rate": float(view.get("target_margin_rate") or 0.30),
+    }.get(field)
+
+
+def _apply_collection_filters(views: list[dict[str, Any]], filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    allowed_fields = {
+        "net_margin", "net_profit", "roi", "risk", "competition", "demand",
+        "compliance", "compliance_status", "evidence_gap",
+    }
+    allowed_operators = {"LT", "LTE", "GT", "GTE", "EQ", "NE", "IN", "NOT_IN", "MISSING", "STALE"}
+
+    def matches(view: dict[str, Any], criterion: dict[str, Any]) -> bool:
+        field = str(criterion.get("field") or "")
+        operator = str(criterion.get("operator") or "").upper()
+        if field not in allowed_fields or operator not in allowed_operators:
+            return False
+        product = _agent_product(view)
+        if field == "evidence_gap":
+            actual = _collection_evidence_gaps(view, product["decision_status"])
+            return bool(actual) if operator == "MISSING" else False
+        if operator == "STALE":
+            return any(
+                gap["code"] == "STALE"
+                for gap in _collection_evidence_gaps(view, product["decision_status"])
+            )
+        actual = _collection_metric_value(view, field)
+        expected = criterion.get("value")
+        if criterion.get("reference_field") == "target_margin_rate":
+            expected = _collection_metric_value(view, "target_margin_rate")
+        if actual is None or expected is None:
+            return False
+        if operator in {"IN", "NOT_IN"}:
+            values = expected if isinstance(expected, list) else [expected]
+            contained = actual in values
+            return contained if operator == "IN" else not contained
+        return {
+            "LT": actual < expected, "LTE": actual <= expected,
+            "GT": actual > expected, "GTE": actual >= expected,
+            "EQ": actual == expected, "NE": actual != expected,
+        }.get(operator, False)
+
+    return [view for view in views if all(matches(view, criterion) for criterion in filters)]
 
 
 async def analyze_collection(repo: ProductRepository, role: str, **arguments: Any) -> dict:
@@ -570,13 +620,23 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
             view["analysis"] = to_dict(analyze(product))
         views.append(view)
 
+    views = _apply_collection_filters(views, list(criteria.get("filters") or []))
     member_ids = [str(item["id"]) for item in views]
     dimensions = list(dict.fromkeys(criteria.get("ranking_dimensions") or ["recommendation"]))
-    for dimension in reversed(dimensions):
+    views = rank_collection(views, dimensions, identity=lambda item: str(item.get("id") or ""))
+    selector = criteria.get("selector") or {}
+    selector_groups = list(selector.get("groups") or [])
+    selector_metric = str(selector.get("metric") or "")
+    if selector_metric in {
+        "recommendation_score", "net_profit", "net_margin", "roi", "risk",
+        "competition", "demand", "compliance",
+    }:
+        descending = str(selector.get("direction") or "DESC").upper() == "DESC"
         views.sort(
-            key=lambda item, dimension=dimension: (_collection_metric(item, dimension), str(item.get("id") or "")),
-            reverse=dimension != "risk",
+            key=lambda item: (_collection_metric_value(item, selector_metric), str(item.get("id") or "")),
+            reverse=descending,
         )
+        criteria["top_k"] = max(1, min(20, int(selector.get("limit") or criteria["top_k"])))
     products_by_id = {item["id"]: _agent_product(item) for item in views}
     ranked_ids = [str(item["id"]) for item in views]
     eligible_views = []
@@ -591,7 +651,58 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
             eligible_views.append(view)
         else:
             status_counts[status] = status_counts.get(status, 0) + 1
-    top_views = eligible_views[: criteria["top_k"]]
+    selection_groups: list[dict[str, Any]] = []
+    selection_comparison: dict[str, Any] = {}
+    if selector_groups:
+        selected_ids: list[str] = []
+        for group in selector_groups:
+            group_metric = str(group.get("metric") or "")
+            if group_metric not in {
+                "recommendation_score", "net_profit", "net_margin", "roi", "risk",
+                "competition", "demand", "compliance",
+            }:
+                continue
+            group_views = sorted(
+                eligible_views,
+                key=lambda item, metric=group_metric: (
+                    _collection_metric_value(item, metric), str(item.get("id") or "")
+                ),
+                reverse=str(group.get("direction") or "DESC").upper() == "DESC",
+            )
+            group_limit = max(1, min(20, int(group.get("limit") or 1)))
+            chosen = group_views[:group_limit]
+            items = [{
+                "product_id": str(item["id"]), "title": str(item.get("title") or ""),
+                "rank": index,
+                "metric_value": _collection_metric_value(item, group_metric),
+                "net_profit": products_by_id[str(item["id"])]["net_profit"],
+                "net_margin": products_by_id[str(item["id"])]["current_margin_rate"],
+                "risk_level": products_by_id[str(item["id"])]["risk_level"],
+                "compliance_status": products_by_id[str(item["id"])]["compliance_status"],
+                "decision_status": products_by_id[str(item["id"])]["decision_status"],
+                "recommendation_score": products_by_id[str(item["id"])]["score"],
+            } for index, item in enumerate(chosen, 1)]
+            selection_groups.append({
+                "metric": group_metric,
+                "direction": str(group.get("direction") or "DESC").upper(),
+                "limit": group_limit,
+                "items": items,
+            })
+            selected_ids.extend(item["product_id"] for item in items)
+        selected_ids = list(dict.fromkeys(selected_ids))
+        by_id = {str(item["id"]): item for item in eligible_views}
+        top_views = [by_id[item] for item in selected_ids if item in by_id]
+        criteria["top_k"] = max(1, min(20, len(top_views)))
+        if len(selection_groups) >= 2:
+            left = [item["product_id"] for item in selection_groups[0]["items"]]
+            right = [item["product_id"] for item in selection_groups[1]["items"]]
+            selection_comparison = {
+                "intersection": [item for item in left if item in set(right)],
+                "left_only": [item for item in left if item not in set(right)],
+                "right_only": [item for item in right if item not in set(left)],
+            }
+    else:
+        top_views = eligible_views[: criteria["top_k"]]
     candidates = []
     for rank, view in enumerate(top_views, 1):
         product = products_by_id[str(view["id"])]
@@ -615,11 +726,14 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
         "exclude_insufficient_data": criteria["exclude_insufficient_data"],
         "member_product_ids": member_ids, "ranked_product_ids": [str(item["id"]) for item in eligible_views],
         "top_product_ids": top_ids, "candidates": candidates,
+        "selection_groups": selection_groups,
+        "selection_comparison": selection_comparison,
         "ineligible_status_counts": status_counts,
         "notice": "Top-K 只从通过当前后端推荐门禁的商品中产生；不足时返回更少结果，不以未达标商品补位。",
     }
     return {
         "tool": "analyze_collection", "success": True, "data": top_views,
+        "analysis_data": views[:20],
         "collection_analysis": collection_result, "member_count": len(views),
         "eligible_count": len(eligible_views), "displayed_count": len(top_views),
         "message": collection_result["notice"],
@@ -653,6 +767,8 @@ def _response_type(parsed: ParsedIntent, resolution: EntityResolution, products:
         return "filter_result"
     if parsed.name == "collection_analysis":
         return "collection_report"
+    if parsed.name == "scenario_analysis":
+        return "scenario_report" if products else "clarification"
     if parsed.name in {"profit_comparison", "product_comparison"}:
         return "comparison_result" if len(products) >= 2 else "clarification"
     if parsed.name == "selection_recommendation":
@@ -675,6 +791,8 @@ def _display_scope(response_type: str, dimensions: tuple[str, ...]) -> list[str]
         return ["answer", "filter_criteria", "products", *dimensions, "evidence", "source", "tool_summary"]
     if response_type == "collection_report":
         return ["answer", "collection", "products", *dimensions, "evidence", "warnings", "missing_data", "next_actions", "human_review", "source", "tool_summary"]
+    if response_type == "scenario_report":
+        return ["answer", "simulation", "products", "canonical_baseline", "hypothetical", "delta", *dimensions, "evidence", "source", "tool_summary"]
     if response_type == "comparison_result":
         return ["answer", "products", *dimensions, "hard_gates", "evidence", "warnings", "source", "tool_summary"]
     if response_type == "decision_report":
@@ -779,13 +897,23 @@ async def agent_v1_ask(
         session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"selected_product_ids": selected_product_ids or [], "selection_revision": selection_revision, "selection_bound_session_id": selection_bound_session_id}))
 
     all_products = await repo.list(limit=500)
+    scenario_state = None
+    scenario_load_error: ScenarioStateError | None = None
+    try:
+        scenario_state = load_scenario_state(
+            conversation.state_json or {}, session_id=session_id, company_id=company_id,
+            valid_product_ids={item.id for item in all_products},
+        )
+    except ScenarioStateError as exc:
+        scenario_load_error = exc
     context_snapshot = build_context_snapshot(
         conversation, company_id=company_id, user_id=user_id, query=query, products=all_products,
         selected_product_ids=selected_product_ids, selection_revision=selection_revision,
         selection_bound_session_id=selection_bound_session_id,
+        has_active_scenario=scenario_state is not None,
     )
     parsed, understanding = (parsed_override, understanding_override) if understanding_override is not None else understand_query(query, all_products, selected_product_ids, context_snapshot)
-    task_mutation = task_mutation_intent(
+    task_mutation = None if parsed.name == "scenario_analysis" else task_mutation_intent(
         query, context_snapshot.task_state, selected_product_ids or (), understanding.entity_mentions,
     )
     if task_mutation:
@@ -848,6 +976,21 @@ async def agent_v1_ask(
     entity_scoped = parsed.policy.selection_mode != "ignore" and parsed.name not in {"selection_recommendation", "collection_analysis"}
     explicit_ids = [item.id for item in resolution.products]
     context_resolution = resolve_context_reference(query, understanding, explicit_ids, context_snapshot)
+    if parsed.name == "scenario_analysis" and scenario_state and not explicit_ids:
+        context_resolution = ReferenceResolutionResult(
+            product_ids=list(scenario_state.base_product_ids), source="session_state",
+            reference_expression="active_scenario", confidence=1.0,
+        )
+    elif (
+        parsed.name == "scenario_analysis"
+        and understanding.scenario_collection_scope
+        and context_snapshot.task_state.active_collection
+        and not explicit_ids
+    ):
+        context_resolution = ReferenceResolutionResult(
+            product_ids=list(context_snapshot.task_state.active_collection.product_ids),
+            source="session_state", reference_expression="active_collection", confidence=1.0,
+        )
     entity_blocked = entity_scoped and (resolution.has_unresolved or context_resolution.requires_clarification)
     context_source = context_resolution.source
     target_source = {
@@ -891,12 +1034,21 @@ async def agent_v1_ask(
     simulation: dict[str, Any] | None = None
     data_sufficiency: dict[str, Any] | None = None
     historical_matches: list[dict[str, Any]] = []
+    profit_diagnosis: list[dict[str, Any]] = []
+    historical_decision_analysis: list[dict[str, Any]] = []
+    human_review_priority: list[dict[str, Any]] = []
     matched_count_override: int | None = None
     total_count_override: int | None = None
     displayed_count_override: int | None = None
     filter_criteria: dict[str, Any] = {}
     collection_analysis: dict[str, Any] | None = None
     collection_context_missing = False
+    scenario_next_state = scenario_state
+    scenario_error_code: str | None = scenario_load_error.code if scenario_load_error and parsed.name == "scenario_analysis" else None
+    scenario_blocked = scenario_load_error is not None and parsed.name == "scenario_analysis"
+    if parsed.name == "scenario_analysis" and entity_blocked:
+        scenario_error_code = context_resolution.failure_code or "MISSING_CONTEXT"
+        scenario_blocked = True
     event(
         trace, "entity_resolution", "entity_resolver", "已逐项保存本轮商品名称解析结果。",
         requested_entities=[{
@@ -910,7 +1062,129 @@ async def agent_v1_ask(
         context_target_source=context_source,
         ignored_semantic_candidate_count=arbitration.ignored_semantic_candidate_count if arbitration else 0,
     )
-    if entity_blocked:
+    if parsed.name == "scenario_analysis" and not entity_blocked:
+        operation = understanding.operation
+        mutation = {
+            "field": understanding.scenario_field,
+            "operation": understanding.mutation_type,
+            "value": understanding.hypothetical_value,
+            "unit": understanding.hypothetical_unit,
+        }
+        try:
+            if operation == "CREATE_SCENARIO":
+                if any(value is None for value in mutation.values()):
+                    raise ScenarioStateError("UNSUPPORTED_SCENARIO_FIELD", "Scenario override is incomplete or unsupported.")
+                if understanding.scenario_collection_scope:
+                    active_collection = context_snapshot.task_state.active_collection
+                    if not active_collection:
+                        raise ScenarioStateError("MISSING_CONTEXT", "Collection scenario requires an active collection.")
+                    scenario_next_state = create_collection_scenario(
+                        scenario_id=uid(), session_id=session_id, company_id=company_id,
+                        products=all_products, collection=active_collection,
+                        override_specs=[mutation], scope=understanding.scenario_collection_scope,
+                        top_k=understanding.scenario_top_k,
+                        selected_product_ids=context_snapshot.current_selected_product_ids,
+                        ranking_dimensions=understanding.scenario_ranking_dimensions,
+                    )
+                else:
+                    if len(targets) != 1:
+                        raise ScenarioStateError("MISSING_CONTEXT", "Scenario creation requires one explicit product.")
+                    scenario_next_state = create_scenario(
+                        scenario_id=uid(), session_id=session_id, company_id=company_id,
+                        products=targets, override_specs=[mutation],
+                        source_task_revision=context_snapshot.task_state.revision,
+                    )
+            else:
+                if scenario_next_state is None:
+                    raise ScenarioStateError("MISSING_CONTEXT", "No active scenario exists in this session.")
+                scenario_next_state = detect_stale_baseline(scenario_next_state, all_products)
+                scenario_next_state = detect_stale_collection_baseline(
+                    scenario_next_state, context_snapshot.task_state.active_collection,
+                )
+                if scenario_next_state.baseline_status == "STALE_BASELINE" and operation != "RESET_SCENARIO":
+                    raise ScenarioStateError("STALE_BASELINE", "Scenario baseline differs from current canonical inputs.")
+                if scenario_next_state.collection_baseline_status == "STALE_COLLECTION_BASELINE" and operation != "RESET_SCENARIO":
+                    raise ScenarioStateError("STALE_COLLECTION_BASELINE", "Collection baseline differs from the frozen scenario source.")
+                if explicit_ids and set(explicit_ids) != set(scenario_next_state.base_product_ids):
+                    raise ScenarioStateError("SCENARIO_TARGET_MISMATCH", "Explicit product does not match the active scenario.")
+                if operation == "UPDATE_SCENARIO":
+                    if understanding.scenario_ranking_dimensions and all(value is None for value in mutation.values()):
+                        scenario_next_state = update_scenario_ranking(
+                            scenario_next_state,
+                            expected_revision=scenario_next_state.scenario_revision,
+                            ranking_dimensions=understanding.scenario_ranking_dimensions,
+                        )
+                    elif any(value is None for value in mutation.values()):
+                        raise ScenarioStateError("UNSUPPORTED_SCENARIO_FIELD", "Scenario override is incomplete or unsupported.")
+                    else:
+                        scenario_next_state = update_scenario(
+                            scenario_next_state, expected_revision=scenario_next_state.scenario_revision,
+                            target_product_ids=scenario_next_state.scenario_scope_target_ids,
+                            **mutation,
+                        )
+                elif operation == "REMOVE_OVERRIDE":
+                    if not understanding.scenario_field:
+                        raise ScenarioStateError("UNSUPPORTED_SCENARIO_FIELD", "Specify the scenario field to restore.")
+                    scenario_next_state = remove_override(
+                        scenario_next_state, field=understanding.scenario_field,
+                        expected_revision=scenario_next_state.scenario_revision,
+                    )
+                elif operation == "RESET_SCENARIO":
+                    scenario_next_state = reset_scenario(
+                        scenario_next_state, expected_revision=scenario_next_state.scenario_revision,
+                    )
+                elif operation not in {"COMPARE_SCENARIO", "EXPLAIN_SCENARIO"}:
+                    raise ScenarioStateError("INVALID_SCENARIO_OPERATION", "Unsupported scenario operation.")
+
+            if scenario_next_state:
+                scenario_products = {item.id: item for item in all_products}
+                derived_by_id = {item.product_id: item for item in scenario_next_state.derived_results}
+                if scenario_next_state.collection_snapshot and operation == "EXPLAIN_SCENARIO":
+                    ranked_ids = scenario_next_state.scenario_ordered_ids
+                    if understanding.ordinal_reference is not None:
+                        rank_index = understanding.ordinal_reference - 1
+                        display_ids = ranked_ids[rank_index:rank_index + 1]
+                    elif understanding.top_k is not None:
+                        display_ids = ranked_ids[:understanding.top_k]
+                    else:
+                        display_ids = scenario_next_state.scenario_top_k_ids
+                else:
+                    display_ids = (
+                        scenario_next_state.scenario_top_k_ids
+                        if scenario_next_state.collection_snapshot else scenario_next_state.base_product_ids
+                    )
+                for product_id in display_ids:
+                    derived = derived_by_id.get(product_id)
+                    if not derived:
+                        continue
+                    canonical = scenario_products.get(derived.product_id)
+                    if not canonical:
+                        continue
+                    view = product_view(canonical, await repo.latest_analysis(canonical.id))
+                    if not view.get("analysis"):
+                        view["analysis"] = to_dict(analyze(canonical))
+                    effective = {item.field: item.value for item in derived.effective_values}
+                    view["current_price"] = effective.get("current_price", view.get("current_price"))
+                    view["current_margin_rate"] = derived.net_margin
+                    view["analysis"] = {
+                        **(view.get("analysis") or {}),
+                        "net_profit": derived.net_profit,
+                        "net_margin": derived.net_margin,
+                        "roi": derived.roi,
+                        "recommendation_score": derived.recommendation_score,
+                        "recommendation_grade": derived.recommendation_grade,
+                        "risk_level": derived.risk_level,
+                    }
+                    views.append(view)
+                simulation = scenario_response_view(scenario_next_state, operation)
+                event(trace, "scenario_calculated", "deterministic_scenario_engine", "已基于会话内不可变快照完成假设计算；未修改商品主档。", operation=operation, scenario_revision=scenario_next_state.scenario_revision)
+        except ScenarioStateError as exc:
+            scenario_error_code = exc.code
+            scenario_blocked = True
+            if exc.code in {"STALE_BASELINE", "STALE_COLLECTION_BASELINE"} and scenario_next_state:
+                simulation = scenario_response_view(scenario_next_state, operation)
+            event(trace, "scenario_blocked", "scenario_state", "情景操作未通过后端状态或输入校验。", failure_code=exc.code)
+    elif entity_blocked:
         event(trace, "entity_resolution_blocked", "entity_resolver", "存在未解析实体，本次不执行商品工具或部分比较。")
     elif understanding.operation in {"ARGMAX", "ARGMIN"} and context_snapshot.task_state.active_result_set:
         ids = context_snapshot.task_state.active_result_set.product_ids
@@ -1001,14 +1275,25 @@ async def agent_v1_ask(
             collection_type = "active_result_set"
         focused_collection_order = (
             list(previous_collection.top_product_ids or previous_collection.ranked_product_ids or previous_collection.product_ids)
-            if previous_collection else []
+            if previous_collection else list(context_snapshot.task_state.active_result_set.product_ids)
+            if context_snapshot.task_state.active_result_set else []
         )
+        ordinal_operation = understanding.operation in {
+            "LOOKUP_ORDINAL_MEMBER", "EXPLAIN_RANKING", "COMPARE_COLLECTION_MEMBERS",
+        } and bool(understanding.ordinal_references)
+        if ordinal_operation and focused_collection_order:
+            positions = understanding.ordinal_references
+            if any(position > len(focused_collection_order) for position in positions):
+                collection_context_missing = True
+            else:
+                collection_ids = [focused_collection_order[position - 1] for position in positions]
         if understanding.operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING"} and context_resolution.product_ids:
             collection_ids = list(context_resolution.product_ids)
             collection_type = previous_collection.collection_type if previous_collection else "candidate_pool"
         # Ranking explanations must consume the exact ranking specification
         # that produced the active collection order.  Provider/default response
         # dimensions cannot replace it with recommendation_score.
+        selector = understanding.collection_selector or {}
         if previous_collection and understanding.operation == "EXPLAIN_RANKING":
             ranking_dimensions = list(previous_collection.ranking_dimensions)
         else:
@@ -1020,14 +1305,46 @@ async def agent_v1_ask(
                 ]
             if not ranking_dimensions and previous_collection:
                 ranking_dimensions = list(previous_collection.ranking_dimensions)
+        selector_dimension = {
+            "recommendation_score": "recommendation", "net_profit": "profit",
+            "net_margin": "profit", "roi": "roi", "risk": "risk",
+            "competition": "competition", "demand": "demand", "compliance": "compliance",
+        }.get(str(selector.get("metric") or ""))
+        if selector_dimension:
+            ranking_dimensions = [selector_dimension]
+        if (
+            previous_collection
+            and "HUMAN_REVIEW_PRIORITY" in understanding.analysis_requests
+            and not selector
+        ):
+            # Risk/compliance/evidence are priority inputs, not a request to
+            # pre-truncate the review population using a different ranking.
+            ranking_dimensions = list(previous_collection.ranking_dimensions)
         ranking_dimensions = list(dict.fromkeys(ranking_dimensions or ["recommendation"]))
-        focused_top_k = len(collection_ids) if understanding.operation == "EXPLAIN_RANKING" and len(collection_ids) >= 2 else 1
-        top_k = understanding.top_k or (focused_top_k if understanding.operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING"} else previous_collection.top_k if previous_collection else parsed.limit)
+        focused_top_k = len(collection_ids) if ordinal_operation else 1
+        diagnostic_analyses = {
+            "PROFIT_DIAGNOSIS", "HISTORY_ANALYSIS", "HUMAN_REVIEW_PRIORITY", "EVIDENCE_GAP",
+        }
+        plural_diagnostic = bool(
+            set(understanding.analysis_requests) & diagnostic_analyses
+            and not selector
+            and understanding.operation not in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING", "RECOMMEND_TOP_K"}
+        )
+        top_k = (
+            min(20, len(collection_ids) or 20) if plural_diagnostic else
+            understanding.top_k or (
+                focused_top_k
+                if understanding.operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING"}
+                else previous_collection.top_k if previous_collection else parsed.limit
+            )
+        )
+        top_k = max(1, min(20, int(top_k)))
         exclude_insufficient = understanding.exclude_insufficient_data or bool(previous_collection and previous_collection.exclude_insufficient_data)
         args = {
             "collection_type": collection_type, "product_ids": collection_ids,
             "top_k": top_k, "ranking_dimensions": ranking_dimensions,
-            "require_gate_pass": True, "exclude_insufficient_data": exclude_insufficient,
+            "require_gate_pass": not plural_diagnostic, "exclude_insufficient_data": exclude_insufficient,
+            "selector": selector or None, "filters": understanding.collection_filters,
         }
         if not collection_context_missing:
             result = await execute(
@@ -1037,7 +1354,7 @@ async def agent_v1_ask(
             views = result.get("data", []) if result.get("success") else []
             if result.get("success"):
                 collection_analysis = result.get("collection_analysis") or {}
-                if previous_collection and understanding.operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING"}:
+                if previous_collection and understanding.operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING", "LOOKUP_ORDINAL_MEMBER", "COMPARE_COLLECTION_MEMBERS"}:
                     for candidate in collection_analysis.get("candidates") or []:
                         product_id = candidate.get("product_id")
                         if product_id in focused_collection_order:
@@ -1046,6 +1363,129 @@ async def agent_v1_ask(
                 total_count_override = int(result.get("member_count", 0))
                 matched_count_override = int(result.get("eligible_count", 0))
                 displayed_count_override = int(result.get("displayed_count", len(views)))
+                analysis_views = result.get("analysis_data") or []
+                if "PROFIT_DIAGNOSIS" in understanding.analysis_requests:
+                    adjustable = {
+                        "current_price", "procurement_cost", "shipping_cost", "fulfillment_cost",
+                        "platform_fee", "advertising_cost", "warehousing_cost", "tax_cost",
+                        "return_loss_reserve", "other_cost", "platform_commission_rate",
+                    }
+                    for view in analysis_views:
+                        product = _agent_product(view)
+                        calculation = await execute(
+                            "calculate_profit", {"product_id": product["id"]},
+                            lambda product_id=product["id"]: calculate_profit(repo, product_id, role),
+                            f"已读取 {product['title']} 的确定性利润输入与计算证据。",
+                        )
+                        merge_profit_calculation(view, calculation)
+                        analysis = view.get("analysis") or {}
+                        input_rows = (analysis.get("calculation_evidence") or {}).get("inputs") or []
+                        inputs = {
+                            str(item.get("field") or ""): item
+                            for item in input_rows if isinstance(item, dict) and item.get("field")
+                        }
+                        target_margin = float(view.get("target_margin_rate") or 0.30)
+                        profit_diagnosis.append({
+                            "product_id": product["id"], "title": product["title"],
+                            "current_net_margin": product["current_margin_rate"],
+                            "target_net_margin": target_margin,
+                            "margin_gap": target_margin - product["current_margin_rate"],
+                            "known_cost_factors": [
+                                {
+                                    "field": field, "value": detail.get("value"),
+                                    "source": detail.get("provider") or detail.get("source") or "unknown",
+                                    "evidence_status": detail.get("evidence_status", "SOURCE_MISSING"),
+                                }
+                                for field, detail in inputs.items()
+                                if field in adjustable and isinstance(detail, dict) and detail.get("value") is not None
+                            ],
+                            "adjustable_scenario_fields": sorted(adjustable),
+                            "protected_fields": ["compliance_status", "decision_status", "recommendation_score"],
+                            "evidence_gaps": _collection_evidence_gaps(view, product["decision_status"]),
+                        })
+                if "HISTORY_ANALYSIS" in understanding.analysis_requests:
+                    product_by_id = {item.id: item for item in all_products}
+                    for view in analysis_views:
+                        product_id = str(view.get("id") or "")
+                        target = product_by_id.get(product_id)
+                        if not target:
+                            continue
+                        history = await execute(
+                            "find_historical_failures", {"product_id": product_id},
+                            lambda target=target: find_historical_failures(session, company_id, target, role),
+                            f"已查询 {target.title} 的同品牌或同类目历史决策。",
+                        )
+                        matches = history.get("data", []) if history.get("success") else []
+                        normalized_matches = [{
+                            "historical_product": item.get("title", ""),
+                            "historical_product_id": item.get("product_id", ""),
+                            "match_type": (
+                                "SAME_BRAND_AND_CATEGORY" if float(item.get("similarity") or 0) >= 1
+                                else "SAME_CATEGORY" if float(item.get("similarity") or 0) >= 0.55
+                                else "SAME_BRAND"
+                            ),
+                            "match_value": item.get("similarity", 0),
+                            "historical_decision": item.get("lifecycle_status", ""),
+                            "historical_reason": item.get("reason", ""),
+                            "evidence": history.get("notice", ""),
+                        } for item in matches]
+                        historical_decision_analysis.append({
+                            "product_id": product_id, "product_title": target.title,
+                            "historical_matches": normalized_matches,
+                            "status": "MATCHED_HISTORY" if normalized_matches else "NO_MATCHING_HISTORY",
+                            "current_review_flags": ["HISTORICAL_DECISION_CONFLICT"] if normalized_matches else [],
+                            "review_reason_codes": ["HISTORICAL_DECISION_CONFLICT"] if normalized_matches else [],
+                            # Compatibility aliases retained for the existing UI.
+                            "title": target.title, "matches": matches,
+                            "review_required": bool(normalized_matches),
+                            "notice": (
+                                "历史匹配只作为人工复核线索，不自动改写当前决策。"
+                                if normalized_matches else "当前企业历史中没有足够可复核的同品牌/同类目放弃案例。"
+                            ),
+                        })
+                if "HUMAN_REVIEW_PRIORITY" in understanding.analysis_requests:
+                    candidates_by_id = {
+                        item["product_id"]: item for item in (collection_analysis.get("candidates") or [])
+                    }
+                    review_views = analysis_views
+                    if selector:
+                        selected_candidate_ids = set(candidates_by_id)
+                        review_views = [item for item in analysis_views if str(item.get("id") or "") in selected_candidate_ids]
+                    for view in review_views:
+                        product = _agent_product(view)
+                        candidate = candidates_by_id.get(product["id"], {})
+                        gaps = candidate.get("evidence_gaps") or _collection_evidence_gaps(view, product["decision_status"])
+                        codes = []
+                        if product["decision_status"] != "RECOMMENDED":
+                            codes.append(product["decision_status"])
+                        if product["compliance_status"] != "approved":
+                            codes.append("COMPLIANCE_REVIEW")
+                        if product["risk_level"] == "high":
+                            codes.append("HIGH_RISK")
+                        codes.extend(gap["code"] for gap in gaps)
+                        codes = list(dict.fromkeys(codes))
+                        if not codes:
+                            codes.append("ROUTINE_REVIEW")
+                        severity = (
+                            100 if product["decision_status"] == "BLOCKED" else
+                            80 if product["risk_level"] == "high" else
+                            60 if product["decision_status"] in {"HUMAN_REVIEW_REQUIRED", "REVIEW_REQUIRED"} else
+                            40 if gaps else 0
+                        ) + len(codes)
+                        human_review_priority.append({
+                            "product_id": product["id"], "title": product["title"],
+                            "priority": 0, "priority_rank": 0,
+                            "priority_level": "HIGH" if severity >= 80 else "MEDIUM" if severity >= 40 else "LOW",
+                            "priority_score": severity,
+                            "reason_codes": codes, "evidence": gaps,
+                            "gate_status": product["decision_status"],
+                            "risk": product["risk_level"],
+                            "evidence_gap_count": len(gaps),
+                        })
+                    human_review_priority.sort(key=lambda item: (-item["priority_score"], item["title"]))
+                    for index, item in enumerate(human_review_priority, 1):
+                        item["priority"] = index
+                        item["priority_rank"] = index
     elif parsed.name == "selection_recommendation":
         if targets:
             ids = [item.id for item in targets[:10]]
@@ -1110,6 +1550,8 @@ async def agent_v1_ask(
 
     products = [_agent_product(view) for view in views]
     response_type = _response_type(parsed, resolution, products, data_sufficiency)
+    if parsed.name == "scenario_analysis":
+        response_type = "clarification" if scenario_blocked and scenario_error_code not in {"STALE_BASELINE", "STALE_COLLECTION_BASELINE"} else "scenario_report"
     if collection_context_missing:
         response_type = "clarification"
     if understanding.operation in {"ARGMAX", "ARGMIN"} and products:
@@ -1167,6 +1609,14 @@ async def agent_v1_ask(
         elif response_type == "comparison_result":
             values = {"identity": product["title"], "price": f"售价 {product['current_price']:g} {product['currency']}", "profit": f"净利率 {product['current_margin_rate']:.1%}", "roi": f"ROI {product['roi']:.1%}", "demand": f"需求评分 {product['demand_score']:g}", "competition": f"竞争评分 {product['competition_score']:g}", "compliance": f"合规状态 {product['compliance_status']}", "risk": f"风险等级 {product['risk_level']}"}
             evidence.append({"product_id": product["id"], "title": product["title"], "source": "deterministic_comparison_result", "summary": "；".join(values[key] for key in parsed.policy.requested_dimensions if key in values), "url": product["url"]})
+        elif response_type == "scenario_report":
+            evidence.append({
+                "product_id": product["id"], "title": product["title"],
+                "source": "deterministic_scenario_engine",
+                "summary": "本结果仅适用于当前会话保存的假设条件；基线和差值均由后端确定性计算。",
+                "url": product["url"], "fields": [],
+            })
+            continue
         elif response_type == "collection_report":
             candidate = next((item for item in (collection_analysis or {}).get("candidates", []) if item.get("product_id") == product["id"]), {})
             reasons = [*(candidate.get("ranking_reasons") or []), *(candidate.get("key_positives") or [])]
@@ -1227,7 +1677,9 @@ async def agent_v1_ask(
         "statuses": {item["id"]: item["decision_status"] for item in products},
     }
     if entity_blocked:
-        if resolution.has_unresolved:
+        if parsed.name == "scenario_analysis" and scenario_error_code == "MISSING_CONTEXT":
+            answer = "当前会话没有可继续的假设情景。请先指定一个商品，并说明要调整的价格或成本条件。"
+        elif resolution.has_unresolved:
             answer = resolution_message(resolution, comparison=parsed.name in {"profit_comparison", "product_comparison"})
         elif context_resolution.failure_code == "MISSING_UI_SELECTION":
             answer = "当前没有可引用的已选商品，请先在对比中心选择商品，或直接说出商品名称。"
@@ -1245,6 +1697,125 @@ async def agent_v1_ask(
             answer = "当前会话中没有唯一可引用的商品，请直接说出商品名称。"
     elif collection_context_missing:
         answer = "当前会话中没有可引用的候选集合，请先分析候选池、企业商品库或一个已有筛选结果。"
+    elif parsed.name == "scenario_analysis" and scenario_error_code == "STALE_BASELINE":
+        answer = "当前假设情景基于旧商品快照（STALE_BASELINE），商品主档的计算输入已变化。为避免混用新旧事实，本次未继续计算；请重置或明确重新建立情景。"
+    elif parsed.name == "scenario_analysis" and scenario_error_code == "STALE_COLLECTION_BASELINE":
+        answer = "当前假设情景基于旧候选集合（STALE_COLLECTION_BASELINE），原集合的成员、排序或版本已变化。本次没有自动迁移假设，也没有修改当前候选池；请重置或重新建立集合情景。"
+    elif parsed.name == "scenario_analysis" and scenario_error_code:
+        answer = "本次假设未通过后端校验，未修改商品主档或当前情景。请使用支持的价格、采购、广告、履约、平台、仓储、税费或退货成本字段，并提供明确数值。"
+    elif parsed.name == "scenario_analysis" and simulation and products:
+        operation = simulation["operation"]
+        if simulation.get("canonical_collection_unchanged"):
+            ranking = simulation.get("collection_ranking") or []
+            ranking_by_id = {item["product_id"]: item for item in ranking}
+            comparison_by_id = {
+                item["product_id"]: item for item in simulation.get("comparison") or []
+            }
+            dimension_text = "、".join(simulation.get("scenario_ranking_spec") or ["recommendation"])
+            if operation == "COMPARE_SCENARIO":
+                changes = []
+                for product in products:
+                    item = ranking_by_id.get(product["id"], {})
+                    comparison = comparison_by_id.get(product["id"], {})
+                    canonical = comparison.get("canonical") or {}
+                    hypothetical = comparison.get("hypothetical") or {}
+                    metric_delta = comparison.get("delta") or {}
+                    canonical_rank = item.get("canonical_rank")
+                    scenario_rank = item.get("scenario_rank")
+                    delta = item.get("rank_delta")
+                    changes.append(
+                        f"{product['title']}：净利润 {float(canonical.get('net_profit') or 0):.2f} → "
+                        f"{float(hypothetical.get('net_profit') or 0):.2f} RUB "
+                        f"({float(metric_delta.get('net_profit') or 0):+.2f})；"
+                        f"净利率 {float(canonical.get('net_margin') or 0):.1%} → "
+                        f"{float(hypothetical.get('net_margin') or 0):.1%} "
+                        f"({float(metric_delta.get('net_margin') or 0) * 100:+.1f}pp)；"
+                        f"ROI {float(canonical.get('roi') or 0):.1%} → "
+                        f"{float(hypothetical.get('roi') or 0):.1%} "
+                        f"({float(metric_delta.get('roi') or 0) * 100:+.1f}pp)；"
+                        f"排名（Canonical Ranking → Hypothetical Ranking）"
+                        f"#{canonical_rank or '-'} → #{scenario_rank or '-'} "
+                        f"(Rank Delta {delta if delta is not None else '-'})"
+                    )
+                answer = (
+                    "当前为 HYPOTHETICAL 集合对比，原候选池未改变。"
+                    + "；".join(changes)
+                    + "。名次差由后端基于冻结集合和当前情景排序计算。"
+                )
+            elif operation == "EXPLAIN_SCENARIO":
+                if understanding.top_k and len(products) > 1:
+                    names = "、".join(
+                        f"#{ranking_by_id.get(product['id'], {}).get('scenario_rank') or index} {product['title']}"
+                        for index, product in enumerate(products, 1)
+                    )
+                    answer = f"当前 HYPOTHETICAL 前 {len(products)} 名是：{names}。原候选池未改变。"
+                else:
+                    ranked_product = products[0]
+                    item = ranking_by_id.get(ranked_product["id"], {})
+                    scenario_rank = item.get("scenario_rank") or understanding.ordinal_reference or 1
+                    analysis = ranked_product.get("analysis") or {}
+                    fact_parts = []
+                    requested = set(understanding.requested_dimensions)
+                    if "profit" in requested:
+                        fact_parts.extend([
+                            f"净利润 {float(analysis.get('net_profit') or 0):.2f} RUB",
+                            f"净利率 {float(analysis.get('net_margin') or 0):.1%}",
+                        ])
+                    if "roi" in requested:
+                        fact_parts.append(f"ROI {float(analysis.get('roi') or 0):.1%}")
+                    if "risk" in requested:
+                        fact_parts.append(f"风险等级 {analysis.get('risk_level') or 'UNKNOWN'}")
+                    facts = f"；{' 、'.join(fact_parts)}" if fact_parts else ""
+                    answer = (
+                        f"当前 HYPOTHETICAL 排名第 {scenario_rank} 是 {ranked_product['title']}{facts}。"
+                        f"当前情景按{dimension_text}排序；其原排名为 #{item.get('canonical_rank') or '-'}。"
+                        "原候选池未改变。"
+                    )
+            elif operation == "RESET_SCENARIO":
+                names = "、".join(f"{index}. {item['title']}" for index, item in enumerate(products, 1))
+                answer = f"集合假设已重置，当前 HYPOTHETICAL 排序恢复冻结基线：{names}。原候选池始终未被修改。"
+            else:
+                names = "、".join(f"{index}. {item['title']}" for index, item in enumerate(products, 1))
+                answer = (
+                    f"已按{dimension_text}完成 HYPOTHETICAL 集合重排：{names}。"
+                    "结果来自后端对冻结成员的确定性重算；原候选池、原排序和正式推荐结论均未改变。"
+                )
+        else:
+            product = products[0]
+            hypothetical = simulation["hypothetical"][0]
+            canonical = simulation["canonical"][0]
+            delta = simulation["delta"].get(product["id"], {})
+            if operation == "COMPARE_SCENARIO":
+                comparison = next(
+                    (item for item in simulation.get("comparison") or [] if item["product_id"] == product["id"]),
+                    None,
+                ) or {}
+                canonical = comparison.get("canonical") or canonical
+                hypothetical = comparison.get("hypothetical") or hypothetical
+                delta = comparison.get("delta") or delta
+                answer = (
+                    f"在当前假设条件下，{product['title']} 与原始基线的对比为："
+                    f"净利润 {canonical['net_profit']:.2f} → {hypothetical['net_profit']:.2f} RUB "
+                    f"({float(delta.get('net_profit') or 0):+.2f})；"
+                    f"净利率 {canonical['net_margin']:.1%} → {hypothetical['net_margin']:.1%} "
+                    f"({float(delta.get('net_margin') or 0) * 100:+.1f}pp)；"
+                    f"ROI（Canonical ROI → Hypothetical ROI，Delta ROI）"
+                    f"{canonical['roi']:.1%} → {hypothetical['roi']:.1%} "
+                    f"({float(delta.get('roi') or 0) * 100:+.1f}pp)。"
+                )
+            elif operation == "RESET_SCENARIO":
+                answer = (
+                    f"在当前假设情景中，所有调整已恢复为创建情景时的原始基线。"
+                    f"{product['title']} 的假设净利润为 {hypothetical['net_profit']:.2f} RUB，"
+                    f"净利率 {hypothetical['net_margin']:.1%}，ROI {hypothetical['roi']:.1%}。"
+                )
+            else:
+                action = "已移除指定字段的调整；其他假设继续保留。" if operation == "REMOVE_OVERRIDE" else ""
+                answer = (
+                    f"在当前假设条件下，{action}{product['title']} 的单件净利润为 {hypothetical['net_profit']:.2f} RUB，"
+                    f"净利率 {hypothetical['net_margin']:.1%}，ROI {hypothetical['roi']:.1%}，"
+                    f"风险为 {hypothetical['risk_level']}。这是模拟结果，不是当前商品事实。"
+                )
     elif parsed.name == "company_product_count":
         answer = f"目前公司商品主档一共有 {matched_count_override or 0} 个。"
     elif parsed.name == "compliance_policy":
@@ -1299,7 +1870,94 @@ async def agent_v1_ask(
     elif parsed.name == "collection_analysis":
         collection = collection_analysis or {}
         candidates = collection.get("candidates") or []
-        if not candidates:
+        review_order = "；".join(
+            f"{item['priority_rank']}. {item['title']}（{item['priority_level']}：{','.join(item['reason_codes']) or '常规复核'}）"
+            for item in human_review_priority
+        )
+        if profit_diagnosis:
+            names = "、".join(
+                f"{item['title']}（当前 {item['current_net_margin']:.1%}，目标 {item['target_net_margin']:.1%}，"
+                f"缺口 {item['margin_gap']:.1%}，已绑定 {len(item['known_cost_factors'])} 项后端成本输入）"
+                for item in profit_diagnosis
+            )
+            answer = (
+                f"当前集合中找到 {len(profit_diagnosis)} 个净利率低于各自目标的商品：{names}。"
+                "下方仅列出后端已知成本输入和可进入 Scenario 的调整字段；未执行自动调价或审批。"
+                + (
+                    f"当前先展示 {len(profit_diagnosis)} 个，其余 "
+                    f"{max(0, int(matched_count_override or 0) - len(profit_diagnosis))} 个可分页查看。"
+                    if int(matched_count_override or 0) > len(profit_diagnosis) else ""
+                )
+            )
+        elif historical_decision_analysis:
+            match_count = sum(len(item["matches"]) for item in historical_decision_analysis)
+            answer = (
+                f"已对 {len(historical_decision_analysis)} 个当前候选执行同品牌/同类目历史决策检索，"
+                f"找到 {match_count} 条可复核记录。"
+                if match_count else
+                "当前企业历史中没有足够可复核的同品牌/同类目放弃案例。"
+            )
+            if review_order:
+                answer += f" 建议人工复核顺序：{review_order}。"
+        elif collection.get("selection_groups"):
+            labels = {
+                "recommendation_score": "推荐度", "net_profit": "净利润", "net_margin": "净利率",
+                "roi": "ROI", "risk": "风险", "competition": "竞争", "demand": "需求", "compliance": "合规",
+            }
+            groups = collection["selection_groups"]
+            group_text = []
+            title_by_id = {
+                item["product_id"]: item["title"]
+                for group in groups for item in group.get("items") or []
+            }
+            for group in groups:
+                items = "、".join(
+                    f"{item['rank']}. {item['title']}（指标值 {item['metric_value']:g}）"
+                    for item in group.get("items") or []
+                ) or "无"
+                group_text.append(f"{labels.get(group['metric'], group['metric'])} Top{group['limit']}：{items}")
+            comparison = collection.get("selection_comparison") or {}
+            intersection = "、".join(title_by_id[item] for item in comparison.get("intersection") or []) or "无"
+            left_only = "、".join(title_by_id[item] for item in comparison.get("left_only") or []) or "无"
+            right_only = "、".join(title_by_id[item] for item in comparison.get("right_only") or []) or "无"
+            answer = (
+                "；".join(group_text)
+                + f"。交集：{intersection}；仅第一组：{left_only}；仅第二组：{right_only}。"
+                "分组、名次和差异均由后端指标确定性计算。"
+            )
+        elif (
+            "EVIDENCE_GAP" in understanding.analysis_requests
+            and not understanding.collection_selector
+            and "COMPARE" not in understanding.analysis_requests
+            and candidates
+        ):
+            details = []
+            for candidate in candidates:
+                grouped: dict[str, list[str]] = {}
+                for gap in candidate.get("evidence_gaps") or []:
+                    grouped.setdefault(gap["code"], []).append(gap.get("field") or gap.get("dimension") or "未指定字段")
+                gap_text = "；".join(
+                    f"{code}（字段：{'、'.join(dict.fromkeys(fields))}）"
+                    for code, fields in grouped.items()
+                ) or "未发现结构化缺口"
+                details.append(f"{candidate['title']}：{gap_text}")
+            hidden = max(0, int(collection.get("eligible_count") or 0) - len(candidates))
+            answer = (
+                f"{collection.get('eligible_count', len(candidates))} 个商品存在数据或证据缺口，"
+                f"当前展示 {len(candidates)} 个：" + "；".join(details)
+                + (f"；其余 {hidden} 个可分页查看。" if hidden else "。")
+            )
+        elif human_review_priority and "COMPARE" not in understanding.analysis_requests:
+            answer = "建议人工复核顺序：" + review_order + "。该顺序来自后端门禁、风险和证据缺口，不是自动审批。"
+        elif "COMPARE" in understanding.analysis_requests and candidates:
+            names = "、".join(f"{item['relative_rank']}. {item['title']}" for item in candidates)
+            answer = (
+                f"已从当前集合按后端选择器取出 {len(candidates)} 个商品进行"
+                f"{'、'.join(parsed.policy.requested_dimensions)}复合对比：{names}。"
+                + (f"建议人工复核顺序：{review_order}。" if review_order else "")
+                + "人工复核顺序来自门禁、风险和证据缺口，不是最终审批。"
+            )
+        elif not candidates:
             answer = (
                 f"当前集合共有 {collection.get('member_count', 0)} 个商品，但没有商品通过正式推荐门禁；"
                 "因此本次不以未达标商品补足 Top-K。"
@@ -1309,6 +1967,10 @@ async def agent_v1_ask(
             gaps = candidate.get("evidence_gaps") or []
             gap_text = "；".join(f"{item['code']}：{item['reason']}" for item in gaps[:5]) or "当前未发现结构化证据缺口。"
             answer = f"{candidate['title']} 当前主要证据缺口：{gap_text}"
+        elif understanding.operation == "LOOKUP_ORDINAL_MEMBER":
+            candidate = candidates[0]
+            ordinal = candidate.get("original_ordinal") or understanding.ordinal_reference or 1
+            answer = f"当前集合第 {ordinal} 名是 {candidate['title']}。"
         elif understanding.operation == "EXPLAIN_RANKING":
             if len(candidates) >= 2:
                 first, second = candidates[:2]
@@ -1369,6 +2031,13 @@ async def agent_v1_ask(
     else:
         answer = "请提供要查询的商品名称或商品 ID，或明确引用已选商品。"
 
+    if (response_type == "clarification" and understanding.clarification_reason
+            and understanding.question_type in {
+                "metric_clarification", "metric_threshold_clarification", "ranking_context_clarification",
+                "business_clarification",
+            }):
+        answer = understanding.clarification_reason
+
     source_badge = (
         "GLM 实际调用成功" if response_mode == "glm_success" else
         f"{active_provider_override or '语义模型'} 实际调用成功" if response_mode == "model_success" else
@@ -1380,7 +2049,11 @@ async def agent_v1_ask(
     displayed_count = displayed_count_override if displayed_count_override is not None else len(products)
     clarification_code: str | None = None
     if response_type == "clarification":
-        if collection_context_missing:
+        if parsed.name == "scenario_analysis" and scenario_error_code:
+            clarification_code = scenario_error_code
+        elif understanding.question_type == "ranking_context_clarification":
+            clarification_code = "MISSING_CONTEXT"
+        elif collection_context_missing:
             clarification_code = "MISSING_CONTEXT"
         elif context_resolution.requires_clarification:
             clarification_code = context_resolution.failure_code or "MISSING_CONTEXT"
@@ -1407,7 +2080,7 @@ async def agent_v1_ask(
     if response_type == "decision_report" and trust_notices:
         answer += " 本次结论须结合来源说明使用；演示、过期或来源不足的数据不能视为已验证的当前市场事实。"
     entities = [{"product_id": item.id, "name": item.title, "resolution_method": target_source} for item in targets if target_source != "none"]
-    decision_status = "NOT_APPLICABLE" if response_type == "simple_fact" else _overall_decision_status(parsed.name, products)
+    decision_status = "HYPOTHETICAL" if response_type == "scenario_report" else "NOT_APPLICABLE" if response_type == "simple_fact" else _overall_decision_status(parsed.name, products)
     if response_type == "simple_fact":
         decision_summary = {}
     human_review_required = (
@@ -1450,15 +2123,27 @@ async def agent_v1_ask(
             "requires_human_review": human_review_required,
             "source_task_revision": context_snapshot.task_state.revision + 1,
         }
+    task_completed = response_type not in {"clarification", "not_found", "error"} and not scenario_blocked
+    # Collection queries are read-only unless the user explicitly mutates the
+    # ranking. A temporary selector/filter/diagnostic result must never replace
+    # the canonical ActiveCollection that later turns reference.
+    read_only_collection_analysis = bool(
+        context_snapshot.task_state.active_collection
+        and parsed.name == "collection_analysis"
+        and understanding.operation not in {
+            "RERANK", "RERANK_COLLECTION", "REORDER", "REFINE_RANKING",
+            "IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING",
+        }
+    )
     next_task_state = evolve_task_state(
         context_snapshot.task_state, intent=parsed.name, operation=understanding.operation,
         turn_index=context_snapshot.turn_index, product_ids=[item["id"] for item in products],
         filters=filter_criteria or parsed.filters, dimensions=list(parsed.policy.requested_dimensions),
-        task_completed=response_type not in {"clarification", "not_found", "error"},
+        task_completed=task_completed,
         resolved_product_ids=explicit_ids, requested_entities=resolution.requested_entities,
         ranking_spec=understanding.sort_updates,
         recommendation=recommendation_state,
-        collection=collection_analysis,
+        collection=None if read_only_collection_analysis or understanding.operation in {"LOOKUP_ORDINAL_MEMBER", "COMPARE_COLLECTION_MEMBERS"} else collection_analysis,
     )
     payload = {
         "run_id": run_id, "session_id": session_id, "response_type": response_type, "answer": answer,
@@ -1476,12 +2161,15 @@ async def agent_v1_ask(
         "provider_calls": provider_calls_override or [],
         "fallback_reason": fallback_reason, "clarification_code": clarification_code,
         "latency_ms": latency_ms, "token_usage": token_usage_override or {}, "intent": parsed.name,
-        "task_completed": response_type not in {"clarification", "not_found", "error"},
+        "task_completed": task_completed,
         "fallback_used": response_mode == "deterministic_fallback" if fallback_used_override is None else fallback_used_override,
         "tool_call_count": state.actual_tool_calls,
         "duplicate_tool_execution": state.duplicate_tool_execution, "requested_dimensions": list(parsed.policy.requested_dimensions), "display_scope": display_scope, "selection_source": target_source, "context_source": context_source,
         "decision_status": decision_status, "decision_summary": decision_summary, "data_sufficiency": data_sufficiency,
         "collection_analysis": collection_analysis,
+        "profit_diagnosis": profit_diagnosis,
+        "historical_decision_analysis": historical_decision_analysis,
+        "human_review_priority": human_review_priority,
         "task_state": next_task_state.model_dump(mode="json"),
         "mode": "provider_semantic_handoff" if response_mode == "model_success" else "zhipu_controlled_function_calling" if response_mode == "glm_success" else "agent_v3_deterministic_fallback" if response_mode == "deterministic_fallback" else "agent_v3_rule_engine",
         "conclusion": answer, "trace": trace, "simulation": simulation, "data_completeness": (views[0].get("analysis") or {}).get("evidence_completeness") if views else None,
@@ -1559,6 +2247,7 @@ async def agent_v1_ask(
         "last_preference_order": understanding.preference_order or previous_state.get("last_preference_order") or [],
         "last_negative_scope": understanding.negative_scope or previous_state.get("last_negative_scope") or [],
         "task_state": validated["task_state"],
+        **({"scenario_state": scenario_next_state.model_dump(mode="json")} if scenario_next_state else {}),
     }
     answer = validated["answer"]
     if not conversation.goal_summary:

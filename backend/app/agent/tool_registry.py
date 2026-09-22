@@ -68,6 +68,8 @@ class AnalyzeCollectionInput(ToolInput):
     ]] = Field(default_factory=lambda: ["recommendation"], max_length=10)
     require_gate_pass: bool = True
     exclude_insufficient_data: bool = False
+    selector: dict[str, Any] | None = None
+    filters: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
 
 
 class SimulatePriceInput(ProductIdInput):
@@ -107,6 +109,7 @@ class CompareProductsOutput(ListToolOutput):
 
 
 class AnalyzeCollectionOutput(ListToolOutput):
+    analysis_data: list[dict[str, Any]] = Field(default_factory=list)
     collection_analysis: dict[str, Any]
     member_count: int = Field(ge=0)
     eligible_count: int = Field(ge=0)

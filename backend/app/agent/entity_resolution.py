@@ -20,10 +20,10 @@ def product_aliases(product: Product) -> tuple[str, ...]:
 
 # Query grammar, not catalogue-specific aliases. Preserve unknown name qualifiers.
 _FIELD_SUFFIX = re.compile(
-    r"(?:的)?(?:当前|目前|现在)?(?:为什么|为何|怎么|主要卡在|主要亏|亏在|数据|这个价格|这个指标|售价|价格|卖多少钱|多少钱|风险等级|风险级别|"
-    r"净利润|净利率|利润率|利润|roi|销量|有(?:多少|几).*?快照|是否|能不能|值得|详情|怎么样|如何|哪个好|哪个更好|中(?:选出|挑选|选择)|选出)", re.I
+    r"(?:的)?(?:当前|目前|现在)?(?:为什么|为何|怎么|主要卡在|主要亏|亏在|数据|这个价格|这个指标|售价|价格|价钱|卖多少钱|多少钱|风险等级|风险级别|"
+    r"净利润|净利率|利润率|利润|roi|销量|什么价位|有(?:多少|几).*?快照|是否|能不能|值得|详情|怎么样|如何|哪个好|哪个更好|中(?:选出|挑选|选择)|选出)", re.I
 )
-_REFERENCE = re.compile(r"(?:(?:和|与)?(?:刚才|当前|已选|那个|这个|那两个|这两个|这几个|这些|我选的这些|这\d+个|这四个|它|对比中心|第[一二两三四五六七八九十\d]+个|前一个|后一个|那利润|现在比较)(?:那|这|的)?(?:几个|两个)?(?:商品|产品|候选)?(?:相比|一下|呢)?)\Z")
+_REFERENCE = re.compile(r"(?:(?:和|与)?(?:刚才|当前|已选|那个|这个|这款|那款|那两个|这两个|这几个|这些|我选的这些|这\d+个|这四个|它|对比中心|第[一二两三四五六七八九十\d]+个|前一个|后一个|那利润|现在比较)(?:那|这|的)?(?:几个|两个)?(?:商品|产品|候选)?(?:相比|一下|呢)?)\Z")
 _GENERIC = {"商品", "产品", "用品", "电子产品", "桌面", "收纳", "东西"}
 _ACTION_SUFFIX = re.compile(
     r"(?:详细|全面|综合)?(?:对比|比较|分析|评估|查看|看看|看一下)(?:一下|看看)?$|"
@@ -48,6 +48,12 @@ def query_mentions(query: str, protected_names: tuple[str, ...] = ()) -> list[st
             marker = f"__ENTITY_{len(protected)}__"
             text = text.replace(name, marker)
             protected[marker] = name
+    # Collection/metric expressions own these spans. Only catalogue names
+    # explicitly present in the utterance may still become product entities.
+    if not protected and re.search(r"候选池|候选集合|这批(?:商品|候选)?|当前(?:集合|结果)", text) and re.search(
+        r"\broi\b|投资回报|利润|净利率|风险|推荐度|竞争|合规|销量|证据|缺口", text, re.I,
+    ):
+        return []
     if not protected and _TASK_LEVEL_QUERY.search(text):
         return []
     text = re.sub(
@@ -61,7 +67,7 @@ def query_mentions(query: str, protected_names: tuple[str, ...] = ()) -> list[st
     text = re.sub(r"(?:的)?\s*[+-]?\d+(?:\.\d+)?\s*[%％]", "", text)
     text = re.sub(r"^(?:先别看|不要看|不看|忽略|排除)[^,，;；]+[,，;；]\s*", "", text)
     text = re.sub(
-        r"^(?:(?:请问|请|帮我|帮忙|查看|查询|(?:详细|全面|综合)?(?:分析一下|分析|比较|对比)|如果|假如|把|将|从|换成|改成)\s*)+",
+        r"^(?:(?:请问|请|帮我(?:确认|看)?(?:一下|下)?|帮忙(?:确认|看)?(?:一下|下)?|麻烦(?:确认|看)?(?:一下|下)?|查看|查询|(?:详细|全面|综合)?(?:分析一下|分析|比较|对比)|如果|假如|把|将|从|换成|改成)[，,\s]*)+",
         "", text,
     )
     text = _FIELD_SUFFIX.split(text, maxsplit=1)[0]

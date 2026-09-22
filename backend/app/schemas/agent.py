@@ -24,6 +24,7 @@ ResponseType = Literal[
     "filter_result",
     "comparison_result",
     "collection_report",
+    "scenario_report",
     "decision_report",
     "policy_answer",
     "insufficient_data",
@@ -42,9 +43,11 @@ TaskOperation = Literal[
     "UPDATE_CONSTRAINT", "REMOVE_CONSTRAINT", "REORDER", "RERUN",
     "INSPECT", "COMPARE", "RECOMMEND", "EXPLAIN", "RECOVER",
     "SIMULATE", "CANCEL",
-    "ARGMAX", "ARGMIN", "EXPLAIN_RANKING",
+    "ARGMAX", "ARGMIN", "EXPLAIN_RANKING", "LOOKUP_ORDINAL_MEMBER",
     "ANALYZE_COLLECTION", "RECOMMEND_TOP_K", "IDENTIFY_EVIDENCE_GAPS",
     "RERANK_COLLECTION", "COMPARE_COLLECTION_MEMBERS",
+    "CREATE_SCENARIO", "UPDATE_SCENARIO", "REMOVE_OVERRIDE",
+    "RESET_SCENARIO", "COMPARE_SCENARIO", "EXPLAIN_SCENARIO",
 ]
 
 EntityRole = Literal[
@@ -225,6 +228,7 @@ class ContextSnapshot(BaseModel):
     last_preference_order: list[str] = Field(default_factory=list, max_length=10)
     last_negative_scope: list[str] = Field(default_factory=list, max_length=10)
     context_warnings: list[str] = Field(default_factory=list, max_length=10)
+    has_active_scenario: bool = False
     task_state: TaskState = Field(default_factory=TaskState)
 
 
@@ -233,7 +237,7 @@ class ReferenceResolutionResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    product_ids: list[str] = Field(default_factory=list, max_length=10)
+    product_ids: list[str] = Field(default_factory=list, max_length=100)
     source: ContextSource = "none"
     reference_expression: str | None = None
     inherited_dimensions: list[str] = Field(default_factory=list, max_length=10)
@@ -284,6 +288,27 @@ class QueryUnderstanding(BaseModel):
     collection_reference: Literal[
         "candidate_pool", "active_result_set", "company_catalog", "current_collection"
     ] | None = None
+    collection_selector: dict[str, Any] | None = None
+    collection_filters: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
+    analysis_requests: list[Literal[
+        "COMPARE", "PROFIT_DIAGNOSIS", "HISTORY_ANALYSIS",
+        "HUMAN_REVIEW_PRIORITY", "EVIDENCE_GAP",
+    ]] = Field(default_factory=list, max_length=10)
+    scenario_field: Literal[
+        "current_price", "procurement_cost", "advertising_cost", "shipping_cost",
+        "fulfillment_cost", "platform_fee", "warehousing_cost", "tax_cost",
+        "return_loss_reserve", "other_cost", "platform_commission_rate",
+    ] | None = None
+    mutation_type: Literal[
+        "SET", "INCREASE_BY", "DECREASE_BY", "INCREASE_PERCENT",
+        "DECREASE_PERCENT", "MULTIPLY",
+    ] | None = None
+    hypothetical_value: float | None = None
+    hypothetical_unit: Literal["RUB", "PERCENT", "RATIO", "MULTIPLIER"] | None = None
+    scenario_reference_role: Literal["EXPLICIT_ENTITY", "ACTIVE_COLLECTION", "ACTIVE_SCENARIO", "NONE"] | None = None
+    scenario_collection_scope: Literal["ALL_MEMBERS", "TOP_K", "SELECTED_MEMBERS"] | None = None
+    scenario_top_k: int | None = Field(default=None, ge=1, le=20)
+    scenario_ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
     top_k: int | None = Field(default=None, ge=1, le=20)
     evidence_gap_requested: bool = False
     exclude_insufficient_data: bool = False
@@ -303,6 +328,12 @@ class QueryUnderstanding(BaseModel):
     requires_reasoning: bool = False
     clarification_required: bool = False
     clarification_reason: str | None = None
+    clarification_category: Literal[
+        "MISSING_PRODUCT", "MISSING_METRIC", "MISSING_THRESHOLD",
+        "MISSING_COLLECTION", "MISSING_COMPARISON_TARGET", "MISSING_REFERENCE",
+        "MISSING_SCENARIO_VALUE", "AMBIGUOUS_METRIC", "AMBIGUOUS_REFERENCE",
+    ] | None = None
+    missing_slots: list[str] = Field(default_factory=list, max_length=10)
     confidence: float = Field(ge=0, le=1)
     route: Literal["DETERMINISTIC_FAST_PATH", "SEMANTIC_PLANNER", "CLARIFICATION"]
     planned_tools: list[str] = Field(
@@ -577,6 +608,8 @@ class CollectionAnalysisResult(BaseModel):
     ranked_product_ids: list[str] = Field(default_factory=list, max_length=100)
     top_product_ids: list[str] = Field(default_factory=list, max_length=20)
     candidates: list[CollectionCandidateResult] = Field(default_factory=list, max_length=20)
+    selection_groups: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
+    selection_comparison: dict[str, Any] = Field(default_factory=dict)
     ineligible_status_counts: dict[str, int] = Field(default_factory=dict)
     notice: str = ""
 
@@ -635,6 +668,9 @@ class AgentRunResult(BaseModel):
     decision_summary: dict[str, Any] = Field(default_factory=dict)
     data_sufficiency: DataSufficiencyResult | None = None
     collection_analysis: CollectionAnalysisResult | None = None
+    profit_diagnosis: list[dict[str, Any]] = Field(default_factory=list)
+    historical_decision_analysis: list[dict[str, Any]] = Field(default_factory=list)
+    human_review_priority: list[dict[str, Any]] = Field(default_factory=list)
     task_state: TaskState = Field(default_factory=TaskState)
 
     # Compatibility fields retained for the existing API and UI during V2 migration.

@@ -1,12 +1,90 @@
+import json
 from dataclasses import asdict, dataclass
 from math import log1p
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict
 
 from app.db.models import Product
 from app.services.provenance import build_trust
 
 ALGORITHM_VERSION = "v2.0.0-enterprise-evaluation"
 WEIGHTS = {"profit": 0.28, "demand": 0.24, "competition": 0.18, "compliance": 0.18, "risk": 0.12}
+
+
+class ScenarioCalculationInput(BaseModel):
+    """Frozen, non-ORM input accepted by the existing deterministic evaluator."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    id: str = ""
+    company_id: str = ""
+    title: str = ""
+    brand: str = ""
+    category_path: str = ""
+    url: str = ""
+    main_image_url: str = ""
+    currency: str = "RUB"
+    current_price: float = 0
+    competitor_price_min: float = 0
+    competitor_price_avg: float = 0
+    rating: float = 0
+    review_count: int = 0
+    latest_30d_sales: float = 0
+    sales_growth_rate: float = 0
+    search_volume: float = 0
+    trend_score: float = 0
+    competitor_count: int = 0
+    price_competition_score: float = 0
+    market_saturation: float = 0
+    compliance_status: str = "pending"
+    compliance_note: str = ""
+    certificates: tuple[str, ...] = ()
+    manual_risk_level: str = "unknown"
+    procurement_cost: float = 0
+    fulfillment_cost: float = 0
+    shipping_cost: float = 0
+    platform_fee: float = 0
+    advertising_cost: float = 0
+    warehousing_cost: float = 0
+    tax_cost: float = 0
+    return_loss_reserve: float = 0
+    other_cost: float = 0
+    platform_commission_rate: float = 0
+    target_margin_rate: float = 0.30
+    sales_source: str = "not_provided"
+    sales_evidence: str = ""
+    competition_evidence: str = ""
+    field_lineage_json: str = "{}"
+
+    @property
+    def field_lineage(self) -> dict[str, Any]:
+        value = json.loads(self.field_lineage_json)
+        return value if isinstance(value, dict) else {}
+
+
+def calculation_input_from_product(product: Product) -> ScenarioCalculationInput:
+    """Copy only evaluator inputs; the returned object has no ORM identity state."""
+
+    fields = ScenarioCalculationInput.model_fields
+    values = {
+        field: getattr(product, field)
+        for field in fields
+        if field not in {"id", "company_id", "certificates", "field_lineage_json"}
+    }
+    values.update(
+        id="",
+        company_id="",
+        certificates=tuple(str(item) for item in (product.certificates or ())),
+        field_lineage_json=json.dumps(product.field_lineage or {}, ensure_ascii=False, sort_keys=True, default=str),
+    )
+    return ScenarioCalculationInput.model_validate(values)
+
+
+def analyze_snapshot(snapshot: ScenarioCalculationInput) -> "AnalysisResult":
+    """Evaluate a detached snapshot through the one canonical formula implementation."""
+
+    return analyze(snapshot)
 
 
 @dataclass
@@ -123,7 +201,7 @@ def evidence_completeness(product: Product) -> tuple[dict[str, Any], list[dict[s
     }, missing
 
 
-def analyze(product: Product, strategy_factor: float = 1.0, historical_risk_factor: float = 1.0) -> AnalysisResult:
+def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float = 1.0, historical_risk_factor: float = 1.0) -> AnalysisResult:
     price = _number(product.current_price)
     purchase = _number(product.procurement_cost)
     logistics = _number(product.shipping_cost) or _number(product.fulfillment_cost)
@@ -286,10 +364,8 @@ def recommendation_gate_status(
 
 
 def simulate_price(product: Product, proposed_price: float) -> dict[str, Any]:
-    original = product.current_price
-    product.current_price = proposed_price
-    result = analyze(product)
-    product.current_price = original
+    snapshot = calculation_input_from_product(product)
+    result = analyze_snapshot(snapshot.model_copy(update={"current_price": proposed_price}))
     return {"proposed_price": proposed_price, "gross_profit": result.gross_profit, "net_profit": result.net_profit, "roi": result.roi, "expected_profit": round(result.expected_profit, 2), "margin_rate": round(result.current_margin_rate, 4), "break_even_price": result.break_even_price, "target_price": result.target_price, "price_position": result.price_position, "base_score": result.base_score, "recommendation_score": result.recommendation_score, "recommendation_grade": result.recommendation_grade, "data_confidence": result.data_confidence, "risks": result.risks, "notice": "情景模拟只改变售价，不假设销量、转化率、广告成本或竞品价格会自动变化。"}
 
 

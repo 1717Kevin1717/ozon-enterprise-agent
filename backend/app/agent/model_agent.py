@@ -11,6 +11,7 @@ from app.agent.query_understanding import (
     SemanticPlanValidationFailure, build_semantic_context_packet, semantic_policy,
     understand_query, validate_semantic_plan,
 )
+from app.agent.scenario_state import ScenarioStateError, load_scenario_state
 from app.agent.tools import rule_agent_ask
 from app.agent.task_state import task_mutation_intent
 from app.db.models import ConversationSession
@@ -40,6 +41,226 @@ SAFE_PROVIDER_MESSAGES = {
     "PROVIDER_ERROR": "语义模型调用失败。",
     "PROVIDER_INTERNAL_ERROR": "语义模型服务内部异常。",
 }
+
+# Only failures that leave the locally produced, backend-verifiable semantic
+# frame trustworthy may use the deterministic Scenario recovery path. Provider
+# authorization, model availability, HTTP policy, and SEM guard failures remain
+# outside this set.
+_RECOVERABLE_SCENARIO_PROVIDER_FAILURES = frozenset({
+    "CONNECT_ERROR",
+    "NETWORK_TIMEOUT",
+    "INVALID_RESPONSE",
+    "SCHEMA_VALIDATION_FAILED",
+    "SEMANTIC_PLAN_VALIDATION_FAILED",
+    "RESPONSE_READ_ERROR",
+})
+_INCOMPLETE_SCENARIO_SIGNAL = re.compile(
+    r"假设|假如|如果|情景|模拟|会怎样|会怎么样|如何变化|有什么影响"
+)
+_ORDINAL_SIGNAL = re.compile(
+    r"第[一二两三四五六七八九十\d]+(?:名|个|位)|"
+    r"前[一二两三四五六七八九十\d]+名|榜首|排名"
+)
+
+
+def _validated_scenario_transport_fallback(
+    query: str,
+    understanding,
+    packet,
+    selected_product_ids,
+    snapshot,
+):
+    """Reuse only a complete backend-verifiable Scenario frame after transport failure."""
+    try:
+        fallback_parsed, fallback_understanding = validate_semantic_plan(
+            understanding.model_dump(mode="json"), query,
+            selected_product_ids or (), packet,
+        )
+    except (SemanticPlanValidationFailure, ValueError, TypeError):
+        return None
+    if fallback_understanding.intent != "scenario_analysis":
+        return None
+
+    operation = fallback_understanding.operation
+    if operation in {"EXPLAIN_SCENARIO", "COMPARE_SCENARIO", "RESET_SCENARIO"}:
+        return (fallback_parsed, fallback_understanding) if snapshot.has_active_scenario else None
+    if operation == "REMOVE_OVERRIDE":
+        return (
+            (fallback_parsed, fallback_understanding)
+            if snapshot.has_active_scenario and fallback_understanding.scenario_field
+            else None
+        )
+    if operation != "CREATE_SCENARIO":
+        return None
+
+    complete_mutation = all((
+        fallback_understanding.scenario_field,
+        fallback_understanding.mutation_type,
+        fallback_understanding.hypothetical_unit,
+    )) and fallback_understanding.hypothetical_value is not None
+    try:
+        from app.agent.scenario_state import normalize_override
+        normalize_override(
+            field=fallback_understanding.scenario_field,
+            operation=fallback_understanding.mutation_type,
+            value=fallback_understanding.hypothetical_value,
+            unit=fallback_understanding.hypothetical_unit,
+            created_revision=1,
+        )
+    except (ScenarioStateError, TypeError, ValueError):
+        return None
+
+    active_collection = snapshot.task_state.active_collection
+    if fallback_understanding.scenario_reference_role == "ACTIVE_COLLECTION":
+        complete_scope = bool(
+            active_collection
+            and active_collection.product_ids
+            and fallback_understanding.scenario_collection_scope
+            and (
+                fallback_understanding.scenario_collection_scope != "TOP_K"
+                or fallback_understanding.scenario_top_k is not None
+            )
+        )
+    else:
+        complete_scope = bool(
+            fallback_understanding.scenario_reference_role == "EXPLICIT_ENTITY"
+            and fallback_understanding.entity_mentions
+        )
+    return (
+        (fallback_parsed, fallback_understanding)
+        if complete_mutation and complete_scope
+        else None
+    )
+
+
+def _validated_collection_transport_fallback(
+    query: str,
+    understanding,
+    packet,
+    selected_product_ids,
+    snapshot,
+):
+    """Reuse only a complete, session-scoped collection frame after provider failure."""
+    try:
+        fallback_parsed, fallback_understanding = validate_semantic_plan(
+            understanding.model_dump(mode="json"), query,
+            selected_product_ids or (), packet,
+        )
+    except (SemanticPlanValidationFailure, ValueError, TypeError):
+        return None
+    if fallback_understanding.intent != "collection_analysis":
+        return None
+    if not (
+        fallback_understanding.collection_selector
+        or fallback_understanding.collection_filters
+        or fallback_understanding.analysis_requests
+        or fallback_understanding.operation in {
+            "ANALYZE_COLLECTION", "COMPARE_COLLECTION_MEMBERS", "RECOMMEND_TOP_K",
+            "IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING", "LOOKUP_ORDINAL_MEMBER",
+        }
+    ):
+        return None
+
+    reference = fallback_understanding.collection_reference
+    if reference == "current_collection":
+        collection = snapshot.task_state.active_collection
+        if not collection or not collection.product_ids:
+            return None
+    elif reference == "active_result_set":
+        result_set = snapshot.task_state.active_result_set
+        if not result_set or not result_set.product_ids:
+            return None
+    elif reference not in {"candidate_pool", "company_catalog"}:
+        return None
+    return fallback_parsed, fallback_understanding
+
+
+def _validated_fact_transport_fallback(query, understanding, packet, selected_product_ids, snapshot):
+    """Reuse a complete fact frame; identity and values remain backend-owned."""
+    if understanding.intent not in {"product_price", "product_detail"}:
+        return None
+    if not understanding.entity_mentions and not (
+        understanding.requires_context
+        and (snapshot.last_explicit_product_ids or snapshot.last_resolved_product_ids)
+    ):
+        return None
+    try:
+        parsed, validated = validate_semantic_plan(
+            understanding.model_dump(mode="json"), query,
+            selected_product_ids or (), packet,
+        )
+    except (SemanticPlanValidationFailure, ValueError, TypeError):
+        return None
+    if validated.intent not in {"product_price", "product_detail"}:
+        return None
+    return parsed, validated
+
+
+def _controlled_transport_clarification(query: str, understanding, snapshot):
+    """Return a business clarification when structural slots remain incomplete."""
+    complete_collection_request = bool(
+        understanding.intent == "scenario_analysis"
+        and understanding.operation == "CREATE_SCENARIO"
+        and understanding.scenario_reference_role == "ACTIVE_COLLECTION"
+        and understanding.scenario_collection_scope
+        and all((
+            understanding.scenario_field,
+            understanding.mutation_type,
+            understanding.hypothetical_unit,
+        ))
+        and understanding.hypothetical_value is not None
+    )
+    if complete_collection_request:
+        # Preserve the typed request so the backend Scenario resolver can emit
+        # MISSING_CONTEXT. The execution boundary still rejects an absent
+        # session-local ActiveCollection before any calculation or mutation.
+        return semantic_policy(
+            "scenario_analysis", understanding.requested_dimensions,
+        ), understanding.model_copy(update={
+            "route": "SEMANTIC_PLANNER",
+            "failure_code": None,
+            "clarification_required": False,
+            "clarification_reason": None,
+        })
+    if _INCOMPLETE_SCENARIO_SIGNAL.search(query):
+        reason = "假设条件不完整：请明确调整的价格或成本字段、调整方式、数值，以及目标商品或候选集合。"
+    elif _ORDINAL_SIGNAL.search(query):
+        reason = "当前会话没有可验证的排名上下文；请先建立候选集合或假设情景。"
+    else:
+        has_product = bool(
+            understanding.entity_mentions
+            or snapshot.current_selected_product_ids
+            or snapshot.last_explicit_product_ids
+            or snapshot.last_resolved_product_ids
+        )
+        has_metric = bool(understanding.metric or understanding.metrics or understanding.requested_dimensions)
+        if not has_product and not has_metric:
+            category = "MISSING_PRODUCT"
+            missing_slots = ["product", "metric"]
+            reason = "请明确要查询的商品，以及要查看的指标（例如价格、净利润、净利率或 ROI）。"
+        elif not has_product:
+            category = "MISSING_PRODUCT"
+            missing_slots = ["product"]
+            reason = "请告诉我你想查询哪个商品。"
+        elif not has_metric:
+            category = "MISSING_METRIC"
+            missing_slots = ["metric"]
+            reason = "你希望查看价格、净利润、净利率还是 ROI？"
+        else:
+            return None
+        return semantic_policy("unknown", ()), understanding.model_copy(update={
+            "intent": "unknown", "question_type": "business_clarification",
+            "route": "CLARIFICATION", "clarification_required": True,
+            "clarification_reason": reason, "clarification_category": category,
+            "missing_slots": missing_slots,
+        })
+    clarification = understanding.model_copy(update={
+        "intent": "unknown", "task_type": "unknown", "question_type": "unknown",
+        "route": "CLARIFICATION", "failure_code": None,
+        "clarification_required": True, "clarification_reason": reason,
+        "planned_tools": [], "requires_tools": False,
+    })
+    return semantic_policy("unknown", ()), clarification
 
 
 async def _conversation(session, company_id, user_id, query, session_id):
@@ -104,10 +325,22 @@ async def dual_model_agent_ask(
     repo = ProductRepository(session, company_id)
     products = await repo.list(limit=500)
     conversation = await _conversation(session, company_id, user_id, query, session_id)
+    has_active_scenario = False
+    try:
+        has_active_scenario = load_scenario_state(
+            conversation.state_json or {},
+            session_id=conversation.id,
+            company_id=company_id,
+            valid_product_ids={item.id for item in products},
+        ) is not None
+    except ScenarioStateError:
+        # An invalid, stale, or foreign Scenario is never eligible context.
+        has_active_scenario = False
     snapshot = build_context_snapshot(
         conversation, company_id=company_id, user_id=user_id, query=query, products=products,
         selected_product_ids=selected_product_ids, selection_revision=selection_revision,
         selection_bound_session_id=selection_bound_session_id,
+        has_active_scenario=has_active_scenario,
     )
     parsed, understanding = understand_query(query, products, selected_product_ids, snapshot)
     mutation_result = task_mutation_intent(
@@ -146,6 +379,7 @@ async def dual_model_agent_ask(
         )
 
     packet = build_semantic_context_packet(query, understanding, snapshot, products)
+    pre_provider_understanding = understanding
     packet_dict = packet.model_dump(mode="json")
     slots = semantic_context_slots(packet_dict)
     external_query, redacted_identifiers = redact_external_query(query, products)
@@ -230,10 +464,60 @@ async def dual_model_agent_ask(
             })
     provider_trace = [{
         "event": "provider_call", "tool": "model_router", "business_label": "模型路由调用",
+        "summary": (
+            f"{item['actual_provider']} 语义调用成功。"
+            if item.get("status") == "success"
+            else f"{item['actual_provider']} 语义调用失败：{item.get('failure_code') or 'PROVIDER_ERROR'}。"
+        ),
         **item,
     } for item in provider_calls]
     if provider_result is None:
         failure_code = primary_failure_code or failure_code
+        deterministic_plan = None
+        if failure_code in _RECOVERABLE_SCENARIO_PROVIDER_FAILURES:
+            deterministic_plan = _validated_scenario_transport_fallback(
+                query, pre_provider_understanding, packet,
+                selected_product_ids, snapshot,
+            )
+            if deterministic_plan is None:
+                deterministic_plan = _validated_collection_transport_fallback(
+                    query, pre_provider_understanding, packet,
+                    selected_product_ids, snapshot,
+                )
+            if deterministic_plan is None:
+                deterministic_plan = _validated_fact_transport_fallback(
+                    query, pre_provider_understanding, packet,
+                    selected_product_ids, snapshot,
+                )
+        if deterministic_plan is not None:
+            parsed, understanding = deterministic_plan
+            return await rule_agent_ask(
+                session, company_id, user_id, role, query, conversation.id,
+                selected_product_ids, selection_revision, selection_bound_session_id,
+                understanding_override=understanding, parsed_override=parsed,
+                response_mode="deterministic_fallback", fallback_reason=failure_code,
+                provider_notice="语义模型本次未产生可用结构化结果；已复用调用前的安全语义，并继续执行后端校验。",
+                fallback_used_override=True, requested_provider_override=requested_provider,
+                model_route_override="QWEN_SEMANTIC", provider_calls_override=provider_calls,
+                trace_prefix=provider_trace,
+            )
+        controlled_clarification = (
+            _controlled_transport_clarification(query, pre_provider_understanding, snapshot)
+            if failure_code in _RECOVERABLE_SCENARIO_PROVIDER_FAILURES else None
+        )
+        if controlled_clarification is not None:
+            parsed, understanding = controlled_clarification
+            understanding = understanding.model_copy(update={"failure_code": failure_code})
+            return await rule_agent_ask(
+                session, company_id, user_id, role, query, conversation.id,
+                selected_product_ids, selection_revision, selection_bound_session_id,
+                understanding_override=understanding, parsed_override=parsed,
+                response_mode="deterministic_fallback", fallback_reason=failure_code,
+                provider_notice="语义模型本次未产生可用结构化结果；后端未猜测缺失条件，请补充必要信息。",
+                fallback_used_override=True, requested_provider_override=requested_provider,
+                model_route_override="QWEN_SEMANTIC", provider_calls_override=provider_calls,
+                trace_prefix=provider_trace,
+            )
         parsed = semantic_policy("unknown", ())
         understanding = understanding.model_copy(update={
             "intent": "unknown", "question_type": "unknown", "route": "CLARIFICATION",

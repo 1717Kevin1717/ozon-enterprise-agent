@@ -17,14 +17,14 @@ CANONICAL_INTENTS = (
     "profit_comparison", "product_comparison", "compliance_policy", "recommendation_policy",
     "selection_recommendation", "provenance_fact", "calculation_explanation",
     "decision_explanation", "data_quality_answer", "data_quality_policy", "unknown",
-    "collection_analysis",
+    "collection_analysis", "scenario_analysis",
 )
 
 SEMANTIC_PLANNER_INTENTS = frozenset({
     "product_price", "product_filter", "product_detail", "product_comparison", "profit_comparison",
     "selection_recommendation", "provenance_fact", "calculation_explanation",
     "decision_explanation", "data_quality_answer", "data_quality_policy", "unknown",
-    "collection_analysis",
+    "collection_analysis", "scenario_analysis",
 })
 
 CANONICAL_DIMENSIONS = (
@@ -72,6 +72,7 @@ INTENT_ALLOWED_DIMENSIONS = {
         "competition", "compliance", "evidence", "evidence_gap", "data_quality",
         "provenance", "freshness",
     }),
+    "scenario_analysis": frozenset({"profit", "roi", "risk", "recommendation", "decision", "calculation"}),
 }
 
 # Collection operations share an intent but not an unlimited analysis scope.
@@ -90,7 +91,8 @@ COLLECTION_OPERATION_ALLOWED_DIMENSIONS = {
     }),
     "COMPARE_COLLECTION_MEMBERS": frozenset({
         "recommendation", "decision", "profit", "roi", "risk", "demand",
-        "competition", "compliance", "evidence", "provenance", "freshness",
+        "competition", "compliance", "evidence", "evidence_gap", "data_quality",
+        "provenance", "freshness",
     }),
     "EXPLAIN_RANKING": frozenset({
         "recommendation", "decision", "profit", "roi", "risk", "demand",

@@ -69,11 +69,11 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
     normalized = " ".join(query.strip().split())
     lowered = normalized.casefold()
     selected = tuple(dict.fromkeys(selected_product_ids or []))[:10]
-    from app.agent.query_understanding import semantic_intent
+    from app.agent.query_understanding import semantic_intent, is_ranking_policy_question
     semantic = semantic_intent(normalized, selected, context_snapshot)
     if semantic is not None:
         return semantic
-    comparison_words = any(token in lowered for token in ("比较", "对比", "哪个更", "哪个好", "这两个", "这几个", "这4个", "这四个", "现在比较"))
+    comparison_words = any(token in lowered for token in ("比较", "对比", "哪个更", "哪个好", "这两个", "这几个", "这4个", "这四个", "现在比较")) or bool(re.search(r"(?:和|与|跟).+只看(?:利润|roi)", lowered, re.I))
     reference_words = any(token in lowered for token in ("刚才", "这个", "那个", "它", "对比中心", "这两个", "这几个", "这4个", "这四个"))
     positive_scope = re.split(r"不要|不分析|无需|不需要|不比较", lowered, maxsplit=1)[0]
     full_comparison = any(token in positive_scope for token in ("全面", "综合", "全维度", "最值得上架"))
@@ -81,8 +81,8 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
     count_question = bool(re.search(r"(?:公司|企业|商品库)?.*?(?:一共|总共|共有|总数).*?(?:多少|几).*?(?:商品|候选)|(?:公司|企业).*?(?:多少|几).*?(?:商品|候选)", normalized))
     compliance_policy = "合规" in lowered and any(token in lowered for token in ("能上架", "可以上架", "能不能上架", "没通过", "未通过", "失败", "先卖", "补审核"))
     price_lookup = (
-        any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "多少钱", "现在售价"))
-        or bool(re.search(r"(?:价格|售价)(?:是)?(?:多少|如何|怎么样|呢|[？?])", lowered))
+        any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "价钱是多少", "多少钱", "现在售价", "什么价位"))
+        or bool(re.search(r"(?:价格|售价|价位|价钱)(?:是)?(?:多少|如何|怎么样|呢|[？?])", lowered))
     ) and not any(token in lowered for token in ("调整", "改为", "模拟"))
     risk_fact = bool(re.search(r"风险(?:等级|级别).*(?:多少|什么|如何)", lowered)) and not comparison_words and not any(token in lowered for token in ("上架", "推荐", "决策", "筛选"))
     snapshot_question = any(token in lowered for token in ("销量快照", "上涨还是下降", "未来销量趋势", "销量趋势"))
@@ -108,19 +108,15 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
     max_saturation = _number_after([r"(?:竞争|饱和度).*?(?:低于|小于|不超过|≤|<=)\s*(\d+(?:\.\d+)?)", r"(?:竞争|饱和度).*?(\d+(?:\.\d+)?)\s*(?:以下|以内)"], normalized)
     category = _category_filter(normalized)
     risk_level = (
-        "low" if any(token in lowered for token in ("低风险", "风险低", "风险为低", "风险等级低"))
-        else "medium" if any(token in lowered for token in ("中风险", "风险中等", "风险为中"))
-        else "high" if any(token in lowered for token in ("高风险", "风险高", "风险为高", "风险等级高"))
+        "low" if re.search(r"低风险|风险(?:等级)?(?:为|是)?低(?!于|过|达|\d)", lowered)
+        else "medium" if re.search(r"中风险|风险(?:等级)?(?:为|是)?中(?:等)?(?!于|过|达|\d)", lowered)
+        else "high" if re.search(r"高风险|风险(?:等级)?(?:为|是)?高(?!于|过|达|\d)", lowered)
         else ""
     )
     compliance_status = "approved" if "合规" in lowered and any(
         token in lowered for token in ("已通过", "通过商品", "合规通过", "合规状态通过", "状态为通过", "状态已通过")
     ) else ""
-    ranking_policy = (
-        any(token in lowered for token in ("排名第一", "第一名", "相对排名", "排在第一"))
-        and any(token in lowered for token in ("推荐", "上架"))
-        and any(token in lowered for token in ("代表", "是不是", "是否", "意味着", "等于"))
-    )
+    ranking_policy = is_ranking_policy_question(normalized)
     recommendation_gate_policy = (
         any(token in lowered for token in ("评分", "分数", "综合分", "必须推荐"))
         and any(token in lowered for token in ("推荐", "上架"))
@@ -129,9 +125,16 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
 
     if count_question:
         return ParsedIntent("company_product_count", plan=({"tool": "count_products", "purpose": "确定性统计当前企业商品总数"},), policy=_policy(("count_products",), 1, ("count",), fast=True))
+    explicit_compliance_failure = compliance_policy and any(
+        token in lowered for token in ("没通过", "未通过", "失败", "补审核", "先卖")
+    )
+    if explicit_compliance_failure:
+        return ParsedIntent("compliance_policy", plan=(), policy=_policy((), 0, ("compliance", "decision"), fast=True))
+    if ranking_policy:
+        return ParsedIntent("recommendation_policy", plan=(), policy=_policy((), 0, ("recommendation_policy", "decision"), fast=True))
     if compliance_policy:
         return ParsedIntent("compliance_policy", plan=(), policy=_policy((), 0, ("compliance", "decision"), fast=True))
-    if ranking_policy or recommendation_gate_policy:
+    if recommendation_gate_policy:
         return ParsedIntent("recommendation_policy", plan=(), policy=_policy((), 0, ("recommendation_policy", "decision"), fast=True))
     if collection_analysis:
         dimensions = ["recommendation", "decision"]

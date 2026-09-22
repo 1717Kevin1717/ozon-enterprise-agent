@@ -38,6 +38,7 @@ class Setup(StrictModel):
     selected_titles: list[str] = Field(default_factory=list)
     additions: list[AddedProduct] = Field(default_factory=list)
     previous_query: str | None = None
+    previous_queries: list[str] = Field(default_factory=list, max_length=10)
     semantic_plan: dict[str, JsonValue] | None = None
     reasoning_plan: dict[str, JsonValue] | None = None
     mock_provider_route: Literal["disabled", "qwen_semantic", "qwen_reasoning", "qwen_timeout_deepseek", "provider_unconfigured"] = "disabled"

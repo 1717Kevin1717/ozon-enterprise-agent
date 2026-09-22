@@ -21,6 +21,7 @@ class ProviderExecutionPolicy:
     """Trusted per-request constraint; it may narrow but never add providers."""
 
     mode: ProviderExecutionMode = "AUTO"
+    require_semantic_handoff: bool = False
 
     def allowed_names(self, primary_name: str) -> frozenset[str] | None:
         if self.mode == "AUTO":
@@ -97,11 +98,12 @@ class ModelRouter:
         has_multimodal_input: bool = False,
         policy: ProviderExecutionPolicy | None = None,
     ) -> RouteDecision:
-        if understanding.route == "DETERMINISTIC_FAST_PATH":
+        execution_policy = policy or ProviderExecutionPolicy()
+        if understanding.route == "DETERMINISTIC_FAST_PATH" and not execution_policy.require_semantic_handoff:
             return RouteDecision("DETERMINISTIC_FAST_PATH", "high_confidence_rule")
-        if understanding.route == "CLARIFICATION":
+        if understanding.route == "CLARIFICATION" and not execution_policy.require_semantic_handoff:
             return RouteDecision("CLARIFICATION", "deterministic_missing_required_information")
-        candidates = self.semantic_candidates(has_multimodal_input=has_multimodal_input, policy=policy)
+        candidates = self.semantic_candidates(has_multimodal_input=has_multimodal_input, policy=execution_policy)
         return RouteDecision("QWEN_SEMANTIC", "semantic_or_context_required") if candidates else RouteDecision("CLARIFICATION", "semantic_provider_unavailable")
 
     def should_reason(self, understanding, *, product_count: int = 0) -> bool:
@@ -157,6 +159,26 @@ def semantic_context_slots(packet: dict) -> dict:
     """Remove tenant/session/product identities before any external semantic call."""
     task = dict(packet.get("task_context") or {})
     rule = dict(packet.get("rule_understanding") or {})
+    if rule.get("intent") == "scenario_analysis":
+        slots = {
+            "intent": "scenario_analysis",
+            "operation": rule.get("operation"),
+            "field": rule.get("scenario_field"),
+            "mutation_type": rule.get("mutation_type"),
+            "value": rule.get("hypothetical_value"),
+            "unit": rule.get("hypothetical_unit"),
+            "reference_role": rule.get("scenario_reference_role") or "ACTIVE_SCENARIO",
+            "has_active_scenario": bool(task.get("has_active_scenario")),
+            "allowed_tools": list(packet.get("allowed_tools") or []),
+        }
+        if rule.get("scenario_collection_scope") or task.get("active_collection_type"):
+            slots.update({
+                "collection_scope": rule.get("scenario_collection_scope"),
+                "top_k": rule.get("scenario_top_k"),
+                "ranking_dimensions": list(rule.get("scenario_ranking_dimensions") or []),
+                "has_active_collection": bool(task.get("active_collection_type")),
+            })
+        return slots
     if rule.get("intent") == "collection_analysis" or task.get("active_task_type") == "collection_analysis":
         references = list(packet.get("reference_candidates") or [])
         available_sources = [

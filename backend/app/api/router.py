@@ -4,12 +4,15 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.tool_registry import TOOL_REGISTRY
+from app.agent.capabilities import capability_view
+from app.agent.scenario_state import ScenarioStateError, load_scenario_state
+from app.agent.task_state import load_task_state
 from app.agent.model_agent import dual_model_agent_ask
 from app.agent.model_router import build_model_router
 from app.agent.tools import compare_products, rule_agent_ask
 from app.agent.zhipu_agent import zhipu_agent_ask
 from app.core.config import settings
-from app.db.models import AgentRun, Company, ConversationMessage, ConversationSession, Memory, ProductDecision, ProductRelation
+from app.db.models import AgentRun, Company, ConversationMessage, ConversationSession, Memory, Product, ProductDecision, ProductRelation
 from app.db.session import get_session
 from app.repositories.products import ProductRepository, product_view
 from app.schemas.products import AgentAsk, CapturePacket, CompareRequest, DecisionCreate, DemoSeedRequest, ProductIn, ProductPatch
@@ -479,6 +482,48 @@ async def agent_session_messages(session_id: str, ctx: dict = Depends(context), 
         raise HTTPException(404, detail={"code": "SESSION_NOT_FOUND", "message": "会话不存在或不属于当前企业。"})
     rows = list((await session.scalars(select(ConversationMessage).where(ConversationMessage.company_id == ctx["company_id"], ConversationMessage.session_id == session_id).order_by(ConversationMessage.created_at))).all())
     return {"success": True, "data": [{"id": row.id, "role": row.role, "content": row.content, "metadata": row.metadata_json, "created_at": row.created_at} for row in rows]}
+
+
+@router.get("/agent/capabilities")
+async def agent_capabilities(
+    session_id: str | None = None,
+    ctx: dict = Depends(context),
+    session: AsyncSession = Depends(get_session),
+):
+    require_role(ctx, "analyst")
+    products = list((await session.scalars(
+        select(Product).where(Product.company_id == ctx["company_id"])
+    )).all())
+    valid_ids = {item.id for item in products}
+    conversation = None
+    if session_id:
+        conversation = await session.scalar(select(ConversationSession).where(
+            ConversationSession.id == session_id,
+            ConversationSession.company_id == ctx["company_id"],
+            ConversationSession.user_id == ctx["user_id"],
+        ))
+    raw_state = conversation.state_json if conversation else {}
+    task_state = load_task_state(raw_state, valid_ids)
+    has_active_scenario = False
+    if conversation:
+        try:
+            has_active_scenario = load_scenario_state(
+                raw_state, session_id=conversation.id,
+                company_id=ctx["company_id"], valid_product_ids=valid_ids,
+            ) is not None
+        except ScenarioStateError:
+            has_active_scenario = False
+    history_available = any(item.lifecycle_status == "abandoned" for item in products)
+    if not history_available:
+        history_available = await session.scalar(select(ProductDecision.id).where(
+            ProductDecision.company_id == ctx["company_id"],
+            ProductDecision.decision_status.in_(("rejected", "abandoned", "blocked", "not_recommended")),
+        ).limit(1)) is not None
+    return {"success": True, "data": capability_view(
+        has_active_collection=bool(task_state.active_collection and task_state.active_collection.product_ids),
+        has_active_scenario=has_active_scenario,
+        history_available=history_available,
+    )}
 
 @router.post("/agent/ask")
 async def ask_agent(data: AgentAsk, ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):

@@ -73,7 +73,7 @@ def execute_isolated(case: GoldenCase) -> dict:
 async def _execute(case: GoldenCase) -> dict:
     from app.agent import model_agent
     from app.agent import zhipu_agent as provider
-    from app.agent.model_router import ModelRouter
+    from app.agent.model_router import ModelRouter, ProviderExecutionPolicy
     from app.agent.providers.base import ModelCapabilities, ModelProvider, ProviderCallResult, ProviderFailure
     from app.agent.tools import rule_agent_ask
     from app.db.models import Base, Company
@@ -138,8 +138,15 @@ async def _execute(case: GoldenCase) -> dict:
             selected = [identity(title) for title in case.setup.selected_titles]
             query = expand(case.query)
             session_id = None
-            if case.setup.previous_query:
-                previous = await rule_agent_ask(session, company, "golden-user", "company_admin", expand(case.setup.previous_query), None, selected)
+            previous_queries = [
+                *([case.setup.previous_query] if case.setup.previous_query else []),
+                *case.setup.previous_queries,
+            ]
+            for previous_query in previous_queries:
+                previous = await rule_agent_ask(
+                    session, company, "golden-user", "company_admin",
+                    expand(previous_query), session_id, selected,
+                )
                 session_id = previous["session_id"]
             mock_calls = 0
             if case.setup.mock_provider_route != "disabled":
@@ -188,6 +195,11 @@ async def _execute(case: GoldenCase) -> dict:
                     result = await model_agent.dual_model_agent_ask(
                         session, company, "golden-user", "company_admin", query, session_id, selected,
                         selection_revision=1 if selected else 0, selection_bound_session_id=session_id,
+                        provider_policy=ProviderExecutionPolicy(
+                            require_semantic_handoff=(
+                                case.expected.model_route == "QWEN_SEMANTIC"
+                            )
+                        ),
                     )
             elif case.setup.mock_llm == "disabled":
                 async def semantic_mock(*args):

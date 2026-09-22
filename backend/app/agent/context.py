@@ -44,6 +44,7 @@ def build_context_snapshot(
     selected_product_ids: list[str] | None = None,
     selection_revision: int = 0,
     selection_bound_session_id: str | None = None,
+    has_active_scenario: bool = False,
 ) -> ContextSnapshot:
     """Build the sole per-turn context view from verified session and UI data."""
     state = conversation.state_json or {}
@@ -81,6 +82,7 @@ def build_context_snapshot(
         last_preference_order=list(state.get("last_preference_order") or [])[:10],
         last_negative_scope=list(state.get("last_negative_scope") or [])[:10],
         context_warnings=list(dict.fromkeys(warnings)),
+        has_active_scenario=has_active_scenario,
         task_state=load_task_state(state, {item.id for item in products}),
     )
 
