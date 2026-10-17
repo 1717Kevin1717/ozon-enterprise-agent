@@ -34,6 +34,8 @@ class ProviderFailure(RuntimeError):
         failure_stage: str | None = None,
         elapsed_ms: int | None = None,
         upstream_status: int | None = None,
+        cause_class: str | None = None,
+        os_error_code: int | None = None,
     ):
         super().__init__(code)
         self.code = code
@@ -43,6 +45,8 @@ class ProviderFailure(RuntimeError):
         self.failure_stage = failure_stage
         self.elapsed_ms = elapsed_ms
         self.upstream_status = upstream_status
+        self.cause_class = cause_class
+        self.os_error_code = os_error_code
 
 
 class ModelProvider(ABC):

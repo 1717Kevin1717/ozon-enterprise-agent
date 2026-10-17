@@ -655,6 +655,32 @@ def test_explicit_constraint_queries_remain_product_filters(query):
     assert parsed.name == understood.intent == "product_filter"
 
 
+def test_semantic_filter_executes_all_query_derived_constraints():
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "product_filter",
+            operation="CREATE",
+            requested_dimensions=["filters", "profit", "risk", "compliance"],
+            planned_tools=["filter_products"],
+        ),
+        "筛选净利率不低于30%、风险低且合规通过的商品。",
+    )
+
+    assert understood.intent == "product_filter"
+    assert parsed.filters["min_margin_rate"] == 0.3
+    assert parsed.filters["risk_level"] == "low"
+    assert parsed.filters["compliance_status"] == "approved"
+
+
+def test_semantic_filter_cannot_execute_with_empty_backend_criteria():
+    with pytest.raises(SemanticPlanValidationFailure) as exc:
+        validate_semantic_plan(
+            plan("product_filter", requested_dimensions=["filters"], planned_tools=["filter_products"]),
+            "请筛选商品",
+        )
+    assert exc.value.rule_id == "SEM004"
+
+
 def test_t01_profit_semantic_uses_backend_profit_plan():
     parsed, understood = validate_semantic_plan(
         plan("product_detail", requested_dimensions=["profit"], planned_tools=[]),
@@ -887,3 +913,45 @@ def test_semantic_guard_returns_structured_reason(updates, query, rule_id, reaso
     assert failure.failure_code == "SEMANTIC_PLAN_VALIDATION_FAILED"
     assert failure.stage == "SEMANTIC_VALIDATE"
     assert (failure.rule_id, failure.reason_code, failure.field) == (rule_id, reason_code, field)
+
+
+@pytest.mark.parametrize("query, expected_positions", [
+    ("最终建议我优先研究哪个？为什么？", [1, 2]),
+    ("这几个中你建议优先验证哪款？依据是什么？", [1, 2, 3]),
+])
+def test_active_collection_decision_followup_reconciles_provider_filter_label(query, expected_positions):
+    parsed, understood = validate_semantic_plan(
+        plan(
+            "product_filter", operation="RECOMMEND_TOP_K",
+            requested_dimensions=["recommendation", "decision_reason", "profit"],
+            planned_tools=["filter_products"],
+        ),
+        query,
+        context_packet={"task_context": {
+            "collection_member_count": 3,
+            "has_collection_ranking_state": True,
+            "collection_ranking_dimensions": ["recommendation"],
+            "scenario_has_focus": False,
+        }},
+    )
+
+    assert parsed.name == understood.intent == "collection_analysis"
+    assert understood.operation == "EXPLAIN_RANKING"
+    assert understood.ordinal_references == expected_positions
+    assert understood.requested_dimensions == ["recommendation"]
+    assert understood.planned_tools == ["analyze_collection"]
+
+
+def test_collection_decision_anchor_does_not_hide_unknown_provider_dimension():
+    with pytest.raises(SemanticPlanValidationFailure) as caught:
+        validate_semantic_plan(
+            plan("product_filter", operation="RECOMMEND_TOP_K",
+                 requested_dimensions=["recommendation", "unregistered_business_dimension"]),
+            "这几个中你建议优先验证哪款？依据是什么？",
+            context_packet={"task_context": {
+                "collection_member_count": 3,
+                "has_collection_ranking_state": True,
+                "collection_ranking_dimensions": ["recommendation"],
+            }},
+        )
+    assert (caught.value.rule_id, caught.value.reason_code) == ("SEM004", "INVALID_DIMENSION")

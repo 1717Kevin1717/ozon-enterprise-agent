@@ -19,8 +19,8 @@ _IGNORE_SELECTION = re.compile(
     r"(?:先别看|不要看|不看|忽略)(?:这几个|这两个|这些|当前|已选|所选|选择|对比中心)?|"
     r"排除(?:这几个|这两个|这些|当前|已选|所选|选择|对比中心)"
 )
-_ORDINAL = re.compile(r"第([一二两三四五六七八九十\d]+)个|排第([一二两三四五六七八九十\d]+)(?:个|款)?|"
-                      r"列表里的第([一二两三四五六七八九十\d]+)(?:个|款)?|前一个|后一个")
+_ORDINAL = re.compile(r"第([一二两三四五六七八九十\d]+)(?:名|位|个|款)|排第([一二两三四五六七八九十\d]+)(?:名|位|个|款)?|"
+                      r"列表里的第([一二两三四五六七八九十\d]+)(?:名|位|个|款)?|榜首|首位|top\s*([1-9]\d*)|前一个|后一个", re.I)
 _SINGULAR_REFERENCE = re.compile(r"(?:它|这个(?:商品|产品)?|那个(?:商品|产品)?|刚才那个(?:商品|产品)?)")
 _ELLIPSIS = re.compile(r"(?:换成|改成).+呢|(?:那|利润|价格|风险|净利率).*(?:呢|方面)|这个(?:利润|价格|数|指标)|它的")
 _ONE_ONLY = re.compile(r"只能留一个|只留一个|必须选一个|二选一")
@@ -95,6 +95,8 @@ def _ordinal_index(query: str, order_size: int) -> int | None:
         return max(0, order_size - 2) if order_size else None
     if "后一个" in match.group(0):
         return order_size - 1 if order_size else None
+    if match.group(0) in {"榜首", "首位"}:
+        return 0
     raw = next((value for value in match.groups() if value), "")
     number = int(raw) if raw.isdigit() else _CN_NUMBERS.get(raw)
     return number - 1 if number and number > 0 else None
@@ -155,10 +157,15 @@ def resolve_context_reference(
                 inherited_dimensions=inherited, confidence=1,
             )
 
+    ranking_pair_requested = bool(
+        re.search(r"(?:第一|第一个|榜首).*(?:第二|第二个)|(?:第二|第二个).*(?:第一|第一个|榜首)", query)
+        or re.search(r"(?:它|这个).*(?:为什么|为何|凭什么).*(?:第一|榜首|首位)", query)
+        or re.search(r"(?:为什么|为何|凭什么|原因|依据).*(?:第一|榜首|首位)|(?:第一|榜首|首位).*(?:为什么|为何|凭什么|原因|依据)", query)
+    )
     if (
         understanding.operation == "EXPLAIN_RANKING"
         and snapshot.task_state.active_collection
-        and re.search(r"(?:第一|第一个|榜首).*(?:第二|第二个)|(?:第二|第二个).*(?:第一|第一个|榜首)", query)
+        and ranking_pair_requested
     ):
         ranked = snapshot.task_state.active_collection.top_product_ids[:2]
         if len(ranked) == 2:
@@ -204,15 +211,52 @@ def resolve_context_reference(
             reference_expression="single_selection_price_scenario", inherited_dimensions=inherited, confidence=0.98,
         )
 
+    result_set = snapshot.task_state.active_result_set
+    collection = snapshot.task_state.active_collection
+    focus = snapshot.task_state.conversation_focus
+    focus_on_result = bool(
+        result_set and result_set.product_ids
+        and focus.focus_type == "CANONICAL_ORDERED_RESULT"
+        and focus.focus_id == result_set.result_id
+    )
+    focus_on_collection = bool(
+        collection and collection.top_product_ids
+        and focus.focus_type == "CANONICAL_ORDERED_RESULT"
+        and focus.focus_id == collection.result_id
+    )
+    latest_result = bool(result_set and result_set.product_ids and (
+        focus_on_result or (not focus_on_collection and (not collection or result_set.source_task_revision > collection.source_task_revision))
+    ))
     task_order = (
+        result_set.product_ids if latest_result else
+        collection.top_product_ids if collection and collection.top_product_ids else
         snapshot.task_state.active_comparison_set.product_ids
         if snapshot.task_state.active_comparison_set else
-        snapshot.task_state.active_collection.top_product_ids
-        if snapshot.task_state.active_collection else
-        snapshot.task_state.active_result_set.product_ids
-        if snapshot.task_state.active_result_set else []
+        result_set.product_ids if result_set else []
     )
-    ordinal_order = snapshot.last_comparison_order or task_order
+    ordinal_order = task_order or snapshot.last_comparison_order
+    ordinal_matches = list(_ORDINAL.finditer(query))
+    range_reference = bool(re.search(r"前(?:[两二2](?:名|个|位)|俩)|头(?:两个|俩)", query))
+    semantic_ordinals = list(dict.fromkeys(understanding.ordinal_references))
+    if len(ordinal_matches) >= 2 or range_reference or len(semantic_ordinals) >= 2:
+        positions = (
+            [value - 1 for value in semantic_ordinals]
+            if len(semantic_ordinals) >= 2 else
+            list(dict.fromkeys(
+                _ordinal_index(match.group(0), len(ordinal_order)) for match in ordinal_matches
+            )) if ordinal_matches else [0, 1]
+        )
+        if len(positions) == 1 and range_reference:
+            positions = [0, 1]
+        if positions and all(index is not None and 0 <= index < len(ordinal_order) for index in positions):
+            return ReferenceResolutionResult(
+                product_ids=[ordinal_order[index] for index in positions], source="ordinal_reference",
+                reference_expression="ordered_result", inherited_dimensions=inherited, confidence=1,
+            )
+        return ReferenceResolutionResult(
+            source="ordinal_reference", reference_expression="ordered_result",
+            inherited_dimensions=inherited, requires_clarification=True, failure_code="ORDINAL_OUT_OF_RANGE",
+        )
     ordinal = _ordinal_index(query, len(ordinal_order))
     if ordinal is not None:
         if 0 <= ordinal < len(ordinal_order):
@@ -248,6 +292,11 @@ def resolve_context_reference(
 
     singular = _SINGULAR_REFERENCE.search(query)
     if singular:
+        if ordinal_order and re.search(r"(?:它|这个).*(?:为什么|为何|凭什么).*(?:第一|榜首|首位)", query):
+            return ReferenceResolutionResult(
+                product_ids=[ordinal_order[0]], source="ordinal_reference",
+                reference_expression="current_ranking_leader", inherited_dimensions=inherited, confidence=1,
+            )
         # Compatibility for clients that predate selection_bound_session_id:
         # a one-item selection may bind after at least one successful session turn,
         # but never on the first turn of a newly created session.

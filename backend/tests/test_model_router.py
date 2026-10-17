@@ -155,6 +155,36 @@ def test_p01_qwen_only_success_executes_qwen_and_no_fallback(deterministic_clien
     assert {item["tool_name"] for item in result["tool_results"]} == {"get_product", "calculate_profit"}
 
 
+def test_admin_can_require_qwen_semantic_handoff_without_changing_normal_fastpath(deterministic_client, monkeypatch):
+    headers, items = seed(deterministic_client, "provider-policy-semantic-handoff")
+    target = by_title(items, "桌面理线器")
+    qwen = MockProvider("qwen", [frame("product_price", ["price"], ["get_product"], mentions=[target["title"]])])
+    install_router(monkeypatch, ModelRouter([qwen], primary_name="qwen", reasoning_name="deepseek"))
+
+    ordinary = ask(deterministic_client, headers, target["title"] + "多少钱？", provider_execution_policy="QWEN_ONLY")
+    assert ordinary["model_route"] == "DETERMINISTIC_FAST_PATH"
+    assert qwen.calls == []
+
+    forced = ask(
+        deterministic_client, headers, target["title"] + "多少钱？",
+        provider_execution_policy="QWEN_ONLY", require_semantic_handoff=True,
+    )
+    assert forced["model_route"] == "QWEN_SEMANTIC"
+    assert forced["active_provider"] == "qwen"
+    assert len(qwen.calls) == 1
+    assert forced["products"][0]["id"] == target["id"]
+
+
+def test_semantic_handoff_requires_admin_and_qwen_only(deterministic_client):
+    headers, _ = seed(deterministic_client, "provider-policy-semantic-handoff-safety")
+    endpoint = "/api/v1/agent/ask"
+    base = {"query": "桌面理线器多少钱？", "require_semantic_handoff": True}
+    viewer = deterministic_client.post(endpoint, headers={**headers, "X-Role": "viewer"}, json={**base, "provider_execution_policy": "QWEN_ONLY"})
+    assert viewer.status_code == 403
+    auto = deterministic_client.post(endpoint, headers=headers, json={**base, "provider_execution_policy": "AUTO"})
+    assert auto.status_code == 422
+
+
 def test_p02_qwen_only_provider_failure_never_calls_fallback(deterministic_client, monkeypatch):
     headers, items = seed(deterministic_client, "provider-policy-qwen-failure")
     target = by_title(items, "桌面理线器")
@@ -393,6 +423,13 @@ def test_provider_transport_diagnostics_reach_agent_audit(deterministic_client, 
     assert audit["failure_stage"] == "DNS_CONNECT"
     assert audit["latency_ms"] == 23
     assert audit["upstream_status"] is None
+    assert len(audit["diagnostic_call_id"]) == 32
+    assert audit["attempt_number"] == 1
+    assert audit["retry_count"] == 0
+    assert audit["cause_class"] is None
+    assert audit["os_error_code"] is None
+    assert result["run_id"]
+    assert any(item.get("diagnostic_call_id") == audit["diagnostic_call_id"] for item in result["trace"])
     assert result["fallback_used"] is True
 
 

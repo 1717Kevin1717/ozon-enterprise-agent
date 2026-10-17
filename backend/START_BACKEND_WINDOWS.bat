@@ -33,14 +33,18 @@ if errorlevel 1 goto :install_failed
 if errorlevel 1 goto :install_failed
 
 if not exist ".env" copy .env.example .env >nul
+if not exist "data" mkdir "data"
 echo.
 echo Starting ZMT Ozon Enterprise Backend at http://127.0.0.1:8000
+>>"data\backend_lifecycle.log" echo START %date% %time% launcher=START_BACKEND_WINDOWS.bat
 start "" http://127.0.0.1:8000
 .venv-py314\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+set "uvicorn_exit=%errorlevel%"
 echo.
-echo The backend has stopped.
+>>"data\backend_lifecycle.log" echo EXIT %date% %time% code=%uvicorn_exit%
+echo The backend has stopped with exit code %uvicorn_exit%.
 pause
-exit /b 0
+exit /b %uvicorn_exit%
 
 :install_failed
 echo.

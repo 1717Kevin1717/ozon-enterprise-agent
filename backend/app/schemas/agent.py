@@ -59,8 +59,18 @@ EntityRole = Literal[
 
 class ResultSetState(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    result_id: str = ""
+    session_id: str = ""
     product_ids: list[str] = Field(default_factory=list, max_length=100)
     source_task_type: str
+    source_operation: str = "CREATE"
+    scope_type: str = "enterprise_catalog"
+    parent_collection_revision: int | None = None
+    requested_top_k: int | None = Field(default=None, ge=1, le=100)
+    effective_top_k: int | None = Field(default=None, ge=0, le=100)
+    selection_reason: str = ""
+    created_at: datetime | None = None
+    result_kind: Literal["canonical", "scenario"] = "canonical"
     filter_spec: dict[str, Any] = Field(default_factory=dict)
     sort_spec: list[str] = Field(default_factory=list, max_length=10)
     ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
@@ -113,6 +123,13 @@ class CollectionState(BaseModel):
     """Session-local collection membership and ordering; never cached business facts."""
 
     model_config = ConfigDict(extra="forbid")
+    result_id: str = ""
+    session_id: str = ""
+    source_operation: str = "ANALYZE_COLLECTION"
+    parent_collection_revision: int | None = None
+    ranking_spec: list[str] = Field(default_factory=list, max_length=10)
+    effective_top_k: int = Field(default=0, ge=0, le=20)
+    created_at: datetime | None = None
     collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
     product_ids: list[str] = Field(default_factory=list, max_length=100)
     ranked_product_ids: list[str] = Field(default_factory=list, max_length=100)
@@ -136,6 +153,20 @@ class FocusedCollectionMemberState(BaseModel):
     focus_operation: Literal["EXPLAIN_RANKING", "IDENTIFY_EVIDENCE_GAPS"]
 
 
+class ConversationFocusState(BaseModel):
+    """Backend-owned pointer to the state branch that follow-ups may reference."""
+
+    model_config = ConfigDict(extra="forbid")
+    focus_type: Literal[
+        "CANONICAL_ORDERED_RESULT", "SCENARIO_RESULT",
+        "COMPARISON_RESULT", "PRODUCT_DETAIL", "NONE",
+    ] = "NONE"
+    focus_id: str = ""
+    focus_revision: int = Field(default=0, ge=0)
+    focus_source_operation: str = ""
+    updated_at: datetime | None = None
+
+
 class TaskState(BaseModel):
     """Session-scoped, backend-controlled task continuity; never LLM facts."""
 
@@ -153,6 +184,7 @@ class TaskState(BaseModel):
     active_recommendation: RecommendationState | None = None
     active_collection: CollectionState | None = None
     focused_collection_member: FocusedCollectionMemberState | None = None
+    conversation_focus: ConversationFocusState = Field(default_factory=ConversationFocusState)
     filter_spec: dict[str, Any] = Field(default_factory=dict)
     sort_spec: list[str] = Field(default_factory=list, max_length=10)
     ranking_spec: list[str] = Field(default_factory=list, max_length=10)
@@ -188,6 +220,9 @@ class SemanticTaskContextPacket(BaseModel):
     has_focused_collection_member: bool = False
     has_collection_ranking_state: bool = False
     has_active_scenario: bool = False
+    focus_type: str = "NONE"
+    focus_revision: int = Field(default=0, ge=0)
+    scenario_has_focus: bool = False
     last_successful_action: str | None = None
 
 
@@ -372,6 +407,11 @@ class ProviderCallAudit(BaseModel):
     failure_code: str | None = None
     exception_class: str | None = None
     failure_stage: str | None = None
+    cause_class: str | None = None
+    os_error_code: int | None = None
+    diagnostic_call_id: str | None = None
+    attempt_number: int = Field(default=1, ge=1)
+    retry_count: int = Field(default=0, ge=0)
     upstream_status: int | None = Field(default=None, ge=100, le=599)
     validation_rule_id: str | None = None
     validation_reason_code: str | None = None
@@ -587,6 +627,8 @@ class CollectionCandidateResult(BaseModel):
     eligible: bool
     recommendation_score: float
     ranking_reasons: list[str] = Field(default_factory=list, max_length=20)
+    metric_evidence: dict[str, Any] = Field(default_factory=dict)
+    comparison_to_next: dict[str, Any] = Field(default_factory=dict)
     key_positives: list[str] = Field(default_factory=list, max_length=20)
     main_risks: list[str] = Field(default_factory=list, max_length=20)
     evidence_gaps: list[CollectionEvidenceGap] = Field(default_factory=list, max_length=100)
@@ -612,6 +654,18 @@ class CollectionAnalysisResult(BaseModel):
     selection_comparison: dict[str, Any] = Field(default_factory=dict)
     ineligible_status_counts: dict[str, int] = Field(default_factory=dict)
     notice: str = ""
+
+
+class RuntimeIdentity(BaseModel):
+    """Non-sensitive runtime identity used only to diagnose stale deployments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    git_commit: str = "unknown"
+    runtime_path: str = ""
+    app_version: str = "0.1.0"
+    process_id: int | None = Field(default=None, ge=1)
+    started_at_utc: str = ""
 
 
 class AgentRunResult(BaseModel):
@@ -668,6 +722,7 @@ class AgentRunResult(BaseModel):
     decision_summary: dict[str, Any] = Field(default_factory=dict)
     data_sufficiency: DataSufficiencyResult | None = None
     collection_analysis: CollectionAnalysisResult | None = None
+    ranking_analysis: dict[str, Any] = Field(default_factory=dict)
     profit_diagnosis: list[dict[str, Any]] = Field(default_factory=list)
     historical_decision_analysis: list[dict[str, Any]] = Field(default_factory=list)
     human_review_priority: list[dict[str, Any]] = Field(default_factory=list)
@@ -681,6 +736,7 @@ class AgentRunResult(BaseModel):
     data_completeness: dict[str, Any] | None = None
     provider_notice: str = ""
     model_summary: str = ""
+    runtime_identity: RuntimeIdentity = Field(default_factory=RuntimeIdentity)
 
     @model_validator(mode="after")
     def validate_evidence_bindings(self):

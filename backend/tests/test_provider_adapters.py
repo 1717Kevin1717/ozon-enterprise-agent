@@ -250,6 +250,21 @@ def test_tls_failure_is_classified_from_exception_chain(monkeypatch):
     assert failure.failure_stage == "TLS_CONNECT"
 
 
+def test_connect_error_records_only_safe_os_cause(monkeypatch):
+    def connection_error(request):
+        error = httpx.ConnectError("sensitive endpoint and token", request=request)
+        error.__cause__ = OSError(10061, "sensitive socket detail")
+        return error
+
+    failure = _transport_failure(monkeypatch, connection_error)
+    assert failure.code == "CONNECT_ERROR"
+    assert failure.cause_class == type(OSError(10061, "")).__name__
+    assert failure.os_error_code == 10061
+    assert failure.elapsed_ms is not None
+    assert "sensitive" not in str(failure)
+    assert "sensitive" not in repr((failure.cause_class, failure.os_error_code))
+
+
 def test_request_serialization_failure_stops_before_transport():
     provider = _provider()
     with pytest.raises(ProviderFailure) as caught:

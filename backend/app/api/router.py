@@ -12,6 +12,7 @@ from app.agent.model_router import build_model_router
 from app.agent.tools import compare_products, rule_agent_ask
 from app.agent.zhipu_agent import zhipu_agent_ask
 from app.core.config import settings
+from app.core.runtime_identity import runtime_identity
 from app.db.models import AgentRun, Company, ConversationMessage, ConversationSession, Memory, Product, ProductDecision, ProductRelation
 from app.db.session import get_session
 from app.repositories.products import ProductRepository, product_view
@@ -191,7 +192,7 @@ async def agent_provider_status(session: AsyncSession, company_id: str) -> dict:
 @router.get("/health")
 async def health(session: AsyncSession = Depends(get_session)):
     status_payload = await agent_provider_status(session, settings.default_company_id)
-    return {"success": True, "data": {"status": "ok", "agent_mode": status_payload["response_mode"], "llm_provider": settings.llm_provider, "llm_configured": status_payload["configured"], **status_payload}}
+    return {"success": True, "data": {"status": "ok", "agent_mode": status_payload["response_mode"], "llm_provider": settings.llm_provider, "llm_configured": status_payload["configured"], "runtime_identity": runtime_identity(), **status_payload}}
 
 
 @router.get("/agent/status")
@@ -530,8 +531,10 @@ async def ask_agent(data: AgentAsk, ctx: dict = Depends(context), session: Async
     require_role(ctx,"analyst")
     provider = settings.llm_provider.lower()
     handler = dual_model_agent_ask if provider in {"qwen", "dual", "model_router"} else zhipu_agent_ask if provider == "zhipu" else rule_agent_ask
-    if data.provider_execution_policy != "AUTO":
+    if data.provider_execution_policy != "AUTO" or data.require_semantic_handoff:
         require_role(ctx, "company_admin")
+        if data.require_semantic_handoff and data.provider_execution_policy != "QWEN_ONLY":
+            raise HTTPException(status_code=422, detail={"code": "QWEN_ONLY_REQUIRED", "message": "强制语义交接仅支持 QWEN_ONLY 约束。"})
         if handler is not dual_model_agent_ask:
             raise HTTPException(status_code=409, detail={"code": "PROVIDER_POLICY_UNAVAILABLE", "message": "当前 Agent 模式不支持请求级模型约束。"})
     if handler is dual_model_agent_ask:
@@ -539,13 +542,14 @@ async def ask_agent(data: AgentAsk, ctx: dict = Depends(context), session: Async
         result = await handler(
             session, ctx["company_id"], ctx["user_id"], ctx["role"], data.query, data.session_id,
             data.selected_product_ids, data.selection_revision, data.selection_bound_session_id,
-            provider_policy=ProviderExecutionPolicy(data.provider_execution_policy),
+            provider_policy=ProviderExecutionPolicy(data.provider_execution_policy, require_semantic_handoff=data.require_semantic_handoff),
         )
     else:
         result = await handler(
             session, ctx["company_id"], ctx["user_id"], ctx["role"], data.query, data.session_id,
             data.selected_product_ids, data.selection_revision, data.selection_bound_session_id,
         )
+    result["runtime_identity"] = runtime_identity()
     return {"success":True,"data":result}
 
 @router.get("/memory/search")

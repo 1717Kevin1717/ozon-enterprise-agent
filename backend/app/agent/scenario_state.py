@@ -103,7 +103,7 @@ def _ranking_dimensions(query: str) -> tuple[str, ...]:
 def _collection_scope(query: str) -> tuple[ScenarioCollectionScope | None, int | None]:
     top_match = re.search(r"前\s*(\d+)\s*(?:名|个|件|款)?", query, re.I)
     chinese_top = next((value for text, value in (
-        ("前三", 3), ("前两", 2), ("前二", 2), ("前五", 5), ("前四", 4), ("第一", 1),
+        ("前三", 3), ("前两", 2), ("前二", 2), ("前五", 5), ("前四", 4),
     ) if text in query), None)
     if top_match or chinese_top:
         return "TOP_K", max(1, min(20, int(top_match.group(1)))) if top_match else chinese_top
@@ -126,30 +126,49 @@ def scenario_entity_text(query: str) -> str:
         prefix = normalized[:field_match.start()]
     else:
         prefix = re.split(r"评分|销量|评论|搜索量|趋势|竞争|合规", normalized, maxsplit=1)[0]
-    return re.sub(r"^(?:如果|假设|假如)\s*", "", prefix).strip(" ，,：:")
+    prefix = re.sub(r"^(?:如果|假设|假如)\s*", "", prefix).strip(" ，,：:")
+    if re.fullmatch(r"(?:当前|现在|原来)?\s*(?:第[一二两三四五六七八九十\d]+(?:名|个|位)|榜首|首位|top\s*\d+)(?:的)?", prefix, re.I):
+        return ""
+    return prefix
 
 
-def parse_scenario_command(query: str, *, has_active_scenario: bool) -> ScenarioCommand | None:
+def parse_scenario_command(
+    query: str,
+    *,
+    has_active_scenario: bool,
+    scenario_has_focus: bool | None = None,
+) -> ScenarioCommand | None:
     """Recognize general scenario operations without binding catalogue identity or facts."""
 
     normalized = " ".join(str(query).strip().split())
     field = _scenario_field(normalized)
     collection_scope, collection_top_k = _collection_scope(normalized)
     ranking_dimensions = _ranking_dimensions(normalized)
-    if has_active_scenario and re.search(r"全部.*(?:恢复|还原).*原值|恢复全部.*原值|清空.*(?:假设|调整|情景)|重置.*(?:假设|情景)", normalized):
+    scenario_has_focus = has_active_scenario if scenario_has_focus is None else scenario_has_focus
+    explicit_scenario_reference = bool(re.search(r"假设|情景|模拟|调整后|假设里|情景里", normalized))
+    scenario_continuation = bool(scenario_has_focus or explicit_scenario_reference)
+    if has_active_scenario and scenario_continuation and re.search(r"全部.*(?:恢复|还原).*原值|恢复全部.*原值|清空.*(?:假设|调整|情景)|重置.*(?:假设|情景)", normalized):
         return ScenarioCommand(operation="RESET_SCENARIO")
-    if has_active_scenario and re.search(r"恢复|还原", normalized) and re.search(r"原来.*(?:排序|排名)|(?:排序|排名).*原来", normalized):
+    if has_active_scenario and scenario_continuation and re.search(r"(?:撤销|撤掉|取消|清除).*(?:这个|当前|刚才)?(?:假设|情景|调整)|(?:这个|当前|刚才)(?:假设|情景|调整).*(?:撤销|撤掉|取消|清除)", normalized):
         return ScenarioCommand(operation="RESET_SCENARIO")
-    if has_active_scenario and field and re.search(r"恢复|还原|取消.*(?:调整|假设)", normalized):
+    if has_active_scenario and scenario_continuation and re.search(r"恢复|还原", normalized) and re.search(r"原来.*(?:排序|排名)|(?:排序|排名).*原来", normalized):
+        return ScenarioCommand(operation="RESET_SCENARIO")
+    if has_active_scenario and scenario_continuation and field and re.search(r"恢复|还原|取消.*(?:调整|假设)", normalized):
         return ScenarioCommand(operation="REMOVE_OVERRIDE", field=field)
-    if has_active_scenario and re.search(r"(?:和|与).*(?:原来|原值|基准).*(?:比|比较)|(?:原来|原值|基准).*(?:比|比较|变化|超过)", normalized):
+    if has_active_scenario and scenario_continuation and re.search(r"(?:撤销|取消|恢复).*(?:刚才|最近|上次).*(?:调整|修改|假设)", normalized):
+        return ScenarioCommand(operation="REMOVE_OVERRIDE")
+    if has_active_scenario and scenario_continuation and re.search(r"(?:和|与|跟).*(?:原来|原始|原值|基准).*(?:比|比较)|(?:原来|原始|原值|基准).*(?:比|比较|变化|超过)", normalized):
         return ScenarioCommand(operation="COMPARE_SCENARIO")
-    if has_active_scenario and re.search(r"(?:当前|这个|刚才).*(?:假设|情景)", normalized) and re.search(r"重排|重新?排|排序", normalized):
+    if has_active_scenario and scenario_continuation and re.search(r"(?:当前|这个|刚才).*(?:假设|情景)", normalized) and re.search(r"重排|重新?排|排序", normalized):
         return ScenarioCommand(operation="UPDATE_SCENARIO", ranking_dimensions=ranking_dimensions)
-    if has_active_scenario and re.search(r"第[一二两三四五六七八九十\d]+名|第一名|排名", normalized) and re.search(r"谁|哪个|解释|为什么|为何", normalized):
+    if has_active_scenario and scenario_continuation and re.search(r"第[一二两三四五六七八九十\d]+名|第一名|排名", normalized) and re.search(r"谁|哪个|解释|为什么|为何", normalized):
         return ScenarioCommand(operation="EXPLAIN_SCENARIO", ranking_dimensions=ranking_dimensions)
-    if has_active_scenario and re.search(r"(?:现在|当前|这个假设|刚才那个假设).*(?:利润|净利率|roi|风险|推荐|结果|怎么算)|(?:解释|说明).*(?:假设|情景|结果)", normalized, re.I):
+    if has_active_scenario and scenario_continuation and re.search(r"(?:现在|当前|这个假设|刚才那个假设).*(?:利润|净利率|roi|风险|推荐|结果|怎么算)|(?:解释|说明).*(?:假设|情景|结果)", normalized, re.I):
         return ScenarioCommand(operation="EXPLAIN_SCENARIO")
+    if has_active_scenario and scenario_continuation and re.search(r"(?:这个|这次|刚才(?:那个)?)(?:调整|变化|改动)", normalized) and re.search(r"利润|净利率|roi|风险|推荐|排名|排序|变化|影响|结果", normalized, re.I):
+        return ScenarioCommand(operation="EXPLAIN_SCENARIO")
+    if has_active_scenario and explicit_scenario_reference and re.search(r"回到|查看|看看|结果|排名", normalized):
+        return ScenarioCommand(operation="EXPLAIN_SCENARIO", ranking_dimensions=ranking_dimensions)
 
     # Ranking/task mutations are not hypothetical calculations. Unanchored
     # text without an allowed override field stays available to TaskState.
@@ -158,15 +177,15 @@ def parse_scenario_command(query: str, *, has_active_scenario: bool) -> Scenario
         return None
 
     mutation_signal = bool(re.search(
-        r"(?:如果|假设|假如|再|继续|另外|同时|并且|然后).*(?:降低|下降|减少|降|提高|上升|增加|涨|改成|改为|设为|调整为|减半|翻倍)|"
-        r"(?:降低|下降|减少|降|提高|上升|增加|涨|改成|改为|设为|调整为|减半|翻倍).*(?:会怎样|会怎么样|利润|净利率|roi|风险|推荐)",
+        r"(?:如果|假设|假如|再|继续|另外|同时|并且|然后).*(?:降低|下降|减少|降|少\s*\d|提高|上升|增加|涨|改成|改为|设为|调整为|减半|翻倍)|"
+        r"(?:降低|下降|减少|降|少\s*\d|提高|上升|增加|涨|改成|改为|设为|调整为|减半|翻倍).*(?:会怎样|会怎么样|利润|净利率|roi|风险|推荐)",
         normalized,
         re.I,
     ))
     if not mutation_signal:
         return None
     follows_existing = bool(re.search(r"^(?:再|继续|另外|同时|并且|然后)", normalized))
-    operation: ScenarioOperation = "UPDATE_SCENARIO" if has_active_scenario or follows_existing else "CREATE_SCENARIO"
+    operation: ScenarioOperation = "UPDATE_SCENARIO" if (has_active_scenario and scenario_has_focus) or follows_existing else "CREATE_SCENARIO"
     if not field:
         return ScenarioCommand(
             operation=operation, unsupported_field=True,
@@ -180,7 +199,7 @@ def parse_scenario_command(query: str, *, has_active_scenario: bool) -> Scenario
         return ScenarioCommand(operation=operation, field=field, mutation_type="MULTIPLY", value=0.5, unit="MULTIPLIER", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
     if re.search(r"翻倍|两倍", normalized):
         return ScenarioCommand(operation=operation, field=field, mutation_type="MULTIPLY", value=2, unit="MULTIPLIER", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
-    if percent and re.search(r"降低|下降|减少|降", normalized):
+    if percent and re.search(r"降低|下降|减少|降|少\s*\d", normalized):
         return ScenarioCommand(operation=operation, field=field, mutation_type="DECREASE_PERCENT", value=float(percent.group(1)), unit="PERCENT", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
     if percent and re.search(r"提高|上升|增加|涨", normalized):
         return ScenarioCommand(operation=operation, field=field, mutation_type="INCREASE_PERCENT", value=float(percent.group(1)), unit="PERCENT", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
@@ -188,7 +207,7 @@ def parse_scenario_command(query: str, *, has_active_scenario: bool) -> Scenario
         return ScenarioCommand(operation=operation, field=field, mutation_type="SET", value=float(percent.group(1)), unit="PERCENT", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
     if rub and re.search(r"改成|改为|设为|调整为", normalized):
         return ScenarioCommand(operation=operation, field=field, mutation_type="SET", value=float(rub.group(1)), unit="RUB", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
-    if rub and re.search(r"降低|下降|减少|降", normalized):
+    if rub and re.search(r"降低|下降|减少|降|少\s*\d", normalized):
         return ScenarioCommand(operation=operation, field=field, mutation_type="DECREASE_BY", value=float(rub.group(1)), unit="RUB", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
     if rub and re.search(r"提高|上升|增加|涨", normalized):
         return ScenarioCommand(operation=operation, field=field, mutation_type="INCREASE_BY", value=float(rub.group(1)), unit="RUB", collection_scope=collection_scope, top_k=collection_top_k, ranking_dimensions=ranking_dimensions)
@@ -314,6 +333,7 @@ class ScenarioState(BaseModel):
     session_id: str
     company_id: str
     base_product_ids: tuple[str, ...]
+    baseline_result_id: str | None = None
     base_collection_revision: int | None = Field(default=None, ge=0)
     source_task_revision: int = Field(default=0, ge=0)
     canonical_snapshot_refs: tuple[CanonicalSnapshotRef, ...]
@@ -332,6 +352,7 @@ class ScenarioState(BaseModel):
     status: Literal["HYPOTHETICAL", "SIMULATION"] = "HYPOTHETICAL"
     baseline_status: Literal["CURRENT", "STALE_BASELINE"] = "CURRENT"
     collection_baseline_status: Literal["CURRENT", "STALE_COLLECTION_BASELINE"] = "CURRENT"
+    stale_reason: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -578,6 +599,7 @@ def create_scenario(
     products: Sequence[Product],
     override_specs: Sequence[dict[str, Any]] = (),
     source_task_revision: int = 0,
+    baseline_result_id: str | None = None,
     base_collection_revision: int | None = None,
     collection_snapshot: ScenarioCollectionSnapshot | None = None,
     scenario_collection_scope: ScenarioCollectionScope | None = None,
@@ -605,6 +627,7 @@ def create_scenario(
         session_id=session_id,
         company_id=company_id,
         base_product_ids=ids,
+        baseline_result_id=baseline_result_id,
         base_collection_revision=base_collection_revision,
         source_task_revision=source_task_revision,
         canonical_snapshot_refs=tuple(CanonicalSnapshotRef(
@@ -680,6 +703,7 @@ def create_collection_scenario(
         products=[product_by_id[item] for item in member_ids],
         override_specs=targeted_specs,
         source_task_revision=collection.source_task_revision,
+        baseline_result_id=collection.result_id,
         base_collection_revision=collection.source_task_revision,
         collection_snapshot=frozen_collection,
         scenario_collection_scope=scope,
@@ -868,7 +892,17 @@ def detect_stale_collection_baseline(
 ) -> ScenarioState:
     snapshot = state.collection_snapshot
     if not snapshot:
-        return state
+        if state.base_collection_revision is None:
+            return state
+        stale = bool(
+            collection is None
+            or collection.source_task_revision != state.base_collection_revision
+        )
+        status = "STALE_COLLECTION_BASELINE" if stale else "CURRENT"
+        reason = "canonical_collection_changed" if stale else None
+        return state if (
+            state.collection_baseline_status == status and state.stale_reason == reason
+        ) else state.model_copy(update={"collection_baseline_status": status, "stale_reason": reason})
     stale = bool(
         collection is None
         or collection.source_task_revision != snapshot.source_collection_revision
@@ -877,7 +911,10 @@ def detect_stale_collection_baseline(
         or normalize_ranking_dimensions(collection.ranking_dimensions) != snapshot.canonical_ranking_spec
     )
     status = "STALE_COLLECTION_BASELINE" if stale else "CURRENT"
-    return state if state.collection_baseline_status == status else state.model_copy(update={"collection_baseline_status": status})
+    reason = "canonical_collection_changed" if stale else None
+    return state if (
+        state.collection_baseline_status == status and state.stale_reason == reason
+    ) else state.model_copy(update={"collection_baseline_status": status, "stale_reason": reason})
 
 
 def load_scenario_state(

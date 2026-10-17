@@ -24,7 +24,7 @@ REFERENCE = re.compile(
     r"我选的这些|这款|那款|该款|它|第[一二两三四五六七八九十\d]+个|前一个|后一个|那利润(?:呢)?|现在比较(?:一下)?|"
     r"剩下(?:的|那个|那些)?|已找到(?:的|那个|那些)?|没找到(?:的|那个|那些)?"
 )
-COLLECTION_REFERENCE = re.compile(r"候选池|候选集合|商品池|当前候选|这批(?:商品|候选)?|公司商品库|企业商品库|当前(?:结果|集合)|刚才(?:那批|那些|的结果)")
+COLLECTION_REFERENCE = re.compile(r"候选池|候选集合|候选商品|商品池|当前(?:这些)?候选|这些候选|这批(?:商品|候选)?|这[三四五六七八九十3-9]个商品|现在这批|全(?:部商品)?库|公司商品库|企业商品库|当前(?:结果|集合)|刚才(?:那批|那些|的结果)")
 SEMANTIC_TYPES = {"provenance_fact", "calculation_explanation", "decision_explanation", "data_quality_answer", "data_quality_policy"}
 SEMANTIC_HANDOFF_TOOLS = ("get_product", "calculate_profit", "get_sales_trend")
 REFERENCE_SLOT_ALIASES = {
@@ -105,7 +105,7 @@ def _reject(
 
 
 _COLLECTION_TASK_SIGNAL = re.compile(
-    r"(?:最值得|优先|推荐|挑|选出|前[一二三四五六七八九十\d]+|top\s*\d+|"
+    r"(?:分析|研究|值得继续|最值得|优先|推荐|挑|选出|前[一二三四五六七八九十\d]+|top\s*\d+|"
     r"证据|缺口|还缺|资料|进一步(?:验证|研究|调研)|商品方向)",
     re.I,
 )
@@ -115,13 +115,118 @@ _EXPLICIT_FILTER_SIGNAL = re.compile(
     r"(?:大于|小于|高于|低于|不低于|不高于|超过|至少|至多|>=|<=|>|<|=)\s*\d)",
     re.I,
 )
+_CANDIDATE_SCOPE_SIGNAL = re.compile(
+    r"候选(?:池|集合|商品)?|当前(?:这些)?(?:候选|商品|集合)|这些(?:候选|商品)|这批(?:商品|候选)?|现在这批"
+)
+_COLLECTION_RANKING_GOAL = re.compile(
+    r"值得(?:继续)?(?:看|研究|分析|验证|调研)?|"
+    r"最值得|优先(?:看|分析|研究|级)?|重点(?:看|分析|研究|方向)?|"
+    r"排名|排序|排前|前[一二两三四五六七八九十\d]+|top\s*\d+",
+    re.I,
+)
+
+
+def _requested_collection_top_k(query: str) -> int | None:
+    """Read a finite Top-K request independent of word order."""
+    match = re.search(r"(?:top\s*|前)([一二两三四五六七八九十\d]+)", query, re.I)
+    if not match:
+        match = re.search(
+            r"(?:找|挑|选|给|排|取|看).{0,8}?([一二两三四五六七八九十\d]+)\s*(?:个|款|件|名)",
+            query,
+            re.I,
+        )
+    if not match:
+        match = re.search(
+            r"([一二两三四五六七八九十\d]+)\s*(?:个|款|件|名).{0,10}?"
+            r"(?:值得|优先|重点|研究|分析|验证|调研)",
+            query,
+            re.I,
+        )
+    value = _finite_chinese_number(match.group(1)) if match else None
+    return max(1, min(20, value)) if value else None
+
+
+_RANKED_SELECTOR_METRICS = re.compile(
+    r"推荐度|推荐分|综合表现|净利率|净利润|(?<!净)利润|"
+    r"(?<![A-Za-z])roi(?![A-Za-z])|投资回报率|风险|竞争|需求|合规",
+    re.I,
+)
+
+
+def _ranked_selector_groups(query: str) -> list[dict]:
+    """Extract metric-specific Top-K groups without inferring product facts."""
+    metric_names = {
+        "推荐度": "recommendation_score", "推荐分": "recommendation_score",
+        "综合表现": "recommendation_score", "净利率": "net_margin",
+        "净利润": "net_profit", "利润": "net_profit",
+        "roi": "roi", "投资回报率": "roi", "风险": "risk",
+        "竞争": "competition", "需求": "demand", "合规": "compliance",
+    }
+    matches = list(_RANKED_SELECTOR_METRICS.finditer(query))
+    groups: list[dict] = []
+    for index, match in enumerate(matches):
+        segment = query[match.end():matches[index + 1].start() if index + 1 < len(matches) else len(query)]
+        count_match = re.search(
+            r"(?:最高|最低|倒数)(?:的)?\s*(?:top\s*|前|取\s*前?)?\s*([\d一二两三四五六七八九十]+)|"
+            r"(?:top\s*|前|取\s*前?)\s*([\d一二两三四五六七八九十]+)",
+            segment, re.I,
+        )
+        if not count_match:
+            continue
+        limit = _finite_chinese_number(count_match.group(1) or count_match.group(2))
+        if limit is None:
+            continue
+        metric = metric_names[match.group(0).casefold()]
+        if any(group["metric"] == metric for group in groups):
+            continue
+        groups.append({
+            "metric": metric,
+            "direction": "ASC" if re.search(r"最低|倒数|从低到高|升序", segment) else "DESC",
+            "limit": max(1, min(20, limit)),
+        })
+    return groups
+
+
+def _collection_establishment_contract(query: str) -> dict | None:
+    """Return the safe core of an explicit candidate-scope Top-K request."""
+    if (
+        not _CANDIDATE_SCOPE_SIGNAL.search(query)
+        or _EXPLICIT_FILTER_SIGNAL.search(query)
+        or _EXPLICIT_SCENARIO_MUTATION.search(query)
+    ):
+        return None
+    ranked_groups = _ranked_selector_groups(query)
+    if any(group["metric"] != "recommendation_score" for group in ranked_groups):
+        return None
+    top_k = _requested_collection_top_k(query)
+    if top_k is None or top_k < 2 or not _COLLECTION_RANKING_GOAL.search(query):
+        return None
+    gaps = bool(re.search(r"证据|缺口|缺失|还缺|资料|数据不足|不完整", query))
+    dimensions = ["recommendation", "decision"]
+    if gaps:
+        dimensions.extend(["evidence", "evidence_gap"])
+    return {
+        "intent": "collection_analysis",
+        "operation": "RECOMMEND_TOP_K",
+        "collection_reference": "candidate_pool",
+        "selector": {
+            "source": "CANDIDATE_POOL",
+            "metric": "recommendation_score",
+            "direction": "DESC",
+            "limit": top_k,
+        },
+        "top_k": top_k,
+        "dimensions": dimensions,
+        "analyses": ["EVIDENCE_GAP"] if gaps else [],
+        "evidence_gap_requested": gaps,
+    }
 
 # Phrase-level vocabulary used by structural collection parsing. These are
 # semantic atoms, not complete test utterances: word order and optional prose
 # around them do not change the resulting backend contract.
 _PLURAL_SCOPE_TERMS = (
     "哪些商品", "哪些候选", "谁", "这批商品", "这批候选", "这批货",
-    "这些商品", "这些候选", "当前商品", "当前候选",
+    "这些商品", "这些候选", "当前商品", "当前候选", "有没有",
 )
 _EVIDENCE_TERMS = ("证据缺口", "数据缺口", "证据不足", "数据不足", "证据不完整", "缺数据", "缺证据")
 _HUMAN_REVIEW_TERMS = ("审核", "复核", "人工确认", "人工介入", "人工查看", "人审", "让人看")
@@ -206,6 +311,8 @@ def _scenario_frame_has_deterministic_backend_path(value, task_get) -> bool:
 
 def _anchor_collection_semantics(query: str, value: QueryUnderstanding) -> QueryUnderstanding:
     """Stabilize provider task labels for explicit collection-analysis language."""
+    if is_ranking_policy_question(query):
+        return value
     has_collection = bool(COLLECTION_REFERENCE.search(query))
     has_collection_task = bool(_COLLECTION_TASK_SIGNAL.search(query))
     valid_collection_scenario_mutation = bool(
@@ -268,6 +375,45 @@ def _anchor_collection_semantics(query: str, value: QueryUnderstanding) -> Query
     })
 
 
+def _reconcile_collection_establishment(
+    query: str,
+    rule_value: QueryUnderstanding | None,
+    provider_value: QueryUnderstanding,
+) -> QueryUnderstanding:
+    """Keep a complete backend collection-establishment frame authoritative."""
+    contract = _collection_establishment_contract(query)
+    if not contract or rule_value is None:
+        return provider_value
+    if not (
+        rule_value.intent == "collection_analysis"
+        and rule_value.collection_reference == "candidate_pool"
+        and rule_value.top_k == contract["top_k"]
+        and rule_value.operation in {"ANALYZE_COLLECTION", "RECOMMEND_TOP_K"}
+    ):
+        return provider_value
+    return provider_value.model_copy(update={
+        "intent": "collection_analysis",
+        "task_type": "collection_analysis",
+        "question_type": "collection_analysis",
+        "operation": "RECOMMEND_TOP_K",
+        "entity_mentions": [],
+        "entity_roles": [],
+        "collection_reference": "candidate_pool",
+        "collection_selector": contract["selector"],
+        "collection_filters": [],
+        "analysis_requests": contract["analyses"],
+        "requested_dimensions": list(rule_value.requested_dimensions or contract["dimensions"]),
+        "top_k": contract["top_k"],
+        "evidence_gap_requested": contract["evidence_gap_requested"],
+        "requires_context": False,
+        "requires_task_state": False,
+        "requires_tools": True,
+        "clarification_required": False,
+        "clarification_reason": None,
+        "confidence": max(provider_value.confidence, rule_value.confidence, 0.95),
+    })
+
+
 def _anchor_active_collection_ranking(
     query: str,
     value: QueryUnderstanding,
@@ -282,7 +428,31 @@ def _anchor_active_collection_ranking(
     has_collection = bool(task_get("collection_member_count", 0))
     has_ranking = bool(task_get("has_collection_ranking_state", False))
     has_result_set = bool(task_get("result_set_count", 0))
-    if not ((has_collection and has_ranking) or has_result_set) or _EXPLICIT_CANONICAL_COLLECTION.search(query):
+    explicit_canonical_reference = bool(_EXPLICIT_CANONICAL_COLLECTION.search(query))
+    explicit_focus_switch = bool(
+        explicit_canonical_reference
+        and re.search(r"回到|返回|切回|查看|看看", query)
+        and not _rank_ordinals(query)
+        and not (value.analysis_requests or value.collection_filters or value.collection_selector)
+    )
+    if explicit_focus_switch and has_collection and has_ranking:
+        dimensions = list(task_get("collection_ranking_dimensions", []) or ["recommendation"])
+        return value.model_copy(update={
+            "intent": "collection_analysis",
+            "task_type": "collection_analysis",
+            "question_type": "collection_analysis",
+            "operation": "EXPLAIN_RANKING",
+            "entity_mentions": [],
+            "entity_roles": [],
+            "collection_reference": "current_collection",
+            "requested_dimensions": dimensions,
+            "reference_slots": list(dict.fromkeys([*value.reference_slots, "session_state"])),
+            "requires_context": True,
+            "requires_task_state": True,
+            "requires_reasoning": False,
+            "clarification_required": False,
+        })
+    if not ((has_collection and has_ranking) or has_result_set) or explicit_canonical_reference:
         return value
     if is_ranking_policy_question(query):
         return value
@@ -290,8 +460,58 @@ def _anchor_active_collection_ranking(
         return value
     if not has_collection and has_result_set and value.intent not in {"unknown", "collection_analysis"}:
         return value
-    if task_get("has_active_scenario", False) and _scenario_rank_reference(query, value) != (None, None):
+    if task_get("scenario_has_focus", False) and _scenario_rank_reference(query, value) != (None, None):
         return value
+    # A request for which member to prioritize and why is an explanation of
+    # the existing order, even when the user does not say "first place". Keep
+    # the current ranking as the sole source of identity and business facts.
+    asks_for_ranking_reason = bool(re.search(r"为什么|为何|依据|原因", query))
+    asks_which_to_prioritize = bool(
+        re.search(r"哪个|哪款|哪一个|谁", query)
+        and re.search(r"建议|推荐|优先|最值得", query)
+    )
+    asks_about_current_cohort = bool(
+        re.search(r"这几个|这些商品|这批(?:商品|候选)|当前候选", query)
+        and re.search(r"推荐|优先|排名|排在前|领先|值得", query)
+    )
+    implicit_winner_explanation = bool(
+        has_collection and has_ranking
+        and not task_get("scenario_has_focus", False)
+        and not value.entity_mentions
+        and not normalize_semantic_values(
+            value.requested_dimensions, value.metrics, value.metric,
+        ).unknown_dimensions
+        and not _EXPLICIT_FILTER_SIGNAL.search(query)
+        and not _EXPLICIT_SCENARIO_MUTATION.search(query)
+        and asks_for_ranking_reason
+        and (asks_which_to_prioritize or asks_about_current_cohort)
+        and not re.search(r"利润|净利率|\broi\b|风险|竞争|合规|售价|价格|成本|销量", query, re.I)
+    )
+    if implicit_winner_explanation:
+        dimensions = list(task_get("collection_ranking_dimensions", []) or ["recommendation"])
+        requested_count = (
+            task_get("collection_top_count", 0) or task_get("collection_member_count", 0)
+            if asks_about_current_cohort else 2
+        )
+        positions = list(range(1, min(max(int(requested_count), 2), 5) + 1))
+        return value.model_copy(update={
+            "intent": "collection_analysis",
+            "task_type": "collection_analysis",
+            "question_type": "ranking_explanation",
+            "operation": "EXPLAIN_RANKING",
+            "entity_mentions": [],
+            "entity_roles": [],
+            "collection_reference": "current_collection",
+            "requested_dimensions": dimensions,
+            "reference_slots": list(dict.fromkeys([*value.reference_slots, "session_state"])),
+            "ordinal_reference": 1,
+            "ordinal_references": positions,
+            "top_k": len(positions),
+            "requires_context": True,
+            "requires_task_state": True,
+            "requires_reasoning": False,
+            "clarification_required": False,
+        })
     # Ordinals are positions in the current ranking, never catalogue names.
     ordinals = _rank_ordinals(query)
     if not ordinals or _EXPLICIT_SCENARIO_MUTATION.search(query):
@@ -306,10 +526,18 @@ def _anchor_active_collection_ranking(
     # request and records FocusedMemberState; ranking ordinals use this anchor.
     if asks_reason and len(ordinals) == 1 and re.search(r"第\s*[一二两三四五六七八九十\d]+\s*个", query):
         return value
-    comparing = len(ordinals) > 1 or bool(re.search(r"前[两二2]名|前[两二2]个|top\s*1\s*(?:vs|和|与|跟)\s*top\s*2", query, re.I))
+    comparing = len(ordinals) > 1 or bool(re.search(
+        r"前(?:[两二2](?:名|个)|俩)|头(?:两个|俩)|top\s*1\s*(?:vs|和|与|跟)\s*top\s*2",
+        query, re.I,
+    ))
     if comparing and len(ordinals) == 1:
         ordinals = [1, 2]
     operation = "EXPLAIN_RANKING" if asks_reason else "COMPARE_COLLECTION_MEMBERS" if comparing else "LOOKUP_ORDINAL_MEMBER"
+    question_type = (
+        "ranking_compare" if comparing
+        else "ranking_explanation" if asks_reason
+        else "ordinal_lookup"
+    )
     dimensions = list(task_get("collection_ranking_dimensions", []) or []) if has_collection else []
     if not dimensions:
         dimensions = ["recommendation"]
@@ -317,7 +545,7 @@ def _anchor_active_collection_ranking(
     return value.model_copy(update={
         "intent": "collection_analysis",
         "task_type": "collection_analysis",
-        "question_type": "collection_analysis",
+        "question_type": question_type,
         "operation": operation,
         "entity_mentions": [],
         "entity_roles": [],
@@ -336,7 +564,8 @@ def _anchor_active_collection_ranking(
 
 _RANK_ORDINAL = re.compile(
     r"第\s*(?P<number>[一二两三四五六七八九十\d]+)\s*(?:名|位|个)|"
-    r"(?P<leader>榜首|首位|排头名|最靠前|最前面|排名最高|(?:榜单|排名|排在|排|前面)第?(?:一|1)|top\s*1)|"
+    r"(?:榜单|排名|排在|排|前面)第?(?P<position>[一二两三四五六七八九十\d]+)(?:名|位|个)?|"
+    r"(?P<leader>榜首|首位|排头名|最靠前|最前面|排名最高|top\s*1)|"
     r"(?P<second>top\s*2)", re.I,
 )
 
@@ -344,17 +573,34 @@ _RANK_ORDINAL = re.compile(
 def _rank_ordinals(query: str) -> list[int]:
     values = []
     for match in _RANK_ORDINAL.finditer(query):
-        number = _finite_chinese_number(match.group("number")) if match.group("number") else 2 if match.group("second") else 1
+        rank_text = match.group("number") or match.group("position")
+        number = _finite_chinese_number(rank_text) if rank_text else 2 if match.group("second") else 1
         if number is not None and number not in values:
             values.append(number)
-    if re.search(r"前(?:面)?(?:的)?[两二2](?:名|个|位|款)|前两个", query) and len(values) < 2:
-        values = [1, 2]
+    if re.search(r"比较|对比|相比", query):
+        for raw in re.findall(r"第\s*([一二两三四五六七八九十\d]+)(?=\s*(?:和|与|跟|、|比较|对比|相比|$))", query):
+            number = _finite_chinese_number(raw)
+            if number is not None and number not in values:
+                values.append(number)
+    top_match = re.search(
+        r"(?:前|头)(?:面)?(?:的)?(?:(?P<count>[一二两三四五六七八九十\d]+)(?:名|个|位|款)|(?P<pair>俩))",
+        query,
+    )
+    if top_match:
+        raw = top_match.group("count")
+        count = 2 if top_match.group("pair") else _finite_chinese_number(raw)
+        if count and 1 <= count <= 10:
+            values = list(range(1, count + 1))
     return values
 
 
 def _is_ordinal_span(value: str) -> bool:
     value = re.sub(r"^(?:呃|嗯|额|哦|麻烦|请问|帮我|刚才)[，,\s]*", "", value.strip())
-    return not value or bool(_RANK_ORDINAL.search(value) or re.search(r"前(?:面)?(?:的)?[两二2](?:名|个|位|款)", value))
+    return not value or bool(
+        _RANK_ORDINAL.search(value)
+        or re.fullmatch(r"第\s*[一二两三四五六七八九十\d]+", value)
+        or re.search(r"前(?:面)?(?:的)?(?:[两二2](?:名|个|位|款)|俩)|头(?:两个|俩)", value)
+    )
 
 
 def is_ranking_policy_question(query: str) -> bool:
@@ -374,7 +620,8 @@ _SCENARIO_ORDINAL = re.compile(
 _SCENARIO_TOP_K = re.compile(r"(?:前|top\s*)(?P<count>[一二两三四五六七八九十\d]+)(?:名|个|位)?", re.I)
 _EXPLICIT_CANONICAL_COLLECTION = re.compile(
     r"(?:原(?:来的?)?(?:候选池|候选集合|集合|排名)|"
-    r"原始(?:候选池|候选集合|集合|排名)|canonical)",
+    r"原始(?:候选池|候选集合|集合|排名)|"
+    r"当前(?:候选池|候选集合|候选)|canonical)",
     re.I,
 )
 _EXPLICIT_SCENARIO_MUTATION = re.compile(
@@ -443,6 +690,7 @@ def _anchor_active_scenario_ordinal(
     task_context,
 ) -> QueryUnderstanding:
     """Prefer the session-local hypothetical ranking for ordinal follow-ups."""
+    context_task_state = getattr(task_context, "task_state", None)
     task_get = (
         task_context.get
         if isinstance(task_context, dict)
@@ -450,6 +698,17 @@ def _anchor_active_scenario_ordinal(
     ) if task_context is not None else lambda key, default=None: default
     ordinal, top_k = _scenario_rank_reference(query, value)
     has_rank_reference = ordinal is not None or top_k is not None
+    scenario_focus = (
+        context_task_state.conversation_focus.focus_type == "SCENARIO_RESULT"
+        if context_task_state is not None else task_get("scenario_has_focus", None)
+    )
+    if scenario_focus is None or (
+        context_task_state is not None
+        and context_task_state.conversation_focus.focus_type == "NONE"
+    ):
+        # A loaded Scenario without a recorded focus is legacy session state;
+        # an explicit canonical focus still wins unless the query names Scenario.
+        scenario_focus = bool(task_get("has_active_scenario", False))
     mutation = bool(
         value.operation in {
             "CREATE_SCENARIO", "UPDATE_SCENARIO", "REMOVE_OVERRIDE",
@@ -461,6 +720,10 @@ def _anchor_active_scenario_ordinal(
     )
     if not (
         task_get("has_active_scenario", False)
+        and (
+            scenario_focus
+            or bool(re.search(r"假设|情景|模拟|调整后|假设里|情景里", query))
+        )
         and has_rank_reference
         and not mutation
         and not _EXPLICIT_CANONICAL_COLLECTION.search(query)
@@ -539,7 +802,7 @@ def semantic_intent(query, selected=(), context_snapshot: ContextSnapshot | None
     previous_fact = context_snapshot.last_fact_dimension if context_snapshot else None
     single_recommendation = bool(re.search(r"推荐\s*(?:一|1)个", q)) and not re.search(r"证据|缺口|分析.*集合|分析.*池", q)
     implicit_collection_request = bool(re.search(r"哪些.*最值得.*(?:验证|研究|调研)", q))
-    if (COLLECTION_REFERENCE.search(q) or implicit_collection_request) and not single_recommendation and re.search(r"分析|研究|方向|最值得|推荐|优先|挑|前[一二三四五\d]+|证据|缺口|资料|重排|重新?排|验证", q):
+    if (COLLECTION_REFERENCE.search(q) or implicit_collection_request) and not single_recommendation and not is_ranking_policy_question(query) and re.search(r"分析|研究|方向|最值得|推荐|优先|挑|前[一二三四五\d]+|证据|缺口|资料|重排|重新?排|验证", q):
         dimensions = ["recommendation", "decision"]
         for dimension, pattern in (
             ("profit", r"利润|净利率|赚钱"), ("roi", r"\broi\b"), ("risk", r"风险"),
@@ -592,6 +855,15 @@ def semantic_intent(query, selected=(), context_snapshot: ContextSnapshot | None
 
 def _collection_composition(query: str) -> dict | None:
     """Extract collection reference, selector/filter, and requested analyses only."""
+    establishment = _collection_establishment_contract(query)
+    if establishment:
+        return {
+            "source": "CANDIDATE_POOL",
+            "selector": establishment["selector"],
+            "filters": [],
+            "analyses": establishment["analyses"],
+            "dimensions": establishment["dimensions"],
+        }
     implicit_metric_collection = bool(re.search(
         r"(?:当前|这批|这些)?.*?(?:推荐度|推荐分|综合表现|最值得|利润|净利率|roi|风险|竞争|需求|合规)"
         r".*?(?:最高|最低|最好|倒数)(?:的)?.*?[\d一二两三四五六七八九十]+(?:个|名)|"
@@ -599,12 +871,9 @@ def _collection_composition(query: str) -> dict | None:
         r".*?(?:商品|候选|比较|对比|分析|拿出来)",
         query, re.I,
     ))
+    ranked_groups = _ranked_selector_groups(query)
     implicit_dual_selector = bool(
-        len(re.findall(
-            r"(?:推荐度|推荐分|净利润|(?<!净)利润).{0,6}?(?:top\s*\d+|前[\d一二两三四五六七八九十]+)",
-            query,
-            re.I,
-        )) >= 2
+        len(ranked_groups) >= 2
         and _has_any(query, ("比较", "对比", "区别", "差异", "同一批"))
     )
     implicit_ranked_collection = implicit_metric_collection or implicit_dual_selector or bool(re.search(
@@ -631,7 +900,15 @@ def _collection_composition(query: str) -> dict | None:
     profit_diagnosis_analysis = bool(
         re.search(r"净利率|净利润率|利润率", query)
         and ("价格" in query or "成本" in query)
-        and _has_any(query, _DIAGNOSIS_ACTION_TERMS)
+        and (
+            _has_any(query, _DIAGNOSIS_ACTION_TERMS)
+            or _has_any(query, _PLURAL_SCOPE_TERMS)
+        )
+    )
+    relative_margin_filter = bool(
+        re.search(r"净利率|净利润率|利润率", query)
+        and _has_any(query, _MARGIN_BELOW_TARGET_TERMS)
+        and _has_any(query, _PLURAL_SCOPE_TERMS)
     )
     implicit_review_collection = bool(
         review_analysis
@@ -641,13 +918,13 @@ def _collection_composition(query: str) -> dict | None:
     plural_collection_analysis = (
         _has_any(query, _PLURAL_SCOPE_TERMS)
         and (evidence_analysis or review_analysis or history_analysis or profit_diagnosis_analysis)
-    ) or implicit_review_collection or bool(
+    ) or implicit_review_collection or relative_margin_filter or bool(
         profit_diagnosis_analysis and _has_any(query, ("候选", "这批", "当前"))
     )
     if not COLLECTION_REFERENCE.search(query) and not implicit_ranked_collection and not plural_collection_analysis:
         return None
     source = (
-        "COMPANY_CATALOG" if re.search(r"公司商品库|企业商品库", query) else
+        "COMPANY_CATALOG" if re.search(r"全(?:部商品)?库|公司商品库|企业商品库", query) else
         "ACTIVE_RESULT_SET" if re.search(r"当前结果|刚才.*结果|刚才筛出", query) else
         "ACTIVE_COLLECTION"
     )
@@ -677,21 +954,6 @@ def _collection_composition(query: str) -> dict | None:
     # collection (for example, profit Top-K versus recommendation Top-K). Keep
     # those selectors structured instead of collapsing them into whichever
     # metric happens to appear first in the vocabulary table.
-    ranked_groups = []
-    for name, pattern in metric_patterns:
-        group_match = re.search(
-            rf"(?:{pattern}).{{0,8}}?(?:(最高|最低|倒数).{{0,4}}?([\d一二两三四五六七八九十]+)|(?:top\s*|前)([\d一二两三四五六七八九十]+))\s*(?:个|名)?",
-            query,
-            re.I,
-        )
-        if not group_match:
-            continue
-        group_limit = _finite_chinese_number(group_match.group(2) or group_match.group(3))
-        ranked_groups.append({
-            "metric": name,
-            "direction": "ASC" if group_match.group(1) in {"最低", "倒数"} else "DESC",
-            "limit": max(1, min(20, group_limit or 1)),
-        })
     if len(ranked_groups) > 1:
         selector = {"source": source, "groups": ranked_groups}
     filters = []
@@ -720,7 +982,7 @@ def _collection_composition(query: str) -> dict | None:
         risk_value = {"低": 0, "中": 1, "高": 2}[risk_match.group(1) or risk_match.group(2)]
         filters.append({"field": "risk", "operator": "EQ", "value": risk_value, "reference_field": None, "reference_value_source": "QUERY"})
     evidence_filter_requested = evidence_analysis and _has_any(
-        query, ("哪些", "存在", "筛出", "找出", "谁缺", "谁有", "谁的"),
+        query, ("哪些", "有没有", "存在", "筛出", "找出", "谁缺", "谁有", "谁的"),
     )
     if evidence_filter_requested:
         filters.append({"field": "evidence_gap", "operator": "MISSING", "value": True, "reference_field": None, "reference_value_source": "BACKEND_EVIDENCE"})
@@ -783,7 +1045,7 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         or context_snapshot.task_state.active_comparison_set
     ))
     ranking_policy_question = is_ranking_policy_question(query)
-    if _rank_ordinals(query) and not has_rank_state and not ranking_policy_question and not any(
+    if _rank_ordinals(query) and not re.search(r"呢\s*[？?]?$", query) and not has_rank_state and not ranking_policy_question and not COLLECTION_REFERENCE.search(query) and not _collection_establishment_contract(query) and not any(
         product.title and product.title in query for product in products
     ):
         parsed = semantic_policy("unknown", ())
@@ -814,8 +1076,14 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
     scenario_command = parse_scenario_command(
         query,
         has_active_scenario=bool(context_snapshot and context_snapshot.has_active_scenario),
+        scenario_has_focus=bool(
+            context_snapshot
+            and context_snapshot.task_state.conversation_focus.focus_type == "SCENARIO_RESULT"
+        ),
     )
-    composition = None if scenario_command else _collection_composition(query)
+    # A question about whether rank implies approval is a policy question,
+    # even when it mentions a multi-product cohort and ranking vocabulary.
+    composition = None if scenario_command or ranking_policy_question else _collection_composition(query)
     if (
         composition
         and _EXPLICIT_FILTER_SIGNAL.search(query)
@@ -847,9 +1115,10 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
     if collection_match:
         has_active_collection = bool(context_snapshot and context_snapshot.task_state.active_collection)
         collection_reference = (
-            "current_collection" if has_active_collection and re.search(r"候选池|候选集合|商品池|当前候选|这批", collection_match.group(0)) else
-            "candidate_pool" if re.search(r"候选池|候选集合|商品池|当前候选|这批", collection_match.group(0)) else
-            "company_catalog" if re.search(r"公司商品库|企业商品库", collection_match.group(0)) else
+            "candidate_pool" if not has_active_collection and _collection_establishment_contract(query) else
+            "current_collection" if has_active_collection and re.search(r"候选池|候选集合|商品池|当前(?:这些)?候选|这批", collection_match.group(0)) else
+            "candidate_pool" if re.search(r"候选池|候选集合|商品池|当前(?:这些)?候选|这批", collection_match.group(0)) else
+            "company_catalog" if re.search(r"全(?:部商品)?库|公司商品库|企业商品库", collection_match.group(0)) else
             "active_result_set" if re.search(r"当前结果|刚才.*结果", collection_match.group(0)) else
             "current_collection"
         )
@@ -1009,8 +1278,17 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         hypothetical_value=scenario_command.value if scenario_command else None,
         hypothetical_unit=scenario_command.unit if scenario_command else None,
         scenario_reference_role=(
-            "ACTIVE_COLLECTION" if scenario_command and scenario_command.collection_scope else
-            "ACTIVE_SCENARIO" if context_snapshot and context_snapshot.has_active_scenario and not mentions else
+            "ACTIVE_COLLECTION" if scenario_command and (
+                scenario_command.collection_scope
+                or (
+                    scenario_command.operation == "CREATE_SCENARIO"
+                    and context_snapshot
+                    and context_snapshot.task_state.conversation_focus.focus_type == "CANONICAL_ORDERED_RESULT"
+                    and context_snapshot.task_state.active_collection
+                )
+            ) else
+            "ACTIVE_SCENARIO" if context_snapshot and context_snapshot.has_active_scenario
+            and context_snapshot.task_state.conversation_focus.focus_type == "SCENARIO_RESULT" and not mentions else
             "EXPLICIT_ENTITY" if mentions else "NONE"
         ) if scenario_command else None,
         scenario_collection_scope=scenario_command.collection_scope if scenario_command else None,
@@ -1028,10 +1306,14 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
         task = context_snapshot.task_state
         understanding = _anchor_active_collection_ranking(query, understanding, {
             "collection_member_count": len(task.active_collection.product_ids) if task.active_collection else 0,
+            "collection_top_count": len(task.active_collection.top_product_ids) if task.active_collection else 0,
             "has_collection_ranking_state": bool(task.active_collection and task.active_collection.ranked_product_ids),
             "collection_ranking_dimensions": task.active_collection.ranking_dimensions if task.active_collection else [],
             "result_set_count": len(task.active_result_set.product_ids) if task.active_result_set else 0,
             "has_active_scenario": context_snapshot.has_active_scenario,
+            "focus_type": task.conversation_focus.focus_type,
+            "focus_revision": task.conversation_focus.focus_revision,
+            "scenario_has_focus": task.conversation_focus.focus_type == "SCENARIO_RESULT",
         })
         if understanding.intent == "collection_analysis" and parsed.name != "collection_analysis":
             parsed = semantic_policy("collection_analysis", understanding.requested_dimensions, selected)
@@ -1086,6 +1368,9 @@ def build_semantic_context_packet(
         has_focused_collection_member=task.focused_collection_member is not None,
         has_collection_ranking_state=bool(task.active_collection and task.active_collection.ranked_product_ids),
         has_active_scenario=snapshot.has_active_scenario,
+        focus_type=task.conversation_focus.focus_type,
+        focus_revision=task.conversation_focus.focus_revision,
+        scenario_has_focus=task.conversation_focus.focus_type == "SCENARIO_RESULT",
         last_successful_action=task.last_successful_action,
     )
     return SemanticContextPacket(
@@ -1248,6 +1533,11 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         if isinstance(context_packet, dict)
         else lambda key, default=None: getattr(context_packet, key, default)
     ) if context_packet is not None else lambda key, default=None: default
+    value = _reconcile_collection_establishment(
+        query,
+        packet_get("rule_understanding"),
+        value,
+    )
     # A session-owned Scenario ranking plus an explicit ordinal is a stronger,
     # deterministic signal than a provider's generic/low-confidence task label.
     # Anchor it before the confidence gate so transport-fallback validation uses
@@ -1307,6 +1597,7 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
             "ACTIVE_COLLECTION": "current_collection" if has_active_collection else "candidate_pool",
             "ACTIVE_RESULT_SET": "active_result_set",
             "COMPANY_CATALOG": "company_catalog",
+            "CANDIDATE_POOL": "candidate_pool",
         }.get(composition["source"], value.collection_reference)
         value = value.model_copy(update={
             "intent": "collection_analysis",
@@ -1380,10 +1671,10 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         has_active_collection = bool(current_task_get("collection_member_count", 0))
         reference = (
             "candidate_pool" if match and (
-                re.search(r"候选池|候选集合|商品池|当前候选", match.group(0))
+                re.search(r"候选池|候选集合|商品池|当前(?:这些)?候选", match.group(0))
                 or (not has_active_collection and re.search(r"这批(?:商品|候选)?", match.group(0)))
             ) else
-            "company_catalog" if match and re.search(r"公司商品库|企业商品库", match.group(0)) else
+            "company_catalog" if match and re.search(r"全(?:部商品)?库|公司商品库|企业商品库", match.group(0)) else
             "active_result_set" if match and re.search(r"当前结果|刚才.*结果", match.group(0)) else
             "current_collection" if match or current_task_get("collection_member_count", 0) or re.search(r"第[一二两三四五六七八九十\d]+个|第一名|第二名|第三名|这批|这几个|这三个", query) else
             "candidate_pool"
@@ -1516,6 +1807,20 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         if value.intent == "collection_analysis" and value.analysis_requests
         else semantic_policy(value.intent, value.requested_dimensions, selected)
     )
+    if value.intent == "product_filter":
+        # The provider selects the task, but never supplies executable filter
+        # facts. Reuse the existing validated, query-derived FilterCriteria so
+        # a semantic handoff cannot silently turn an AND filter into "all".
+        from dataclasses import replace
+        from app.agent.intent_engine import parse_intent
+
+        deterministic_filter = parse_intent(query, list(selected))
+        if deterministic_filter.name != "product_filter" or not deterministic_filter.filters:
+            _reject("SEM004", "MISSING_FILTER_CRITERIA", "filters")
+        parsed = replace(
+            parsed, filters=deterministic_filter.filters,
+            limit=deterministic_filter.limit,
+        )
     unknown_tools = [tool for tool in value.planned_tools if TOOL_REGISTRY.get(tool) is None]
     # Collection suggestions and complete, backend-verifiable Scenario frames
     # treat provider tool labels as advisory. Unknown labels remain visible as

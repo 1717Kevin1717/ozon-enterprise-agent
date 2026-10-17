@@ -1,5 +1,6 @@
 import re
 import time
+from uuid import uuid4
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -345,12 +346,14 @@ async def dual_model_agent_ask(
     parsed, understanding = understand_query(query, products, selected_product_ids, snapshot)
     mutation_result = task_mutation_intent(
         query, snapshot.task_state, selected_product_ids or (), understanding.entity_mentions,
+        understanding.analysis_requests,
     )
     if mutation_result:
         parsed, mutation = mutation_result
         understanding = understanding.model_copy(update={
             "intent": parsed.name,
             "task_type": snapshot.task_state.task_type or parsed.name,
+            "question_type": mutation.get("question_type", understanding.question_type),
             "operation": mutation["operation"],
             "filter_updates": mutation.get("filter_updates", {}),
             "sort_updates": mutation.get("sort_updates", []),
@@ -399,8 +402,13 @@ async def dual_model_agent_ask(
             "status": "skipped", "failure_code": failure_code, "latency_ms": None, "token_usage": {},
         })
     candidates = router.semantic_candidates(policy=execution_policy)
-    for provider in candidates:
+    for attempt_number, provider in enumerate(candidates, start=1):
         call_started = time.perf_counter()
+        call_diagnostics = {
+            "diagnostic_call_id": uuid4().hex,
+            "attempt_number": attempt_number,
+            "retry_count": 0,  # A different fallback provider is not an HTTP retry.
+        }
         candidate = None
         try:
             candidate = await provider.semantic_interpret(external_query, slots)
@@ -416,6 +424,7 @@ async def dual_model_agent_ask(
                 "failure_code": None, "latency_ms": candidate.latency_ms if candidate.latency_ms is not None else round((time.perf_counter() - call_started) * 1000),
                 "token_usage": candidate.usage, "exception_class": None,
                 "failure_stage": None, "upstream_status": candidate.upstream_status,
+                **call_diagnostics,
             })
             provider_result = candidate
             failure_code = ""
@@ -430,6 +439,8 @@ async def dual_model_agent_ask(
                 "failure_code": exc.code, "latency_ms": exc.elapsed_ms if exc.elapsed_ms is not None else round((time.perf_counter() - call_started) * 1000), "token_usage": {},
                 "exception_class": exc.exception_class, "failure_stage": exc.failure_stage,
                 "upstream_status": exc.upstream_status,
+                "cause_class": exc.cause_class, "os_error_code": exc.os_error_code,
+                **call_diagnostics,
             })
         except SemanticPlanValidationFailure as exc:
             failure_code = exc.failure_code
@@ -448,6 +459,7 @@ async def dual_model_agent_ask(
                 "raw_requested_dimensions": exc.diagnostics.get("raw_requested_dimensions", []),
                 "canonical_requested_dimensions": exc.diagnostics.get("canonical_requested_dimensions", []),
                 "normalization_failures": exc.diagnostics.get("normalization_failures", []),
+                **call_diagnostics,
             })
         except (ValueError, TypeError) as exc:
             failure_code = "SEMANTIC_PLAN_VALIDATION_FAILED"
@@ -461,6 +473,7 @@ async def dual_model_agent_ask(
                 "upstream_status": candidate.upstream_status if candidate else None,
                 "validation_rule_id": None, "validation_reason_code": "UNKNOWN_SEMANTIC_PLAN_ERROR",
                 "validation_field": None,
+                **call_diagnostics,
             })
     provider_trace = [{
         "event": "provider_call", "tool": "model_router", "business_label": "模型路由调用",

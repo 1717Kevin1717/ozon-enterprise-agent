@@ -1,4 +1,5 @@
 import json
+import re
 import ssl
 import time
 from dataclasses import dataclass
@@ -27,6 +28,26 @@ def _caused_by_tls(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _safe_transport_cause(exc: BaseException) -> tuple[str, int | None]:
+    """Return only exception type and OS error number, never the exception text."""
+    current: BaseException | None = exc
+    deepest = exc
+    os_error: OSError | None = None
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        deepest = current
+        if isinstance(current, OSError):
+            os_error = current
+        current = current.__cause__ or current.__context__
+    cause = os_error or deepest
+    name = re.sub(r"[^A-Za-z0-9_]", "", type(cause).__name__)[:80] or "UnknownError"
+    code = getattr(os_error, "winerror", None) if os_error is not None else None
+    if not isinstance(code, int) and os_error is not None:
+        code = os_error.errno
+    return name, code if isinstance(code, int) else None
 
 
 def _classify_http_error(exc: Exception) -> FailureClassification:
@@ -165,6 +186,7 @@ class OpenAICompatibleProvider(ModelProvider):
         exc: Exception,
         started: float,
     ) -> ProviderFailure:
+        cause_class, os_error_code = _safe_transport_cause(exc)
         return ProviderFailure(
             classification.code,
             self.provider_name,
@@ -172,6 +194,8 @@ class OpenAICompatibleProvider(ModelProvider):
             failure_stage=classification.stage,
             elapsed_ms=round((time.perf_counter() - started) * 1000),
             upstream_status=classification.upstream_status,
+            cause_class=cause_class,
+            os_error_code=os_error_code,
         )
 
     async def _chat(
