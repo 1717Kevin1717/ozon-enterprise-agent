@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.entity_resolution import EntityResolution, resolve_query_entities, resolution_message
 from app.agent.context import build_context_snapshot, resolve_context_reference
-from app.agent.collection_ranking import rank_collection
+from app.agent.collection_ranking import RANKING_DIMENSIONS, rank_collection
 from app.agent.query_understanding import arbitrate_entity_mentions, build_semantic_context_packet, understand_query, semantic_fallback, semantic_policy
 from app.agent.intent_engine import ParsedIntent, parse_intent
 from app.agent.runtime import AgentRunState
@@ -32,6 +32,22 @@ from app.schemas.provenance import FieldEvidence
 
 
 TOOL_POLICY = {spec.tool_name: list(spec.allowed_roles) for spec in TOOL_REGISTRY.all()}
+_RANKING_FIELD_ALIASES = {
+    "recommendation_score": "recommendation",
+    "net_profit": "profit",
+    "margin_rate": "profit",
+    "net_margin": "profit",
+}
+
+
+def _verified_ranking_dimensions(spec: list[str]) -> list[str]:
+    """Return only a complete, backend-supported ranking basis; never guess one."""
+    fields = [_RANKING_FIELD_ALIASES.get(item.split(":", 1)[0], item.split(":", 1)[0]) for item in spec]
+    if not fields or any(field not in RANKING_DIMENSIONS for field in fields):
+        return []
+    return list(dict.fromkeys(fields))
+
+
 BUSINESS_TOOL_LABELS = {
     "count_products": "统计企业商品总数",
     "filter_products": "筛选企业商品库",
@@ -1169,6 +1185,7 @@ async def agent_v1_ask(
     collection_analysis: dict[str, Any] | None = None
     ranking_analysis: dict[str, Any] = {}
     collection_context_missing = False
+    ranking_basis_missing = False
     scenario_next_state = scenario_state
     scenario_error_code: str | None = scenario_load_error.code if scenario_load_error and parsed.name == "scenario_analysis" else None
     scenario_blocked = scenario_load_error is not None and parsed.name == "scenario_analysis"
@@ -1345,7 +1362,11 @@ async def agent_v1_ask(
             matched_count_override = 1
             total_count_override = len(candidates)
             displayed_count_override = 1
-    elif understanding.operation == "EXPLAIN_RANKING" and context_snapshot.task_state.active_result_set:
+    elif (
+        understanding.operation == "EXPLAIN_RANKING"
+        and parsed.name != "collection_analysis"
+        and context_snapshot.task_state.active_result_set
+    ):
         ids = context_snapshot.task_state.active_result_set.product_ids[:2]
         result = await execute(
             "compare_products", {"product_ids": ids}, lambda: compare_products(repo, ids, role),
@@ -1396,17 +1417,21 @@ async def agent_v1_ask(
         reference = understanding.collection_reference or ("current_collection" if previous_collection else "candidate_pool")
         collection_type = reference
         collection_ids: list[str] = []
+        result_set = context_snapshot.task_state.active_result_set
+        ordered_result = result_set if result_set and (
+            reference == "active_result_set" or not previous_collection
+            or result_set.source_task_revision > previous_collection.source_task_revision
+        ) else None
         if reference == "current_collection" and not previous_collection:
             collection_context_missing = True
         if reference == "active_result_set" and not context_snapshot.task_state.active_result_set:
             collection_context_missing = True
         if reference == "current_collection" and previous_collection:
             collection_type = previous_collection.collection_type
-            active_order = context_snapshot.task_state.active_result_set
             reranking = understanding.operation in {"RERANK", "RERANK_COLLECTION", "REORDER", "REFINE_RANKING"}
             collection_ids = list(
                 previous_collection.top_product_ids if reranking and previous_collection.top_product_ids
-                else active_order.product_ids if reranking and active_order and active_order.product_ids
+                else ordered_result.product_ids if reranking and ordered_result and ordered_result.product_ids
                 else previous_collection.product_ids
             )
         elif reference == "active_result_set" and context_snapshot.task_state.active_result_set:
@@ -1414,11 +1439,10 @@ async def agent_v1_ask(
         elif reference == "active_result_set":
             collection_type = "active_result_set"
         focused_collection_order = (
-            list(context_snapshot.task_state.active_result_set.product_ids)
-            if context_snapshot.task_state.active_result_set and context_snapshot.task_state.active_result_set.product_ids else
+            list(ordered_result.product_ids)
+            if ordered_result and ordered_result.product_ids else
             list(previous_collection.top_product_ids or previous_collection.ranked_product_ids or previous_collection.product_ids)
-            if previous_collection else list(context_snapshot.task_state.active_result_set.product_ids)
-            if context_snapshot.task_state.active_result_set else []
+            if previous_collection else []
         )
         ordinal_operation = understanding.operation in {
             "LOOKUP_ORDINAL_MEMBER", "EXPLAIN_RANKING", "COMPARE_COLLECTION_MEMBERS",
@@ -1429,15 +1453,35 @@ async def agent_v1_ask(
                 collection_context_missing = True
             else:
                 collection_ids = [focused_collection_order[position - 1] for position in positions]
+        explain_single_leader = bool(
+            previous_collection
+            and understanding.operation == "EXPLAIN_RANKING"
+            and understanding.ordinal_references == [1]
+            and len(focused_collection_order) > 1
+        )
         if understanding.operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING"} and context_resolution.product_ids:
             collection_ids = list(context_resolution.product_ids)
             collection_type = previous_collection.collection_type if previous_collection else "candidate_pool"
+        if explain_single_leader and not collection_context_missing:
+            # The runner-up is evidence, not an additional user reference.
+            collection_ids = focused_collection_order[:2]
         # Ranking explanations must consume the exact ranking specification
         # that produced the active collection order.  Provider/default response
         # dimensions cannot replace it with recommendation_score.
         selector = understanding.collection_selector or {}
-        if previous_collection and understanding.operation == "EXPLAIN_RANKING":
-            ranking_dimensions = list(previous_collection.ranking_dimensions)
+        if understanding.operation == "EXPLAIN_RANKING" and (ordered_result or previous_collection):
+            # The basis must come from the same state object as the ordinals.
+            # A newer ResultSet (including a temporary preview) outranks the
+            # older canonical collection but never mutates it.
+            if ordered_result:
+                stored_spec = list(ordered_result.ranking_dimensions) or (
+                    [f"{ordered_result.sort_spec[0]}:{ordered_result.sort_spec[1]}"]
+                    if len(ordered_result.sort_spec) >= 2 else []
+                )
+            else:
+                stored_spec = list(previous_collection.ranking_dimensions or previous_collection.ranking_spec)
+            ranking_dimensions = _verified_ranking_dimensions(stored_spec)
+            ranking_basis_missing = not ranking_dimensions
         else:
             ranking_dimensions = [item.split(":", 1)[0] for item in understanding.sort_updates if item]
             if not ranking_dimensions:
@@ -1485,7 +1529,7 @@ async def agent_v1_ask(
             "require_gate_pass": not plural_diagnostic, "exclude_insufficient_data": exclude_insufficient,
             "selector": selector or None, "filters": understanding.collection_filters,
         }
-        if not collection_context_missing:
+        if not collection_context_missing and not ranking_basis_missing:
             result = await execute(
                 "analyze_collection", args, lambda: analyze_collection(repo, role, **args),
                 "已按后端推荐门禁、确定性评分与证据质量分析候选集合。",
@@ -1625,10 +1669,7 @@ async def agent_v1_ask(
                     for index, item in enumerate(human_review_priority, 1):
                         item["priority"] = index
                         item["priority_rank"] = index
-        singular_leader_explanation = bool(
-            re.search(r"(?:它|这个).*(?:为什么|为何|凭什么).*(?:第一|榜首|首位)", query)
-        )
-        if understanding.operation == "EXPLAIN_RANKING" and singular_leader_explanation and len(views) > 1:
+        if explain_single_leader and len(views) > 1:
             # The second row is comparison evidence for the explanation, not a
             # second primary answer target. Keep the visible/product contract
             # focused on the referenced leader while retaining both candidates
@@ -1704,7 +1745,7 @@ async def agent_v1_ask(
     response_type = _response_type(parsed, resolution, products, data_sufficiency)
     if parsed.name == "scenario_analysis":
         response_type = "clarification" if scenario_blocked and scenario_error_code not in {"STALE_BASELINE", "STALE_COLLECTION_BASELINE"} else "scenario_report"
-    if collection_context_missing:
+    if collection_context_missing or ranking_basis_missing:
         response_type = "clarification"
     if understanding.operation in {"ARGMAX", "ARGMIN"} and products:
         response_type = "product_detail"
@@ -1851,6 +1892,8 @@ async def agent_v1_ask(
             answer = "请告诉我你想查看哪个商品的利润或净利率。"
         else:
             answer = "当前会话中没有唯一可引用的商品，请直接说出商品名称。"
+    elif ranking_basis_missing:
+        answer = "当前有商品顺序，但缺少可验证的排序依据，不能可靠解释名次。请重新排序或重新生成候选结果。"
     elif collection_context_missing:
         answer = "当前会话中没有可引用的候选集合，请先分析候选池、企业商品库或一个已有筛选结果。"
     elif parsed.name == "scenario_analysis" and scenario_error_code == "STALE_BASELINE":
@@ -2235,6 +2278,8 @@ async def agent_v1_ask(
             clarification_code = "MISSING_CONTEXT"
         elif collection_context_missing:
             clarification_code = "MISSING_CONTEXT"
+        elif ranking_basis_missing:
+            clarification_code = "MISSING_RANKING_BASIS"
         elif context_resolution.requires_clarification:
             clarification_code = context_resolution.failure_code or "MISSING_CONTEXT"
         elif resolution.has_unresolved:
@@ -2345,6 +2390,11 @@ async def agent_v1_ask(
             else None
             if read_only_collection_analysis or understanding.operation in {"LOOKUP_ORDINAL_MEMBER", "COMPARE_COLLECTION_MEMBERS"}
             else collection_analysis
+        ),
+        ranking_preview=(
+            collection_analysis
+            if understanding.question_type == "ranking_preference_change" and read_only_collection_analysis
+            else None
         ),
         session_id=session_id, requested_top_k=understanding.top_k,
         scope_type=("active_collection" if context_snapshot.task_state.active_collection and

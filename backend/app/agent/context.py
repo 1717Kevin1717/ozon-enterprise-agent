@@ -20,7 +20,7 @@ _IGNORE_SELECTION = re.compile(
     r"排除(?:这几个|这两个|这些|当前|已选|所选|选择|对比中心)"
 )
 _ORDINAL = re.compile(r"第([一二两三四五六七八九十\d]+)(?:名|位|个|款)|排第([一二两三四五六七八九十\d]+)(?:名|位|个|款)?|"
-                      r"列表里的第([一二两三四五六七八九十\d]+)(?:名|位|个|款)?|榜首|首位|top\s*([1-9]\d*)|前一个|后一个", re.I)
+                      r"列表里的第([一二两三四五六七八九十\d]+)(?:名|位|个|款)?|榜首|首位|头名|top\s*([1-9]\d*)|前一个|后一个", re.I)
 _SINGULAR_REFERENCE = re.compile(r"(?:它|这个(?:商品|产品)?|那个(?:商品|产品)?|刚才那个(?:商品|产品)?)")
 _ELLIPSIS = re.compile(r"(?:换成|改成).+呢|(?:那|利润|价格|风险|净利率).*(?:呢|方面)|这个(?:利润|价格|数|指标)|它的")
 _ONE_ONLY = re.compile(r"只能留一个|只留一个|必须选一个|二选一")
@@ -95,7 +95,7 @@ def _ordinal_index(query: str, order_size: int) -> int | None:
         return max(0, order_size - 2) if order_size else None
     if "后一个" in match.group(0):
         return order_size - 1 if order_size else None
-    if match.group(0) in {"榜首", "首位"}:
+    if match.group(0) in {"榜首", "首位", "头名"}:
         return 0
     raw = next((value for value in match.groups() if value), "")
     number = int(raw) if raw.isdigit() else _CN_NUMBERS.get(raw)

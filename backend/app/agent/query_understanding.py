@@ -115,6 +115,21 @@ _EXPLICIT_FILTER_SIGNAL = re.compile(
     r"(?:大于|小于|高于|低于|不低于|不高于|超过|至少|至多|>=|<=|>|<|=)\s*\d)",
     re.I,
 )
+_UNSUPPORTED_PRICE_FILTER = re.compile(
+    r"(?:价格|售价|定价)\s*(?:低于|小于|不高于|至多|高于|大于|不低于|至少|不超过|超过|[<>]=?)\s*\d+(?:\.\d+)?",
+    re.I,
+)
+
+
+def _has_unsupported_filter_constraint(query: str) -> bool:
+    """Fail closed when an explicit numeric filter is absent from FilterProductsInput."""
+    filter_scope = re.search(
+        r"筛选|筛出|只保留|过滤|找出|(?:哪些|什么|所有).*商品|商品.*(?:符合|满足)|"
+        r"(?:低于|高于|不低于|不高于).{0,20}(?:商品|候选)", query,
+    )
+    return bool(filter_scope and _EXPLICIT_FILTER_SIGNAL.search(query) and _UNSUPPORTED_PRICE_FILTER.search(query))
+
+
 _CANDIDATE_SCOPE_SIGNAL = re.compile(
     r"候选(?:池|集合|商品)?|当前(?:这些)?(?:候选|商品|集合)|这些(?:候选|商品)|这批(?:商品|候选)?|现在这批"
 )
@@ -512,6 +527,16 @@ def _anchor_active_collection_ranking(
             "requires_reasoning": False,
             "clarification_required": False,
         })
+    # A ranking mutation may mention a position as a *weight preference*
+    # (for example, putting ROI first) while separately requesting Top-K.
+    # Preserve that explicit operation and count before ordinal lookup.
+    if value.operation in {"RERANK", "RERANK_COLLECTION", "REORDER", "REFINE_RANKING"}:
+        return value
+    if value.top_k and value.top_k > 1 and _requested_collection_top_k(query) == value.top_k:
+        from app.agent.task_state import is_collection_rerank_query
+
+        if is_collection_rerank_query(query):
+            return value
     # Ordinals are positions in the current ranking, never catalogue names.
     ordinals = _rank_ordinals(query)
     if not ordinals or _EXPLICIT_SCENARIO_MUTATION.search(query):
@@ -565,7 +590,7 @@ def _anchor_active_collection_ranking(
 _RANK_ORDINAL = re.compile(
     r"第\s*(?P<number>[一二两三四五六七八九十\d]+)\s*(?:名|位|个)|"
     r"(?:榜单|排名|排在|排|前面)第?(?P<position>[一二两三四五六七八九十\d]+)(?:名|位|个)?|"
-    r"(?P<leader>榜首|首位|排头名|最靠前|最前面|排名最高|top\s*1)|"
+    r"(?P<leader>榜首|首位|头名|排头名|最靠前|最前面|排名最高|top\s*1)|"
     r"(?P<second>top\s*2)", re.I,
 )
 
@@ -604,18 +629,21 @@ def _is_ordinal_span(value: str) -> bool:
 
 
 def is_ranking_policy_question(query: str) -> bool:
-    """A question about whether relative position/score authorizes a decision."""
+    """A question about whether relative rank or one strong metric authorizes a decision."""
     return bool(
-        re.search(r"排名|第一名|评分|分数|综合分", query)
+        (
+            re.search(r"排名|第一名|排第一|评分|分数|综合分", query)
+            or re.search(r"(?:利润|净利率|回报率|\broi\b|风险|销量|竞争).{0,8}(?:最高|最低|最好|第一)", query, re.I)
+        )
         and re.search(r"推荐|上架|决策|审核", query)
-        and re.search(r"是否|是不是|代表|意味着|表示|等于|能否|能不能|绕过", query)
+        and re.search(r"是否|是不是|代表|意味着|表示|等于|能否|能不能|能|可以|绕过|为什么|为何", query)
     )
 
 
 _SCENARIO_ORDINAL = re.compile(
     r"第(?P<ordinal>[一二两三四五六七八九十\d]+)(?:名|个|位)|"
     r"(?:排名|排在|排)第?(?P<rank>[一二两三四五六七八九十\d]+)|"
-    r"(?P<leader>榜首|首位|排头名|榜单第一|排名第一|谁排第一|最靠前|最前面|排名最高|top\s*1)", re.I
+    r"(?P<leader>榜首|首位|头名|排头名|榜单第一|排名第一|谁排第一|最靠前|最前面|排名最高|top\s*1)", re.I
 )
 _SCENARIO_TOP_K = re.compile(r"(?:前|top\s*)(?P<count>[一二两三四五六七八九十\d]+)(?:名|个|位)?", re.I)
 _EXPLICIT_CANONICAL_COLLECTION = re.compile(
@@ -798,6 +826,8 @@ def semantic_collection_composite_policy(dimensions, selected=(), analyses=()):
 def semantic_intent(query, selected=(), context_snapshot: ContextSnapshot | None = None):
     """Grammatical question/metric patterns, independent of catalogue titles."""
     q = query.casefold()
+    if is_ranking_policy_question(query):
+        return semantic_policy("recommendation_policy", ("recommendation_policy", "decision"), selected)
     previous_dimensions = tuple(context_snapshot.last_requested_dimensions) if context_snapshot else ()
     previous_fact = context_snapshot.last_fact_dimension if context_snapshot else None
     single_recommendation = bool(re.search(r"推荐\s*(?:一|1)个", q)) and not re.search(r"证据|缺口|分析.*集合|分析.*池", q)
@@ -1026,6 +1056,13 @@ def _collection_composition(query: str) -> dict | None:
 def understand_query(query, products, selected=None, context_snapshot: ContextSnapshot | None = None):
     from app.agent.intent_engine import parse_intent
     from app.agent.scenario_state import parse_scenario_command, scenario_entity_text
+    if _has_unsupported_filter_constraint(query):
+        return semantic_policy("unknown", ()), QueryUnderstanding(
+            intent="unknown", question_type="unsupported_filter_clarification",
+            clarification_required=True,
+            clarification_reason="当前筛选工具不支持这个价格阈值条件，请改用已支持的筛选维度。",
+            confidence=0.95, route="CLARIFICATION", planned_tools=[],
+        )
     vague_profit_quality = bool(
         re.search(r"(?<!净)利润\s*(?:不好|不佳|较差|差劲|差|不达标|未达标|不足)", query)
         and not re.search(r"净利润|净利率|利润率|\broi\b|投资回报|\d+(?:\.\d+)?\s*[%％]", query, re.I)
@@ -1813,6 +1850,9 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         # a semantic handoff cannot silently turn an AND filter into "all".
         from dataclasses import replace
         from app.agent.intent_engine import parse_intent
+
+        if _has_unsupported_filter_constraint(query):
+            _reject("SEM004", "UNSUPPORTED_FILTER_CRITERIA", "filters")
 
         deterministic_filter = parse_intent(query, list(selected))
         if deterministic_filter.name != "product_filter" or not deterministic_filter.filters:

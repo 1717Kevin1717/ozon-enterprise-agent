@@ -127,7 +127,7 @@ def scenario_entity_text(query: str) -> str:
     else:
         prefix = re.split(r"评分|销量|评论|搜索量|趋势|竞争|合规", normalized, maxsplit=1)[0]
     prefix = re.sub(r"^(?:如果|假设|假如)\s*", "", prefix).strip(" ，,：:")
-    if re.fullmatch(r"(?:当前|现在|原来)?\s*(?:第[一二两三四五六七八九十\d]+(?:名|个|位)|榜首|首位|top\s*\d+)(?:的)?", prefix, re.I):
+    if re.fullmatch(r"(?:当前|现在|原来)?\s*(?:第[一二两三四五六七八九十\d]+(?:名|个|位)|榜首|首位|头名|top\s*\d+)(?:的)?", prefix, re.I):
         return ""
     return prefix
 

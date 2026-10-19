@@ -29,9 +29,9 @@ _RECOMMENDATION_FRESHNESS = re.compile(r"过期|新鲜|时效|多久|旧了")
 _COLLECTION_ORDINAL = re.compile(r"第[一二两三四五六七八九十\d]+个|第一名|第二名|第三名")
 _COLLECTION_GAPS = re.compile(r"证据缺口|缺什么证据|还缺.*(?:证据|资料|数据)|数据不足")
 _COLLECTION_RERANK = re.compile(r"重排|重新?排|只看|优先")
-_RANKING_MUTATION = re.compile(r"重新?排|再排|重排|排序|只看|优先|权重|更(?:加)?关注|侧重|偏重|看重|更重要|按[^，。?!？]{1,20}排")
+_RANKING_MUTATION = re.compile(r"重新?排|再排|重排|排序|只看|优先|权重|更(?:加)?关注|侧重|偏重|看重|更重要|放在首位|先规避|按[^，。?!？]{1,20}排")
 _STRONG_RANKING_MUTATION = re.compile(r"重新?排|再排|重排|排序")
-_PREFERENCE_RANKING = re.compile(r"更(?:加)?关注|侧重|偏重|看重|优先|权重|更重要|只看")
+_PREFERENCE_RANKING = re.compile(r"更(?:加)?关注|侧重|偏重|看重|优先|权重|更重要|只看|放在首位|先规避")
 _FILTER_CONSTRAINT = re.compile(
     r"重新筛|筛出|筛选|只保留|排除|剔除|(?:高于|低于|大于|小于|至少|不低于|不高于|不超过|等于|=|>|<)\s*\d",
     re.I,
@@ -46,7 +46,7 @@ _ENTITY_STATUSES = {
 def _comparison_dimensions(query: str, current: list[str]) -> list[str]:
     patterns = (
             ("price", r"价格|售价"), ("profit", r"利润|净利率|赚钱"),
-            ("roi", r"\broi\b"), ("risk", r"风险"), ("recommendation", r"推荐度|推荐"),
+            ("roi", r"\broi\b|投资回报率|回报率"), ("risk", r"风险"), ("recommendation", r"推荐度|推荐"),
             ("demand", r"需求|销量|趋势"), ("competition", r"竞争"), ("compliance", r"合规"),
     )
     excluded = {
@@ -200,11 +200,21 @@ def task_mutation_intent(
     )
     recommendation = state.active_recommendation if recommendation_reference else None
     collection = state.active_collection
-    if collection and state.active_result_set and state.active_result_set.source_task_revision > collection.source_task_revision:
+    if (
+        collection and state.active_result_set
+        and state.active_result_set.source_task_revision > collection.source_task_revision
+        and not (
+            state.active_result_set.source_operation == "PREVIEW_RANKING"
+            and state.active_result_set.parent_collection_revision == collection.source_task_revision
+        )
+    ):
         collection = None
     if collection and not _EXPLICIT_CATALOG_SCOPE.search(query):
         dimensions = _comparison_dimensions(query, collection.ranking_dimensions)
-        preference_preview = bool(_PREFERENCE_RANKING.search(query) and not _STRONG_RANKING_MUTATION.search(query))
+        preference_preview = bool(_PREFERENCE_RANKING.search(query) and (
+            not _STRONG_RANKING_MUTATION.search(query)
+            or re.search(r"会.*(?:变|变化)|会怎样", query)
+        ))
         evidence_requested = bool(_COLLECTION_GAPS.search(query))
         exclude_insufficient = bool(re.search(r"排除|不要|去掉|剔除", query) and re.search(r"证据不足|数据不足|不充分|INSUFFICIENT", query, re.I))
         operation = None
@@ -216,7 +226,9 @@ def task_mutation_intent(
             operation = "REFINE"
         elif _COLLECTION_ORDINAL.search(query) and re.search(r"为什么|为何|原因|依据", query):
             operation = "EXPLAIN_RANKING"
-        elif re.search(r"这(?:三|几)个.*(?:人工|调研|研究)|哪个.*(?:人工|调研|研究)", query):
+        elif not _RECOMMENDATION_REASON.search(query) and re.search(
+            r"这(?:三|几)个.*(?:人工|调研|研究)|哪个.*(?:人工|调研|研究)", query,
+        ):
             operation = "RECOMMEND_TOP_K"
         if operation:
             question_type = (
@@ -365,7 +377,9 @@ def task_mutation_intent(
             operation = "ADD_CONSTRAINT"
         elif update_fields and re.search(r"改|调整|变成|其他.*不变", query):
             operation = "UPDATE_CONSTRAINT"
-        elif _REORDER.search(query) and state.active_result_set:
+        elif _REORDER.search(query) and state.active_result_set and not (
+            _COLLECTION_ORDINAL.search(query) and re.search(r"谁|哪个|什么", query)
+        ):
             operation = "REORDER"
             sort = _sort_update(query)
             if sort:
@@ -388,6 +402,7 @@ def evolve_task_state(
     resolved_product_ids: list[str] | None = None, requested_entities=(),
     ranking_spec: list[str] | None = None, recommendation: dict | None = None,
     collection: dict | None = None,
+    ranking_preview: dict | None = None,
     session_id: str = "",
     requested_top_k: int | None = None,
     scope_type: str = "enterprise_catalog",
@@ -500,12 +515,32 @@ def evolve_task_state(
                 created_turn=turn_index,
             )
             state.focused_collection_member = None
+            if state.active_result_set and state.active_result_set.source_operation == "PREVIEW_RANKING":
+                state.active_result_set = None
             state.conversation_focus = ConversationFocusState(
                 focus_type="CANONICAL_ORDERED_RESULT",
                 focus_id=state.active_collection.result_id,
                 focus_revision=state.active_collection.source_task_revision,
                 focus_source_operation=operation,
                 updated_at=datetime.now(UTC),
+            )
+    if intent == "collection_analysis" and ranking_preview and previous.active_collection:
+        # A preference preview is an ordered result, not a new canonical
+        # collection. Persist its order and basis together for follow-ups.
+        preview_ids = list(ranking_preview.get("top_product_ids") or [])
+        preview_dimensions = list(ranking_preview.get("ranking_dimensions") or [])
+        if preview_ids and preview_dimensions:
+            state.active_result_set = ResultSetState(
+                result_id=uuid4().hex, session_id=session_id,
+                product_ids=preview_ids, source_task_type=intent,
+                source_operation="PREVIEW_RANKING", scope_type="active_collection",
+                parent_collection_revision=previous.active_collection.source_task_revision,
+                requested_top_k=len(preview_ids), effective_top_k=len(preview_ids),
+                selection_reason="temporary_ranking_preference",
+                created_at=datetime.now(UTC),
+                sort_spec=[preview_dimensions[0], "asc" if preview_dimensions[0] == "risk" else "desc"],
+                ranking_dimensions=preview_dimensions[:10],
+                source_task_revision=revision, created_turn=turn_index,
             )
     # One backend-owned adapter records exactly the visible order, regardless
     # of which business handler produced it.  A focused inspection must not

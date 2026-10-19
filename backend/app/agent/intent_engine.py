@@ -79,7 +79,7 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
     full_comparison = any(token in positive_scope for token in ("全面", "综合", "全维度", "最值得上架"))
     profit_only = comparison_words and not full_comparison and any(token in positive_scope for token in ("利润", "roi")) and not any(token in positive_scope for token in ("需求", "竞争", "合规", "风险", "趋势"))
     count_question = bool(re.search(r"(?:公司|企业|商品库)?.*?(?:一共|总共|共有|总数).*?(?:多少|几).*?(?:商品|候选)|(?:公司|企业).*?(?:多少|几).*?(?:商品|候选)", normalized))
-    compliance_policy = "合规" in lowered and any(token in lowered for token in ("能上架", "可以上架", "能不能上架", "没通过", "未通过", "失败", "先卖", "补审核"))
+    compliance_policy = "合规" in lowered and any(token in lowered for token in ("能上架", "可以上架", "能不能上架", "没通过", "未通过", "没过", "失败", "先卖", "直接卖", "补审核"))
     price_lookup = (
         any(token in lowered for token in ("售价多少", "售价是多少", "价格多少", "价格是多少", "价钱是多少", "多少钱", "现在售价", "什么价位"))
         or bool(re.search(r"(?:价格|售价|价位|价钱)(?:是)?(?:多少|如何|怎么样|呢|[？?])", lowered))
@@ -126,7 +126,7 @@ def parse_intent(query: str, selected_product_ids: list[str] | None = None, cont
     if count_question:
         return ParsedIntent("company_product_count", plan=({"tool": "count_products", "purpose": "确定性统计当前企业商品总数"},), policy=_policy(("count_products",), 1, ("count",), fast=True))
     explicit_compliance_failure = compliance_policy and any(
-        token in lowered for token in ("没通过", "未通过", "失败", "补审核", "先卖")
+        token in lowered for token in ("没通过", "未通过", "没过", "失败", "补审核", "先卖", "直接卖")
     )
     if explicit_compliance_failure:
         return ParsedIntent("compliance_policy", plan=(), policy=_policy((), 0, ("compliance", "decision"), fast=True))

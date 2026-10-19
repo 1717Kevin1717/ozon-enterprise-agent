@@ -392,6 +392,7 @@ async def dual_model_agent_ask(
     primary_failure_code: str | None = None
     provider_failures: list[str] = []
     provider_calls: list[dict[str, Any]] = []
+    semantic_guard_rejected = False
     primary = router.provider(requested_provider)
     if not primary or not primary.configured:
         primary_failure_code = failure_code
@@ -444,6 +445,7 @@ async def dual_model_agent_ask(
             })
         except SemanticPlanValidationFailure as exc:
             failure_code = exc.failure_code
+            semantic_guard_rejected = semantic_guard_rejected or exc.stage == "SEMANTIC_VALIDATE"
             primary_failure_code = primary_failure_code or failure_code
             provider_failures.append(failure_code)
             provider_calls.append({
@@ -487,7 +489,7 @@ async def dual_model_agent_ask(
     if provider_result is None:
         failure_code = primary_failure_code or failure_code
         deterministic_plan = None
-        if failure_code in _RECOVERABLE_SCENARIO_PROVIDER_FAILURES:
+        if failure_code in _RECOVERABLE_SCENARIO_PROVIDER_FAILURES and not semantic_guard_rejected:
             deterministic_plan = _validated_scenario_transport_fallback(
                 query, pre_provider_understanding, packet,
                 selected_product_ids, snapshot,
@@ -516,7 +518,7 @@ async def dual_model_agent_ask(
             )
         controlled_clarification = (
             _controlled_transport_clarification(query, pre_provider_understanding, snapshot)
-            if failure_code in _RECOVERABLE_SCENARIO_PROVIDER_FAILURES else None
+            if failure_code in _RECOVERABLE_SCENARIO_PROVIDER_FAILURES and not semantic_guard_rejected else None
         )
         if controlled_clarification is not None:
             parsed, understanding = controlled_clarification
