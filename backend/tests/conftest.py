@@ -4,6 +4,7 @@ import os
 
 
 os.environ["APP_ENV"] = "test"
+os.environ["DEMO_IDENTITY_ENABLED"] = "true"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 os.environ["DEFAULT_COMPANY_ID"] = "test-company"
 os.environ["DEFAULT_USER_ID"] = "test-user"

@@ -11,21 +11,43 @@ from app.agent.model_agent import dual_model_agent_ask
 from app.agent.model_router import build_model_router
 from app.agent.tools import compare_products, rule_agent_ask
 from app.agent.zhipu_agent import zhipu_agent_ask
+from app.connectors.mock_products import MockProductConnector
 from app.core.config import settings
+from app.core.tenant_context import ROLE_ORDER, TrustedTenantContext, VerifiedPrincipal, get_verified_principal, resolve_tenant_context
 from app.core.runtime_identity import runtime_identity
-from app.db.models import AgentRun, Company, ConversationMessage, ConversationSession, Memory, Product, ProductDecision, ProductRelation
+from app.db.models import AgentRun, Company, ConversationMessage, ConversationSession, Memory, Product, ProductDecision, ProductRelation, User
 from app.db.session import get_session
 from app.repositories.products import ProductRepository, product_view
 from app.schemas.products import AgentAsk, CapturePacket, CompareRequest, DecisionCreate, DemoSeedRequest, ProductIn, ProductPatch
 from app.services.demo_dataset import enterprise_demo_candidates
 from app.services.provenance import snapshot_view
+from app.services.product_ingestion import ingest_product_result
 
 router = APIRouter(prefix="/api/v1")
-ROLE_ORDER = {"viewer":0,"operator":1,"analyst":2,"reviewer":3,"company_admin":4,"super_admin":5}
-
-async def context(x_company_id: str | None = Header(default=None), x_user_id: str | None = Header(default=None), x_role: str | None = Header(default=None)) -> dict:
-    # 开发阶段使用显式请求头或 .env 默认值；生产必须替换为 JWT/OAuth 中间件，不接受客户端伪造角色头。
-    return {"company_id":x_company_id or settings.default_company_id,"user_id":x_user_id or settings.default_user_id,"role":x_role or settings.default_role}
+async def context(
+    x_company_id: str | None = Header(default=None),
+    x_user_id: str | None = Header(default=None),
+    x_role: str | None = Header(default=None),
+    principal: VerifiedPrincipal | None = Depends(get_verified_principal),
+    session: AsyncSession = Depends(get_session),
+) -> TrustedTenantContext:
+    verified_role = None
+    if principal is not None:
+        if not isinstance(principal, VerifiedPrincipal) or not principal.user_id or not principal.active_company_id:
+            raise HTTPException(403, detail={"code": "TENANT_FORBIDDEN"})
+        company = await session.scalar(select(Company).where(Company.id == principal.active_company_id, Company.status == "active"))
+        user = await session.scalar(select(User).where(User.id == principal.user_id,
+            User.company_id == principal.active_company_id, User.status == "active"))
+        if company is None or user is None:
+            raise HTTPException(403, detail={"code": "TENANT_FORBIDDEN"})
+        verified_role = user.role
+    return resolve_tenant_context(
+        app_env=settings.app_env, demo_identity_enabled=settings.demo_identity_enabled,
+        principal=principal, verified_role=verified_role,
+        demo_company_id=x_company_id or settings.default_company_id,
+        demo_user_id=x_user_id or settings.default_user_id,
+        demo_role=x_role or settings.default_role,
+    )
 
 def require_role(ctx: dict, minimum: str) -> None:
     if ROLE_ORDER.get(ctx["role"], -1) < ROLE_ORDER[minimum]:
@@ -191,6 +213,8 @@ async def agent_provider_status(session: AsyncSession, company_id: str) -> dict:
 
 @router.get("/health")
 async def health(session: AsyncSession = Depends(get_session)):
+    if settings.app_env not in {"development", "test"}:
+        return {"success": True, "data": {"status": "ok", "auth_mode": "verified_required"}}
     status_payload = await agent_provider_status(session, settings.default_company_id)
     return {"success": True, "data": {"status": "ok", "agent_mode": status_payload["response_mode"], "llm_provider": settings.llm_provider, "llm_configured": status_payload["configured"], "runtime_identity": runtime_identity(), **status_payload}}
 
@@ -308,16 +332,17 @@ async def list_agent_tools(ctx: dict = Depends(context)):
 @router.post("/demo/seed")
 async def seed_demo(data: DemoSeedRequest, ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):
     require_role(ctx, "company_admin")
-    if settings.app_env not in {"development", "test"}:
+    if settings.app_env not in {"development", "test"} or not settings.demo_identity_enabled:
         raise HTTPException(status_code=403, detail={"code": "DEMO_DISABLED", "message": "演示数据只允许在开发或测试环境使用。"})
     repo = ProductRepository(session, ctx["company_id"])
     created, updated, rows = 0, 0, []
-    for candidate in demo_candidates():
-        existed = await repo.get_by_external_id(candidate.external_product_id)
+    for adapted in MockProductConnector(demo_candidates()).list_products():
+        external_id = adapted.identity.repository_key()
+        existed = await repo.get_by_external_id(external_id)
         if existed and not data.replace_demo:
             rows.append(product_view(existed, await repo.latest_analysis(existed.id)))
             continue
-        product = await repo.upsert(candidate)
+        product = await ingest_product_result(repo, adapted)
         analysis = await repo.analyze(product)
         rows.append(product_view(product, analysis))
         if existed: updated += 1
@@ -327,7 +352,10 @@ async def seed_demo(data: DemoSeedRequest, ctx: dict = Depends(context), session
 @router.get("/companies/me")
 async def company_me(ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):
     company=await session.get(Company,ctx["company_id"])
-    if not company: company=Company(id=ctx["company_id"],name="本地中贸通试点企业"); session.add(company); await session.commit(); await session.refresh(company)
+    if not company and ctx["auth_mode"] == "demo":
+        company=Company(id=ctx["company_id"],name="本地中贸通试点企业"); session.add(company); await session.commit(); await session.refresh(company)
+    if not company:
+        raise HTTPException(404, detail={"code": "TENANT_NOT_FOUND"})
     return {"success":True,"data":{"id":company.id,"name":company.name,"role":ctx["role"],"mode":settings.app_env}}
 
 @router.get("/products")
@@ -529,6 +557,18 @@ async def agent_capabilities(
 @router.post("/agent/ask")
 async def ask_agent(data: AgentAsk, ctx: dict = Depends(context), session: AsyncSession = Depends(get_session)):
     require_role(ctx,"analyst")
+    if data.session_id:
+        owned_session = await session.scalar(select(ConversationSession.id).where(
+            ConversationSession.id == data.session_id,
+            ConversationSession.company_id == ctx["company_id"],
+            ConversationSession.user_id == ctx["user_id"],
+        ))
+        if owned_session is None:
+            if ctx["auth_mode"] == "demo":
+                # Preserve local-demo follow-up behavior without loading foreign state.
+                data = data.model_copy(update={"session_id": None})
+            else:
+                raise HTTPException(404, detail={"code": "SESSION_NOT_FOUND", "message": "会话不存在或不属于当前用户及企业。"})
     provider = settings.llm_provider.lower()
     handler = dual_model_agent_ask if provider in {"qwen", "dual", "model_router"} else zhipu_agent_ask if provider == "zhipu" else rule_agent_ask
     if data.provider_execution_policy != "AUTO" or data.require_semantic_handoff:

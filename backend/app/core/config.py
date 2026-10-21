@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class Settings(BaseSettings):
     app_env: str = "development"
+    demo_identity_enabled: bool = False
     app_host: str = "127.0.0.1"
     app_port: int = 8000
     database_url: str = "sqlite+aiosqlite:///./data/zmt_enterprise.db"

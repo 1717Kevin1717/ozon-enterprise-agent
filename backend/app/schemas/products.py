@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 class ProductIn(BaseModel):
     external_product_id: str = Field(min_length=1, max_length=128)
+    store_id: str | None = None
     title: str = Field(min_length=1, max_length=500)
     brand: str = ""
     category_path: str = ""

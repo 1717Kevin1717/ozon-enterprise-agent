@@ -3,7 +3,7 @@ from copy import deepcopy
 from typing import List
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.db.models import Memory, Product, ProductAnalysis, ProductSnapshot
+from app.db.models import Memory, Product, ProductAnalysis, ProductSnapshot, Store
 from app.schemas.products import ProductIn, ProductPatch
 from app.services.decision_engine import ALGORITHM_VERSION, WEIGHTS, analyze, to_dict
 from app.services.provenance import build_trust, capture_lineage
@@ -26,8 +26,14 @@ class ProductRepository:
         return await self.session.scalar(select(Product).where(Product.external_product_id == external_product_id, Product.company_id == self.company_id))
 
     async def upsert(self, data: ProductIn) -> Product:
+        if data.store_id and not await self.session.scalar(select(Store.id).where(Store.id == data.store_id, Store.company_id == self.company_id)):
+            raise ValueError("Store does not belong to this company")
         product = await self.get_by_external_id(data.external_product_id)
+        if product and product.store_id != data.store_id and data.store_id is not None:
+            raise ValueError("External product identity is bound to another store")
         values = data.model_dump(exclude={"captured_at", "competitor_entries", "visible_lowest_competitor_price"})
+        if data.store_id is None:
+            values.pop("store_id", None)
         raw_payload = dict(data.raw_payload or {})
         raw_payload["visibleCompetitors"] = data.competitor_entries
         raw_payload["visibleLowestCompetitorPriceRub"] = data.visible_lowest_competitor_price
@@ -53,7 +59,9 @@ class ProductRepository:
         await self.session.refresh(product)
         return product
 
-    async def patch(self, product: Product, data: ProductPatch) -> Product:
+    async def patch(self, product: Product, data: ProductPatch, *, field_lineage: dict | None = None, captured_at: datetime | None = None) -> Product:
+        if product.company_id != self.company_id:
+            raise ValueError("Product does not belong to this company")
         values=data.model_dump(exclude_unset=True)
         entries=values.pop("competitor_entries", None)
         lowest=values.pop("visible_lowest_competitor_price", None)
@@ -64,14 +72,14 @@ class ProductRepository:
             if entries is not None: merged["visibleCompetitors"]=entries
             if lowest is not None: merged["visibleLowestCompetitorPriceRub"]=lowest
             values["raw_payload"]=merged
-        changed = {key for key, value in values.items() if key != "raw_payload" and getattr(product, key, None) != value}
-        patch_input = data.model_copy(update={"raw_payload": values.get("raw_payload", product.raw_payload)})
+        changed = {key for key, value in values.items() if key != "raw_payload" and (field_lineage is not None or getattr(product, key, None) != value)}
+        patch_input = data.model_copy(update={"raw_payload": values.get("raw_payload", product.raw_payload), "field_lineage": field_lineage or {}, "captured_at": captured_at})
         product.field_lineage = {**(product.field_lineage or {}), **capture_lineage(patch_input, changed_fields=changed)}
         updated_raw = dict(values.get("raw_payload", product.raw_payload) or {})
         updated_raw["_provided_fields"] = sorted(set(updated_raw.get("_provided_fields", [])) | changed)
         values["raw_payload"] = updated_raw
         for key, value in values.items(): setattr(product, key, value)
-        await self._snapshot(product, product.raw_payload, None)
+        await self._snapshot(product, product.raw_payload, captured_at)
         await self.session.commit(); await self.session.refresh(product)
         return product
 
@@ -81,6 +89,8 @@ class ProductRepository:
         self.session.add(ProductSnapshot(company_id=self.company_id, product_id=product.id, captured_at=captured_at, price=product.current_price, rating=product.rating, review_count=product.review_count, sales_30d=product.latest_30d_sales, competitor_count=product.competitor_count, raw_payload=snapshot_payload))
 
     async def analyze(self, product: Product) -> ProductAnalysis:
+        if product.company_id != self.company_id:
+            raise ValueError("Product does not belong to this company")
         result = analyze(product)
         product.current_margin_rate = result.current_margin_rate
         product.price_position = result.price_position

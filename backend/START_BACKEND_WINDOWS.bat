@@ -33,6 +33,7 @@ if errorlevel 1 goto :install_failed
 if errorlevel 1 goto :install_failed
 
 if not exist ".env" copy .env.example .env >nul
+if not defined DEMO_IDENTITY_ENABLED set "DEMO_IDENTITY_ENABLED=1"
 if not exist "data" mkdir "data"
 echo.
 echo Starting ZMT Ozon Enterprise Backend at http://127.0.0.1:8000
