@@ -6,7 +6,8 @@ does not expose a live-network constructor or silently ingest response data.
 """
 
 import asyncio
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Awaitable, Callable, Mapping, Protocol
@@ -15,17 +16,23 @@ import httpx
 from sqlalchemy import select
 
 from app.connectors.base import AdapterResult, DataSourceType, ExternalProductIdentity, FieldStatus
+from app.connectors.ozon_seller_contract import (
+    SellerContractError, SellerDetailItem, SellerPage, SellerPriceItem, SellerStockItem,
+    build_product_info_request, build_product_list_request, build_product_prices_request,
+    build_product_stocks_request, collect_pages, decode_product_info,
+    decode_product_list, decode_product_prices, decode_product_stocks,
+)
 from app.db.models import Store
 from app.repositories.products import ProductRepository
 
 
 class ReadOnlyEndpoint(StrEnum):
-    # Ozon's published read-only role mapping names these versions. Their
-    # current request/response schemas must be rechecked before live use.
-    PRODUCT_LIST = "/v2/product/list"
-    PRODUCT_INFO = "/v2/product/info/list"
-    PRODUCT_PRICES = "/v4/product/info/prices"
-    PRODUCT_STOCKS = "/v3/product/info/stocks"
+    # User-provided four-operation OpenAPI extract; current online status is
+    # not independently verified. There is no live-network constructor.
+    PRODUCT_LIST = "/v3/product/list"
+    PRODUCT_INFO = "/v3/product/info/list"
+    PRODUCT_PRICES = "/v5/product/info/prices"
+    PRODUCT_STOCKS = "/v4/product/info/stocks"
 
 
 @dataclass(frozen=True, repr=False)
@@ -127,6 +134,55 @@ class OzonSellerOfflineClient:
                 return body
         raise AssertionError("bounded retry loop exhausted unexpectedly")
 
+    async def product_list_page(self, *, last_id: str = "", limit: int = 100,
+                                product_ids: tuple[str, ...] = ()) -> SellerPage:
+        body = await self.post(ReadOnlyEndpoint.PRODUCT_LIST,
+                               build_product_list_request(last_id=last_id, limit=limit, product_ids=product_ids))
+        page = decode_product_list(body)
+        if product_ids and any(item.product_id not in product_ids for item in page.items):
+            raise SellerContractError("FILTER_RESULT_MISMATCH")
+        return page
+
+    async def product_info(self, *, product_ids: tuple[str, ...]) -> tuple[SellerDetailItem, ...]:
+        body = await self.post(ReadOnlyEndpoint.PRODUCT_INFO,
+                               build_product_info_request(product_ids=product_ids))
+        rows = decode_product_info(body)
+        if any(item.product_id not in product_ids for item in rows):
+            raise SellerContractError("FILTER_RESULT_MISMATCH")
+        if len({item.product_id for item in rows}) != len(rows):
+            raise SellerContractError("DUPLICATE_PRODUCT_ID")
+        return rows
+
+    async def product_prices_page(self, *, cursor: str = "", limit: int = 100,
+                                  product_ids: tuple[str, ...] = ()) -> SellerPage[SellerPriceItem]:
+        body = await self.post(ReadOnlyEndpoint.PRODUCT_PRICES,
+                               build_product_prices_request(cursor=cursor, limit=limit, product_ids=product_ids))
+        page = decode_product_prices(body)
+        if product_ids and any(item.product_id not in product_ids for item in page.items):
+            raise SellerContractError("FILTER_RESULT_MISMATCH")
+        return page
+
+    async def product_stocks_page(self, *, cursor: str = "", limit: int = 100,
+                                  product_ids: tuple[str, ...] = ()) -> SellerPage[SellerStockItem]:
+        body = await self.post(ReadOnlyEndpoint.PRODUCT_STOCKS,
+                               build_product_stocks_request(cursor=cursor, limit=limit, product_ids=product_ids))
+        page = decode_product_stocks(body)
+        if product_ids and any(item.product_id not in product_ids for item in page.items):
+            raise SellerContractError("FILTER_RESULT_MISMATCH")
+        return page
+
+    async def collect_product_list(self, *, limit: int = 100, max_pages: int = 1000) -> tuple:
+        return await collect_pages(lambda cursor, size: self.product_list_page(last_id=cursor, limit=size),
+                                   lambda item: item.product_id, limit=limit, max_pages=max_pages)
+
+    async def collect_product_prices(self, *, limit: int = 100, max_pages: int = 1000) -> tuple[SellerPriceItem, ...]:
+        return await collect_pages(lambda cursor, size: self.product_prices_page(cursor=cursor, limit=size),
+                                   lambda item: item.product_id, limit=limit, max_pages=max_pages)
+
+    async def collect_product_stocks(self, *, limit: int = 100, max_pages: int = 1000) -> tuple[SellerStockItem, ...]:
+        return await collect_pages(lambda cursor, size: self.product_stocks_page(cursor=cursor, limit=size),
+                                   lambda item: item.product_id, limit=limit, max_pages=max_pages)
+
 
 @dataclass(frozen=True)
 class SellerProductObservation:
@@ -142,6 +198,37 @@ class SellerProductObservation:
     source_updated_at: datetime | None = None
     price_status: FieldStatus = FieldStatus.UNVERIFIED
     title_status: FieldStatus = FieldStatus.UNVERIFIED
+    field_lineage: dict[str, dict] = field(default_factory=dict)
+
+
+def observation_from_detail_and_price(
+    detail: SellerDetailItem, price: SellerPriceItem, *, observed_at: datetime,
+) -> SellerProductObservation:
+    """Join only matching Ozon IDs; detail update time is not a price update time."""
+    if detail.product_id != price.product_id or (detail.offer_id and price.offer_id and detail.offer_id != price.offer_id):
+        raise SellerContractError("IDENTITY_MISMATCH")
+    try:
+        normalized_price = float(price.price) if price.price is not None else None
+    except OverflowError:
+        raise SellerContractError("INVALID_PRICE") from None
+    if normalized_price is not None and not math.isfinite(normalized_price):
+        raise SellerContractError("INVALID_PRICE")
+    return SellerProductObservation(
+        ozon_product_id=detail.product_id,
+        offer_id=detail.offer_id or price.offer_id,
+        sku=detail.sku,
+        title=detail.title,
+        price=normalized_price,
+        currency=price.currency,
+        observed_at=observed_at,
+        # Product information updated_at has no authority over the separate
+        # price response's freshness; only title gets that source timestamp.
+        field_lineage={"title": {"updated_at": detail.updated_at.isoformat()}}
+        if detail.updated_at is not None else {},
+        price_status=(FieldStatus.UNKNOWN if price.price is None else
+                      FieldStatus.KNOWN_ZERO if price.price == 0 else FieldStatus.PRESENT),
+        title_status=FieldStatus.PRESENT if detail.title else FieldStatus.UNKNOWN,
+    )
 
 
 def adapt_seller_observation(store_id: str, observation: SellerProductObservation) -> AdapterResult:
@@ -163,13 +250,15 @@ def adapt_seller_observation(store_id: str, observation: SellerProductObservatio
         # Existing ProductIn stores RUB price; no implicit currency conversion.
         statuses["current_price"] = FieldStatus.UNVERIFIED
     return AdapterResult(
-        data=values, provider="ozon_seller_offline", source_reference=f"store:{store_id}:product:{observation.ozon_product_id}",
+        data=values, provider="mock_ozon_seller_contract", source_reference=f"store:{store_id}:product:{observation.ozon_product_id}",
         observed_at=observation.observed_at.astimezone(UTC), source_updated_at=observation.source_updated_at,
         source_type=DataSourceType.OZON_SELLER,
+        confidence="synthetic",
         identity=ExternalProductIdentity(DataSourceType.OZON_SELLER, observation.ozon_product_id,
             store_id=store_id, ozon_product_id=observation.ozon_product_id,
             offer_id=observation.offer_id, sku=observation.sku),
         field_status=statuses,
+        field_lineage=observation.field_lineage,
         warnings=["Wire schema and field trust remain unverified; offline fixture only."],
     )
 

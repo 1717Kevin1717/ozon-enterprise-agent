@@ -1,5 +1,8 @@
 # Ozon Seller Stage C1 — offline contract boundary
 
+This records the initial C1 investigation. For the later user-supplied
+four-operation extract and offline decoders, see `OZON_SELLER_C1_FINAL.md`.
+
 Checked 2026-10-21. This is **not** a live Seller integration and contains no
 merchant credentials or real merchant data.
 

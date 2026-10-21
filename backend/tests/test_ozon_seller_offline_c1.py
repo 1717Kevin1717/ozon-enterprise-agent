@@ -54,7 +54,7 @@ def test_mock_transport_uses_only_allowlisted_read_endpoint_and_bound_store():
                 client = OzonSellerOfflineClient(ProductRepository(db, "tenant-a"), "store-a",
                     OfflineCredentials(), transport=httpx.MockTransport(respond))
                 assert (await client.post(ReadOnlyEndpoint.PRODUCT_LIST, {}))["result"]["items"] == []
-                assert seen == [("POST", "/v2/product/list", "fixture-client")]
+                assert seen == [("POST", "/v3/product/list", "fixture-client")]
                 with pytest.raises(ValueError, match="allowlisted"):
                     await client.post("/v1/product/import", {})
                 foreign = OzonSellerOfflineClient(ProductRepository(db, "tenant-b"), "store-a",
@@ -230,7 +230,7 @@ def test_known_zero_price_is_distinct_from_missing_and_is_source_traced():
                 product = await ingest_product_result(ProductRepository(db, "tenant-a"), result)
                 assert product.current_price == 0
                 assert product.raw_payload["_ingestion"]["field_status"]["current_price"] == "KNOWN_ZERO"
-                assert product.field_lineage["current_price"]["is_mock"] is False
+                assert product.field_lineage["current_price"]["is_mock"] is True
         finally:
             await engine.dispose()
     asyncio.run(run())

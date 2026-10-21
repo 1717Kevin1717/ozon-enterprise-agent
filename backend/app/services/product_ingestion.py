@@ -3,7 +3,8 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from app.connectors.base import AdapterResult, DataSourceType, FieldStatus
+from app.connectors.base import AdapterResult, DataSourceType, ExternalProductIdentity, FieldStatus
+from app.connectors.ozon_seller_contract import SellerStockItem, decode_product_stocks
 from app.db.models import Product
 from app.repositories.products import ProductRepository
 from app.schemas.products import ProductIn, ProductPatch
@@ -86,7 +87,7 @@ def _validated_fields(result: AdapterResult) -> tuple[dict[str, Any], dict[str, 
         entry = {"source": old} if isinstance(old, str) else dict(old) if isinstance(old, dict) else {}
         provider = str(entry.get("provider") or entry.get("source") or result.provider) if result.source_type == DataSourceType.DEMO_MOCK else result.provider
         entry.update({"source_type": _SOURCE_KIND[result.source_type], "provider": provider,
-                      "is_mock": result.source_type == DataSourceType.DEMO_MOCK})
+                      "is_mock": result.source_type == DataSourceType.DEMO_MOCK or result.confidence == "synthetic"})
         if result.observed_at is not None:
             entry["observed_at"] = _timestamp(result.observed_at)
         entry["collected_at"] = _timestamp(datetime.now(UTC))
@@ -139,6 +140,7 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
         raise ValueError("New products require sourced title and price")
     metadata = {
         "source_type": result.source_type.value, "provider": result.provider,
+        "offline_fixture": result.confidence == "synthetic",
         "source_reference": result.source_reference,
         "identity": {"store_id": identity.store_id, "ozon_product_id": identity.ozon_product_id,
                      "offer_id": identity.offer_id, "sku": identity.sku},
@@ -146,6 +148,12 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
         "source_updated_at": _timestamp(result.source_updated_at),
     }
     raw_payload = dict(result.data.get("raw_payload") or {}) if result.source_type == DataSourceType.DEMO_MOCK else {}
+    if product is not None and result.source_type == DataSourceType.OZON_SELLER:
+        existing_inventory = (product.raw_payload or {}).get("_seller_inventory")
+        if isinstance(existing_inventory, dict):
+            # A later catalog/price sync must not erase a separately observed
+            # warehouse-granular stock snapshot for this same store/product.
+            raw_payload["_seller_inventory"] = existing_inventory
     identities = dict((product.raw_payload or {}).get("_external_identities") or {}) if product is not None else {}
     if result.source_type in {DataSourceType.DEMO_MOCK, DataSourceType.OZON_SELLER}:
         identities[result.source_type.value] = {"external_product_id": key, **metadata["identity"]}
@@ -168,7 +176,8 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
         create_values = {**values, "external_product_id": key, "store_id": identity.store_id,
                          "field_lineage": lineage, "raw_payload": raw_payload, "captured_at": result.observed_at}
         product = await repo.upsert(ProductIn.model_validate(create_values))
-    product.sync_status = "demo_mock" if result.source_type == DataSourceType.DEMO_MOCK else "synced"
+    product.sync_status = ("demo_mock" if result.source_type == DataSourceType.DEMO_MOCK else
+                           "offline_fixture" if result.confidence == "synthetic" else "synced")
     product.last_sync_at = datetime.now(UTC).replace(tzinfo=None)
     if result.source_updated_at is not None:
         source_time = result.source_updated_at.astimezone(UTC).replace(tzinfo=None) if result.source_updated_at.tzinfo else result.source_updated_at
@@ -176,3 +185,46 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
     await repo.session.commit()
     await repo.session.refresh(product)
     return product
+
+
+async def ingest_seller_stock_observation(
+    repo: ProductRepository, store_id: str, item: SellerStockItem, *, observed_at: datetime,
+) -> Product:
+    """Store an offline, warehouse-granular observation on an existing product.
+
+    It does not change price, sales, costs, recommendation or compliance facts.
+    The normal tenant-scoped repository patch creates the auditable snapshot.
+    """
+    if observed_at.tzinfo is None:
+        raise ValueError("Stock observation time must carry a timezone")
+    identity = ExternalProductIdentity(DataSourceType.OZON_SELLER, item.product_id,
+                                       store_id=store_id, ozon_product_id=item.product_id)
+    product = await repo.get_by_external_id(identity.repository_key())
+    if product is None or product.store_id != store_id:
+        raise ValueError("Seller stock target does not belong to this store and tenant")
+    known = ((product.raw_payload or {}).get("_external_identities") or {}).get("OZON_SELLER") or {}
+    if item.offer_id and known.get("offer_id") and item.offer_id != known["offer_id"]:
+        raise ValueError("Seller stock offer ID conflicts with product identity")
+    wire_stocks = [
+        {"sku": int(unit.sku) if unit.sku is not None else None,
+         "type": unit.fulfillment_type, "shipment_type": unit.shipment_type,
+         "warehouse_ids": list(unit.warehouse_ids) if unit.warehouse_ids is not None else None,
+         "present": unit.present, "reserved": unit.reserved}
+        for unit in item.stocks
+    ]
+    # Revalidate even if a caller constructed SellerStockItem directly rather
+    # than using the strict wire decoder. No partial or malformed record writes.
+    decode_product_stocks({"items": [{"product_id": int(item.product_id),
+                                      "offer_id": item.offer_id, "stocks": wire_stocks}], "cursor": ""})
+    inventory = {
+        "source_type": DataSourceType.OZON_SELLER.value,
+        "provider": "mock_ozon_seller_contract", "is_mock": True,
+        "observed_at": _timestamp(observed_at), "stock_units": wire_stocks,
+        "quantity_note": "present and reserved are distinct source fields; availability is not inferred",
+    }
+    raw = dict(product.raw_payload or {})
+    if raw.get("_seller_inventory") == inventory:
+        return product
+    raw["_seller_inventory"] = inventory
+    return await repo.patch(product, ProductPatch.model_validate({"raw_payload": raw}),
+                            captured_at=observed_at)
