@@ -159,8 +159,11 @@ def build_trust(product, analysis: dict | None = None, *, saved_fields: dict | N
     notices = evidence_notices(list(fields.values()))
     if legacy_analysis and not saved_fields:
         notices.append(TrustNotice(product_id=product.id, field="analysis", code="LEGACY_ANALYSIS", message="旧分析未保存字段级输入证据；其历史计算输入来源未知，需重新分析以建立新证据链。"))
+    merchant_imported = ((product.raw_payload or {}).get("_merchant_import") or {}).get("source_type") == "MERCHANT_INTERNAL"
     return ProductDataTrust(product_id=product.id, company_id=product.company_id, is_mock=mock,
-        disclosure="演示 / Mock 数据，不代表真实 Ozon 市场；平台链接仅供参考。" if mock else "来源声明不等于外部真实性认证；缺失来源或采集时间保持未知。",
+        disclosure=("演示 / Mock 数据，不代表真实 Ozon 市场；平台链接仅供参考。" if mock else
+                    "商家导入 / 预计数据，不是 Ozon 实时成交价或官方成本；缺少市场证据时不得视为正式推荐。" if merchant_imported else
+                    "来源声明不等于外部真实性认证；缺失来源或采集时间保持未知。"),
         completeness={"definition": "field_presence_v1", "present": present, "total": len(raw_fields), "percent": round(100*present/len(raw_fields)), "missing_fields": [item.field for item in raw_fields if item.presence == "MISSING"], "unknown_fields": [item.field for item in raw_fields if item.presence == "UNKNOWN"]}, fields=fields, notices=notices)
 
 

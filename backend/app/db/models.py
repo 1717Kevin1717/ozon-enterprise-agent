@@ -97,6 +97,21 @@ class Product(Base, Timestamped):
     source_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     raw_payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
+
+class MerchantImportPreview(Base):
+    """Short-lived, tenant-bound confirmation state; never stores the CSV body."""
+
+    __tablename__ = "merchant_import_previews"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=uid)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    versions_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
 class ProductSnapshot(Base):
     __tablename__ = "product_snapshots"
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=uid)

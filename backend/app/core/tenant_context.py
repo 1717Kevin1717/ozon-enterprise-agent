@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import TypedDict
 
 from fastapi import HTTPException, status
@@ -52,7 +53,7 @@ def resolve_tenant_context(
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "AUTHENTICATION_REQUIRED"})
 
 
-def require_local_demo_database(database_url: str, *, workspace: Path) -> None:
+def require_local_demo_database(database_url: str, *, workspace: Path, test_mode: bool = False) -> None:
     """Refuse a Demo identity against a remote or non-project database."""
     try:
         url = make_url(database_url)
@@ -65,6 +66,6 @@ def require_local_demo_database(database_url: str, *, workspace: Path) -> None:
     if not url.database:
         raise RuntimeError("Demo database path is missing")
     actual = Path(url.database).resolve()
-    permitted = (workspace / "data").resolve()
+    permitted = ((Path(tempfile.gettempdir()) / "ozon-agent-tests") if test_mode else (workspace / "data")).resolve()
     if not actual.is_relative_to(permitted):
-        raise RuntimeError("Demo identity requires a database under this backend's data directory")
+        raise RuntimeError("Demo identity requires a database under this backend's isolated data directory")

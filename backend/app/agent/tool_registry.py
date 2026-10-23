@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.agent import MAX_IMPORT_COLLECTION_MEMBERS
+
 
 ToolRiskLevel = Literal["low", "medium", "high"]
 
@@ -60,8 +62,8 @@ class CompareProductsInput(ToolInput):
 
 
 class AnalyzeCollectionInput(ToolInput):
-    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
-    product_ids: list[str] = Field(default_factory=list, max_length=100)
+    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog", "merchant_import_batch"]
+    product_ids: list[str] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
     top_k: int = Field(default=3, ge=1, le=20)
     ranking_dimensions: list[Literal[
         "recommendation", "profit", "roi", "risk", "demand", "competition", "compliance"

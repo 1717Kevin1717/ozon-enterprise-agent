@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from app.db.models import Product
+from app.services.financial_readiness import financial_readiness
 from app.services.provenance import build_trust
 
 ALGORITHM_VERSION = "v2.0.0-enterprise-evaluation"
@@ -120,6 +121,8 @@ class AnalysisResult:
     price_position: str
     strategy_factor: float
     historical_risk_factor: float
+    financial_status: str = "SUFFICIENT"
+    financial_missing_fields: tuple[str, ...] = ()
 
 
 def _number(value: Any) -> float:
@@ -202,6 +205,7 @@ def evidence_completeness(product: Product) -> tuple[dict[str, Any], list[dict[s
 
 
 def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float = 1.0, historical_risk_factor: float = 1.0) -> AnalysisResult:
+    financial = financial_readiness(product)
     price = _number(product.current_price)
     purchase = _number(product.procurement_cost)
     logistics = _number(product.shipping_cost) or _number(product.fulfillment_cost)
@@ -220,6 +224,18 @@ def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float 
     target_price = (purchase + logistics + advertising + fixed_operating_costs) / max(0.01, 1 - commission_rate - target_margin)
     price_position = _price_position(product)
     completeness, missing = evidence_completeness(product)
+    if not financial.ready:
+        profit_group = completeness["groups"]["profit"]
+        if profit_group["ready"]:
+            completeness["passed_weight"] -= profit_group["weight"]
+        profit_group["ready"] = False
+        completeness["percent"] = completeness["passed_weight"]
+        completeness["ratio"] = round(completeness["percent"] / 100, 2)
+        completeness["grade"] = "partial" if completeness["percent"] >= 40 else "insufficient"
+        completeness["decision_ready"] = False
+        missing = [item for item in missing if item["dimension"] != "profit"]
+        missing.append({"dimension": "profit", "missing": " / ".join(financial.missing_fields),
+                        "action": "补齐有来源且可按 RUB 核验的成本及费率。"})
     missing_fields = sorted({field for item in missing for field in item["missing"].split(" / ")})
 
     sales_score = _log_score(_number(product.latest_30d_sales), 1000)
@@ -234,6 +250,8 @@ def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float 
     roi_score = _clamp(roi / 0.80 * 100)
     profit_buffer_score = _clamp(net_profit / max(price * 0.35, 1) * 100) if price else 0
     profit = margin_score * 0.45 + roi_score * 0.35 + profit_buffer_score * 0.20
+    if not financial.ready:
+        profit = 0.0  # Not a measured zero profit; numeric ranking weight is conservatively withheld.
 
     competitor_count_score = _clamp(100 - _number(product.competitor_count) * 2)
     price_pressure = _number(product.price_competition_score)
@@ -252,7 +270,8 @@ def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float 
 
     risk_deduction = 0.0
     risk_deduction += 80 if product.compliance_status in {"rejected", "未通过"} else 25 if compliance < 80 else 0
-    risk_deduction += _clamp((target_margin - net_margin) / max(target_margin, 0.01) * 25, 0, 25)
+    if financial.ready:
+        risk_deduction += _clamp((target_margin - net_margin) / max(target_margin, 0.01) * 25, 0, 25)
     risk_deduction += _clamp(-_number(product.sales_growth_rate) * 1.5, 0, 15)
     risk_deduction += saturation * 0.12 + price_pressure * 0.08
     risk_deduction += (1 - completeness["ratio"]) * 25
@@ -276,7 +295,7 @@ def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float 
         risk(missing_codes[item["dimension"]], "high" if item["dimension"] in {"profit", "compliance"} else "medium", f"{item['dimension']} 证据不完整：{item['missing']}。", item["action"])
     if product.compliance_status in {"rejected", "未通过"}:
         risk("COMPLIANCE_BLOCK", "high", "合规未通过，选品已阻断。", "补充材料或由人工驳回候选。")
-    if price and net_margin < target_margin:
+    if financial.ready and price and net_margin < target_margin:
         risk("MARGIN_BELOW_TARGET", "medium", f"净利率 {net_margin:.1%} 低于目标 {target_margin:.1%}。", "复核成本、广告或调整价格。")
     if _number(product.sales_growth_rate) < -5:
         risk(
@@ -310,6 +329,9 @@ def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float 
         "risk": {"score": scores["risk"], "drivers": [f"安全余量 {risk_score:.1f}/100", f"风险项 {len(risks)} 个"], "formula": "100 - 合规/利润/趋势/饱和度/缺失数据扣分（高分代表更安全）"},
         "recommendation": {"score": recommendation_score, "grade": grade, "weights": WEIGHTS, "data_confidence": completeness["ratio"]},
     }
+    if not financial.ready:
+        score_explanations["profit"] = {"score": None, "drivers": ["利润证据不足；缺少 " + "、".join(financial.missing_fields)],
+                                        "formula": "未执行可信利润判断"}
     evidence = {
         "demand": {"score": scores["demand"], "fields": [{"field": "latest_30d_sales", "value": product.latest_30d_sales, "source": product.sales_source, "evidence": product.sales_evidence}, {"field": "search_volume", "value": product.search_volume, "source": (product.field_lineage or {}).get("search_volume", "not_confirmed")}]},
         "profit": {"score": scores["profit"], "fields": [{"field": "current_price", "value": price, "source": (product.field_lineage or {}).get("currentPriceRub", "not_confirmed")}, {"field": "total_cost", "value": round(total_cost, 2), "source": "enterprise_operating_data"}, {"field": "net_margin", "value": net_margin, "source": "deterministic_evaluation_v2"}]},
@@ -318,6 +340,9 @@ def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float 
         "risk": {"score": scores["risk"], "fields": [{"field": "manual_risk_level", "value": product.manual_risk_level, "source": "human_or_rule"}]},
         "dynamic": {"base_score": base_score, "data_confidence": completeness["ratio"], "strategy_factor": strategy_factor, "historical_risk_factor": historical_risk_factor, "recommendation_score": recommendation_score},
     }
+    if not financial.ready:
+        evidence["profit"] = {"score": None, "fields": [{"field": "financial_sufficiency", "value": "INSUFFICIENT_DATA",
+                                                       "source": "backend_field_status", "missing_fields": list(financial.missing_fields)}]}
     result = AnalysisResult(
         demand_score=scores["demand"], profit_score=scores["profit"], competition_score=scores["competition"], compliance_score=scores["compliance"], risk_score=scores["risk"], total_score=total_score,
         base_score=base_score, recommendation_score=recommendation_score, recommendation_grade=grade, data_confidence=completeness["ratio"], data_completeness=completeness["percent"], evidence_completeness=completeness,
@@ -325,9 +350,11 @@ def analyze(product: Product | ScenarioCalculationInput, strategy_factor: float 
         gross_profit=round(gross_profit, 2), gross_margin=round(gross_margin, 4), net_profit=round(net_profit, 2), net_margin=round(net_margin, 4), roi=round(roi, 4),
         current_margin_rate=net_margin, expected_profit=net_profit, break_even_price=round(break_even_price, 2), target_price=round(target_price, 2), price_position=price_position,
         strategy_factor=strategy_factor, historical_risk_factor=historical_risk_factor,
+        financial_status=financial.status, financial_missing_fields=financial.missing_fields,
     )
     if product.id and product.company_id:
-        trust = build_trust(product, {key: getattr(result, key) for key in ("gross_profit", "gross_margin", "net_profit", "net_margin", "roi", "risk_level")})
+        trust_fields = ("risk_level",) if not financial.ready else ("gross_profit", "gross_margin", "net_profit", "net_margin", "roi", "risk_level")
+        trust = build_trust(product, {key: getattr(result, key) for key in trust_fields})
         evidence["field_provenance"] = {key: value.model_dump(mode="json") for key, value in trust.fields.items()}
         evidence["disclosure"] = trust.disclosure
         for dimension in ("demand", "profit", "competition", "compliance", "risk"):
@@ -364,10 +391,19 @@ def recommendation_gate_status(
 
 
 def simulate_price(product: Product, proposed_price: float) -> dict[str, Any]:
+    financial = financial_readiness(product)
+    if not financial.ready:
+        return {"status": "INSUFFICIENT_DATA", "missing_fields": list(financial.missing_fields),
+                "notice": "无法根据缺失的成本输入计算价格情景；请先补齐并核验成本与币种。"}
     snapshot = calculation_input_from_product(product)
     result = analyze_snapshot(snapshot.model_copy(update={"current_price": proposed_price}))
     return {"proposed_price": proposed_price, "gross_profit": result.gross_profit, "net_profit": result.net_profit, "roi": result.roi, "expected_profit": round(result.expected_profit, 2), "margin_rate": round(result.current_margin_rate, 4), "break_even_price": result.break_even_price, "target_price": result.target_price, "price_position": result.price_position, "base_score": result.base_score, "recommendation_score": result.recommendation_score, "recommendation_grade": result.recommendation_grade, "data_confidence": result.data_confidence, "risks": result.risks, "notice": "情景模拟只改变售价，不假设销量、转化率、广告成本或竞品价格会自动变化。"}
 
 
 def to_dict(result: AnalysisResult) -> dict[str, Any]:
-    return asdict(result)
+    payload = asdict(result)
+    if result.financial_status != "SUFFICIENT":
+        for field in ("gross_profit", "gross_margin", "net_profit", "net_margin", "roi",
+                      "current_margin_rate", "expected_profit", "break_even_price", "target_price", "profit_score"):
+            payload[field] = None
+    return payload

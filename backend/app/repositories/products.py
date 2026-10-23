@@ -7,6 +7,8 @@ from app.db.models import Memory, Product, ProductAnalysis, ProductSnapshot, Sto
 from app.schemas.products import ProductIn, ProductPatch
 from app.services.decision_engine import ALGORITHM_VERSION, WEIGHTS, analyze, to_dict
 from app.services.provenance import build_trust, capture_lineage
+from app.services.financial_readiness import financial_readiness
+from app.schemas.agent import MAX_IMPORT_COLLECTION_MEMBERS
 
 class ProductRepository:
     def __init__(self, session: AsyncSession, company_id: str):
@@ -22,10 +24,26 @@ class ProductRepository:
     async def get(self, product_id: str) -> Product | None:
         return await self.session.scalar(select(Product).where(Product.id == product_id, Product.company_id == self.company_id))
 
+    async def get_many_in_order(self, product_ids: list[str]) -> list[Product]:
+        """Bounded, tenant-scoped batch lookup retaining the confirmed batch order."""
+        ids = list(dict.fromkeys(product_ids))
+        if len(ids) > MAX_IMPORT_COLLECTION_MEMBERS:
+            raise ValueError("Import collection exceeds the supported analysis size")
+        found: dict[str, Product] = {}
+        for start in range(0, len(ids), 100):
+            rows = (await self.session.scalars(
+                select(Product).where(
+                    Product.company_id == self.company_id,
+                    Product.id.in_(ids[start:start + 100]),
+                )
+            )).all()
+            found.update((row.id, row) for row in rows)
+        return [found[item] for item in ids if item in found]
+
     async def get_by_external_id(self, external_product_id: str) -> Product | None:
         return await self.session.scalar(select(Product).where(Product.external_product_id == external_product_id, Product.company_id == self.company_id))
 
-    async def upsert(self, data: ProductIn) -> Product:
+    async def upsert(self, data: ProductIn, *, commit: bool = True) -> Product:
         if data.store_id and not await self.session.scalar(select(Store.id).where(Store.id == data.store_id, Store.company_id == self.company_id)):
             raise ValueError("Store does not belong to this company")
         product = await self.get_by_external_id(data.external_product_id)
@@ -55,11 +73,14 @@ class ProductRepository:
         abandon_reason=(data.raw_payload or {}).get("abandonReason", "")
         if product.lifecycle_status in {"abandoned", "已放弃"}:
             self.session.add(Memory(company_id=self.company_id, memory_type="abandoned_product", source_type="product", source_id=product.id, content=f"已放弃商品：{product.title}；品牌：{product.brand or '待确认'}；类目：{product.category_path or '待确认'}；失败原因：{abandon_reason or '未记录'}。", metadata_json={"product_id":product.id,"reason":abandon_reason,"tags":product.tags or []}))
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
+        else:
+            await self.session.flush()
         await self.session.refresh(product)
         return product
 
-    async def patch(self, product: Product, data: ProductPatch, *, field_lineage: dict | None = None, captured_at: datetime | None = None) -> Product:
+    async def patch(self, product: Product, data: ProductPatch, *, field_lineage: dict | None = None, captured_at: datetime | None = None, commit: bool = True) -> Product:
         if product.company_id != self.company_id:
             raise ValueError("Product does not belong to this company")
         values=data.model_dump(exclude_unset=True)
@@ -80,7 +101,11 @@ class ProductRepository:
         values["raw_payload"] = updated_raw
         for key, value in values.items(): setattr(product, key, value)
         await self._snapshot(product, product.raw_payload, captured_at)
-        await self.session.commit(); await self.session.refresh(product)
+        if commit:
+            await self.session.commit()
+        else:
+            await self.session.flush()
+        await self.session.refresh(product)
         return product
 
     async def _snapshot(self, product: Product, raw_payload: dict, captured_at: datetime | None) -> None:
@@ -92,7 +117,8 @@ class ProductRepository:
         if product.company_id != self.company_id:
             raise ValueError("Product does not belong to this company")
         result = analyze(product)
-        product.current_margin_rate = result.current_margin_rate
+        if financial_readiness(product).ready:
+            product.current_margin_rate = result.current_margin_rate
         product.price_position = result.price_position
         product.data_quality = result.evidence_completeness["grade"]
         record = ProductAnalysis(
@@ -119,18 +145,20 @@ class ProductRepository:
             evidence_json=result.evidence,
             input_snapshot={
                 "price": product.current_price,
+                "financial_status": result.financial_status,
+                "financial_missing_fields": list(result.financial_missing_fields),
                 "competitor_prices": {"min": product.competitor_price_min, "avg": product.competitor_price_avg},
                 "costs": {
-                    "procurement": product.procurement_cost,
+                    "procurement": None if "procurement_cost" in result.financial_missing_fields else product.procurement_cost,
                     "fulfillment": product.fulfillment_cost,
-                    "shipping": product.shipping_cost,
-                    "platform_fee": product.platform_fee,
-                    "commission_rate": product.platform_commission_rate,
-                    "advertising": product.advertising_cost,
-                    "warehousing": product.warehousing_cost,
-                    "tax": product.tax_cost,
-                    "return_loss_reserve": product.return_loss_reserve,
-                    "other": product.other_cost,
+                    "shipping": None if "shipping_cost" in result.financial_missing_fields else product.shipping_cost,
+                    "platform_fee": None if "platform_fee" in result.financial_missing_fields else product.platform_fee,
+                    "commission_rate": None if "platform_commission_rate" in result.financial_missing_fields else product.platform_commission_rate,
+                    "advertising": None if "advertising_cost" in result.financial_missing_fields else product.advertising_cost,
+                    "warehousing": None if "warehousing_cost" in result.financial_missing_fields else product.warehousing_cost,
+                    "tax": None if "tax_cost" in result.financial_missing_fields else product.tax_cost,
+                    "return_loss_reserve": None if "return_loss_reserve" in result.financial_missing_fields else product.return_loss_reserve,
+                    "other": None if "other_cost" in result.financial_missing_fields else product.other_cost,
                 },
                 "sales": product.latest_30d_sales,
                 "search_volume": product.search_volume,
@@ -154,12 +182,24 @@ class ProductRepository:
         return record
 
     async def latest_analysis(self, product_id: str) -> ProductAnalysis | None:
-        return await self.session.scalar(select(ProductAnalysis).where(ProductAnalysis.company_id == self.company_id, ProductAnalysis.product_id == product_id).order_by(desc(ProductAnalysis.created_at)))
+        analysis = await self.session.scalar(select(ProductAnalysis).where(ProductAnalysis.company_id == self.company_id, ProductAnalysis.product_id == product_id).order_by(desc(ProductAnalysis.created_at)))
+        if analysis:
+            product = await self.get(product_id)
+            merchant = ((product.raw_payload or {}).get("_merchant_import") or {}) if product else {}
+            imported = product is not None and (
+                product.external_product_id.startswith("merchant_internal:")
+                or product.sync_status == "merchant_imported"
+                or merchant.get("source_type") == "MERCHANT_INTERNAL"
+            )
+            if imported and product.updated_at > analysis.created_at:
+                return None  # Preserve old audit record, but never present it as current import analysis.
+        return analysis
 
     async def history(self, product_id: str) -> List[ProductSnapshot]:
         return list((await self.session.scalars(select(ProductSnapshot).where(ProductSnapshot.company_id == self.company_id, ProductSnapshot.product_id == product_id).order_by(ProductSnapshot.captured_at))).all())
 
 def product_view(product: Product, analysis: ProductAnalysis | None = None) -> dict:
+    financial = financial_readiness(product)
     result = {key: getattr(product, key) for key in [
         "id","external_product_id","sku","title","brand","category","category_path","url","main_image_url","image_urls","seller_name","currency",
         "current_price","regular_price","competitor_price_min","competitor_price_avg","price_position","rating","review_count","latest_30d_sales","sales_growth_rate","search_volume","trend_score",
@@ -177,6 +217,15 @@ def product_view(product: Product, analysis: ProductAnalysis | None = None) -> d
         "monthly_sales": product.latest_30d_sales,
         "sales_growth": product.sales_growth_rate,
     })
+    result["financial_status"] = financial.status
+    result["financial_missing_fields"] = list(financial.missing_fields)
+    if not financial.ready:
+        result["current_margin_rate"] = None
+        for field in financial.missing_fields:
+            if field in result:
+                result[field] = None
+        if "procurement_cost" in financial.missing_fields:
+            result["cost_price"] = None
     raw_payload = product.raw_payload or {}
     result["visible_competitors"] = raw_payload.get("visibleCompetitors", [])
     result["visible_lowest_competitor_price"] = raw_payload.get("visibleLowestCompetitorPriceRub", 0)
@@ -210,8 +259,16 @@ def product_view(product: Product, analysis: ProductAnalysis | None = None) -> d
             "recommendation": meta.get("recommendation", "review_required"),
             "created_at": analysis.created_at,
         }
+    if analysis and not financial.ready:
+        for field in ("gross_profit", "gross_margin", "net_profit", "net_margin", "roi", "profit_score"):
+            result["analysis"][field] = None
+        result["analysis"]["total_score"] = None
+        result["analysis"]["recommendation"] = "review_required"
+        result["analysis"]["financial_status"] = financial.status
+        result["analysis"]["financial_missing_fields"] = list(financial.missing_fields)
     current_analysis = result.get("analysis") or to_dict(analyze(product))
-    result["data_trust"] = build_trust(product, current_analysis, saved_fields=(analysis.evidence_json or {}).get("field_provenance") if analysis else None, legacy_analysis=analysis is not None).model_dump(mode="json")
+    trust_analysis = {key: value for key, value in current_analysis.items() if value is not None}
+    result["data_trust"] = build_trust(product, trust_analysis, saved_fields=(analysis.evidence_json or {}).get("field_provenance") if analysis and financial.ready else None, legacy_analysis=analysis is not None).model_dump(mode="json")
     # Legacy labels such as enterprise_verified are not proof of external authenticity.
     if analysis:
         projected = deepcopy(analysis.evidence_json or {})

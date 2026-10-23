@@ -503,6 +503,9 @@ def evolve_task_state(
                 effective_top_k=len(collection.get("top_product_ids") or []),
                 created_at=datetime.now(UTC),
                 collection_type=collection["collection_type"],
+                source_batch_id=(collection.get("source_batch_id") or (
+                    previous.active_collection.source_batch_id if previous.active_collection else None
+                )) if collection["collection_type"] == "merchant_import_batch" else None,
                 product_ids=parent_members,
                 ranked_product_ids=collection.get("ranked_product_ids") or [],
                 top_product_ids=collection.get("top_product_ids") or [],
@@ -542,6 +545,18 @@ def evolve_task_state(
                 ranking_dimensions=preview_dimensions[:10],
                 source_task_revision=revision, created_turn=turn_index,
             )
+    if intent == "collection_analysis" and previous.active_collection and operation in {
+        "COMPARE_COLLECTION_MEMBERS", "LOOKUP_ORDINAL_MEMBER",
+    }:
+        # A read-only canonical lookup changes conversational focus, not the
+        # collection's members, order, ranking basis, or source revision.
+        state.conversation_focus = ConversationFocusState(
+            focus_type="CANONICAL_ORDERED_RESULT",
+            focus_id=previous.active_collection.result_id,
+            focus_revision=previous.active_collection.source_task_revision,
+            focus_source_operation=operation,
+            updated_at=datetime.now(UTC),
+        )
     # One backend-owned adapter records exactly the visible order, regardless
     # of which business handler produced it.  A focused inspection must not
     # replace the previous multi-product result.

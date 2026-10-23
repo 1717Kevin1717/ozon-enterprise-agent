@@ -38,6 +38,10 @@ ContextSource = Literal[
     "last_resolved_entity", "ordinal_reference", "session_state", "none", "conflict", "invalid",
 ]
 
+# A confirmed merchant batch is analyzed in bounded chunks.  Keep its complete
+# identifier set in session state; only the visible Top-K reaches answer context.
+MAX_IMPORT_COLLECTION_MEMBERS = 200
+
 TaskOperation = Literal[
     "CREATE", "CONTINUE", "SWITCH", "REFINE", "ADD_CONSTRAINT",
     "UPDATE_CONSTRAINT", "REMOVE_CONSTRAINT", "REORDER", "RERUN",
@@ -61,7 +65,7 @@ class ResultSetState(BaseModel):
     model_config = ConfigDict(extra="forbid")
     result_id: str = ""
     session_id: str = ""
-    product_ids: list[str] = Field(default_factory=list, max_length=100)
+    product_ids: list[str] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
     source_task_type: str
     source_operation: str = "CREATE"
     scope_type: str = "enterprise_catalog"
@@ -130,9 +134,10 @@ class CollectionState(BaseModel):
     ranking_spec: list[str] = Field(default_factory=list, max_length=10)
     effective_top_k: int = Field(default=0, ge=0, le=20)
     created_at: datetime | None = None
-    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
-    product_ids: list[str] = Field(default_factory=list, max_length=100)
-    ranked_product_ids: list[str] = Field(default_factory=list, max_length=100)
+    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog", "merchant_import_batch"]
+    source_batch_id: str | None = None
+    product_ids: list[str] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
+    ranked_product_ids: list[str] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
     top_product_ids: list[str] = Field(default_factory=list, max_length=20)
     top_k: int = Field(default=3, ge=1, le=20)
     ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
@@ -272,7 +277,7 @@ class ReferenceResolutionResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    product_ids: list[str] = Field(default_factory=list, max_length=100)
+    product_ids: list[str] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
     source: ContextSource = "none"
     reference_expression: str | None = None
     inherited_dimensions: list[str] = Field(default_factory=list, max_length=10)
@@ -321,7 +326,7 @@ class QueryUnderstanding(BaseModel):
     sort_updates: list[str] = Field(default_factory=list, max_length=10)
     result_set_reference: bool = False
     collection_reference: Literal[
-        "candidate_pool", "active_result_set", "company_catalog", "current_collection"
+        "candidate_pool", "active_result_set", "company_catalog", "current_collection", "merchant_import_batch"
     ] | None = None
     collection_selector: dict[str, Any] | None = None
     collection_filters: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
@@ -576,13 +581,16 @@ class AgentProduct(BaseModel):
     currency: str = "RUB"
     price_source: str = "company_product_database"
     updated_at: datetime | None = None
-    current_margin_rate: float = 0
-    net_profit: float = 0
-    roi: float = 0
+    current_margin_rate: float | None = 0
+    net_profit: float | None = 0
+    roi: float | None = 0
+    financial_status: str = "SUFFICIENT"
+    financial_missing_fields: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     url: str = ""
     main_image_url: str = ""
     is_mock: bool = False
+    source_type: str = "unknown"
     data_disclosure: str = ""
 
 
@@ -637,8 +645,12 @@ class CollectionCandidateResult(BaseModel):
 
 class CollectionAnalysisResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
+    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog", "merchant_import_batch"]
+    source_batch_id: str | None = None
     member_count: int = Field(ge=0)
+    source_member_count: int = Field(default=0, ge=0)
+    ranking_result_count: int = Field(default=0, ge=0)
+    excluded_count: int = Field(default=0, ge=0)
     eligible_count: int = Field(ge=0)
     requested_top_k: int = Field(ge=1, le=20)
     returned_top_k: int = Field(ge=0, le=20)
@@ -646,13 +658,14 @@ class CollectionAnalysisResult(BaseModel):
     ranking_dimensions: list[str] = Field(default_factory=list, max_length=10)
     require_gate_pass: bool = True
     exclude_insufficient_data: bool = False
-    member_product_ids: list[str] = Field(default_factory=list, max_length=100)
-    ranked_product_ids: list[str] = Field(default_factory=list, max_length=100)
+    member_product_ids: list[str] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
+    ranked_product_ids: list[str] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
     top_product_ids: list[str] = Field(default_factory=list, max_length=20)
     candidates: list[CollectionCandidateResult] = Field(default_factory=list, max_length=20)
     selection_groups: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
     selection_comparison: dict[str, Any] = Field(default_factory=dict)
     ineligible_status_counts: dict[str, int] = Field(default_factory=dict)
+    excluded_from_ranking: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_IMPORT_COLLECTION_MEMBERS)
     notice: str = ""
 
 

@@ -238,10 +238,13 @@ async def dashboard_overview(ctx: dict = Depends(context), session: AsyncSession
 
     analyzed = [item for item in views if item.get("analysis")]
     scored = [item["analysis"]["recommendation_score"] for item in analyzed]
-    margins = [item["current_margin_rate"] for item in views if item.get("current_price", 0) > 0 and item.get("procurement_cost", 0) > 0]
+    margins = [item["current_margin_rate"] for item in views
+               if item.get("current_price", 0) > 0 and item.get("procurement_cost") is not None
+               and item["procurement_cost"] > 0 and item.get("current_margin_rate") is not None]
     verified_profit = sum(
         item.get("latest_30d_sales", 0) * item.get("current_price", 0) * item.get("current_margin_rate", 0)
         for item in views if item.get("sales_source") not in {"", "not_provided", "未提供"}
+        and item.get("current_margin_rate") is not None
     )
     pipeline = Counter(item.get("lifecycle_status") or "candidate" for item in views)
     categories: dict[str, dict] = {}
@@ -396,7 +399,8 @@ async def get_analysis(product_id: str, ctx: dict = Depends(context), session: A
     repo=ProductRepository(session,ctx["company_id"]); analysis=await repo.latest_analysis(product_id)
     if not analysis: raise HTTPException(404,detail={"code":"ANALYSIS_NOT_FOUND","message":"尚未分析该商品。"})
     product=await ProductRepository(session,ctx["company_id"]).get(product_id)
-    return {"success":True,"data":{"algorithm_version":analysis.algorithm_version,"weights":analysis.weights_json,"scores":{"demand":analysis.demand_score,"profit":analysis.profit_score,"competition":analysis.competition_score,"compliance":analysis.compliance_score,"total":analysis.total_score},"risk_level":analysis.risk_level,"risks":analysis.risks_json,"evidence":product_view(product, analysis)["analysis"]["evidence"],"input_snapshot":analysis.input_snapshot,"visible_competitors":(product.raw_payload or {}).get("visibleCompetitors",[]) if product else [],"visible_lowest_competitor_price":(product.raw_payload or {}).get("visibleLowestCompetitorPriceRub",0) if product else 0,"created_at":analysis.created_at}}
+    view = product_view(product, analysis)["analysis"]
+    return {"success":True,"data":{"algorithm_version":analysis.algorithm_version,"weights":analysis.weights_json,"scores":{"demand":analysis.demand_score,"profit":view["profit_score"],"competition":analysis.competition_score,"compliance":analysis.compliance_score,"total":view["total_score"]},"risk_level":analysis.risk_level,"risks":analysis.risks_json,"evidence":view["evidence"],"input_snapshot":analysis.input_snapshot,"visible_competitors":(product.raw_payload or {}).get("visibleCompetitors",[]) if product else [],"visible_lowest_competitor_price":(product.raw_payload or {}).get("visibleLowestCompetitorPriceRub",0) if product else 0,"created_at":analysis.created_at}}
 
 
 @router.get("/products/{product_id}/history")

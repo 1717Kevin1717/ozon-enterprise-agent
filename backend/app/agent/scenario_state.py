@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.agent.collection_ranking import normalize_ranking_dimensions, rank_collection
 from app.db.models import Product
 from app.schemas.agent import CollectionState
+from app.services.financial_readiness import financial_readiness
 from app.services.decision_engine import (
     ScenarioCalculationInput,
     analyze_snapshot,
@@ -265,7 +266,7 @@ class ScenarioCollectionSnapshot(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog"]
+    collection_type: Literal["candidate_pool", "active_result_set", "company_catalog", "merchant_import_batch"]
     source_collection_revision: int = Field(ge=0)
     member_ids: tuple[str, ...]
     canonical_ordered_ids: tuple[str, ...]
@@ -375,6 +376,9 @@ def _collection_snapshot_hash(payload: dict[str, Any]) -> str:
 def snapshot_product(product: Product) -> ScenarioProductSnapshot:
     """Detach the canonical calculation input from the tracked ORM instance."""
 
+    financial = financial_readiness(product)
+    if not financial.ready:
+        raise ScenarioStateError("INSUFFICIENT_FINANCIAL_DATA", "Scenario requires verified cost inputs: " + ", ".join(financial.missing_fields))
     values = calculation_input_from_product(product)
     changed_at = getattr(product, "source_updated_at", None) or getattr(product, "updated_at", None)
     captured_at = changed_at or _now()
@@ -743,6 +747,78 @@ def update_scenario(
     return recalculate_scenario(candidate)
 
 
+def continue_scenario_for_product(
+    state: ScenarioState,
+    *,
+    product: Product,
+    expected_revision: int,
+) -> ScenarioState:
+    """Apply one unambiguous prior adjustment to another canonical member.
+
+    The new member gets its own frozen baseline. Existing member overrides and
+    snapshots are retained; no product row or canonical ranking is changed.
+    """
+    _require_revision(state, expected_revision)
+    if state.collection_snapshot or product.company_id != state.company_id:
+        raise ScenarioStateError("SCENARIO_SCOPE_VIOLATION", "Scenario transfer requires an owned product and a single-member scenario.")
+    if len(state.scenario_scope_target_ids) != 1 or not state.overrides:
+        raise ScenarioStateError("AMBIGUOUS_SCENARIO_CONTINUATION", "No unique prior adjustment can be reused.")
+    previous_target = state.scenario_scope_target_ids[0]
+    candidates = [item for item in state.overrides if previous_target in item.target_product_ids]
+    if len(candidates) != 1:
+        raise ScenarioStateError("AMBIGUOUS_SCENARIO_CONTINUATION", "Several prior adjustments require clarification.")
+    if product.id in state.base_product_ids:
+        if any(product.id in item.target_product_ids for item in state.overrides):
+            raise ScenarioStateError("AMBIGUOUS_SCENARIO_CONTINUATION", "The selected product already has an adjustment.")
+        snapshot = next(item for item in state.canonical_snapshots if item.product_id == product.id)
+        refs = state.canonical_snapshot_refs
+        snapshots = state.canonical_snapshots
+        baselines = state.comparison_baseline
+        ids = state.base_product_ids
+    else:
+        snapshot = snapshot_product(product)  # financial sufficiency gate
+        refs = (*state.canonical_snapshot_refs, CanonicalSnapshotRef(
+            product_id=snapshot.product_id, source_revision=snapshot.source_revision,
+            captured_at=snapshot.captured_at, snapshot_hash=snapshot.snapshot_hash,
+        ))
+        snapshots = (*state.canonical_snapshots, snapshot)
+        baselines = (*state.comparison_baseline, _baseline(snapshot))
+        ids = (*state.base_product_ids, snapshot.product_id)
+    prior = candidates[0]
+    override = normalize_override(
+        field=prior.field, operation=prior.operation, value=prior.value,
+        unit=prior.unit, target_product_ids=(product.id,),
+        created_revision=state.scenario_revision + 1,
+    )
+    candidate = state.model_copy(update={
+        "base_product_ids": ids, "canonical_snapshot_refs": refs,
+        "canonical_snapshots": snapshots, "comparison_baseline": baselines,
+        "scenario_scope_target_ids": (product.id,),
+        "overrides": (*state.overrides, override),
+        "scenario_revision": state.scenario_revision + 1,
+        "status": "HYPOTHETICAL",
+    })
+    return recalculate_scenario(candidate)
+
+
+def undo_scenario_product_override(
+    state: ScenarioState, *, product_id: str, expected_revision: int,
+) -> ScenarioState:
+    """Undo only the latest adjustment for an explicitly selected member."""
+    _require_revision(state, expected_revision)
+    matches = [index for index, item in enumerate(state.overrides) if product_id in item.target_product_ids]
+    if not matches:
+        raise ScenarioStateError("MISSING_SCENARIO_OVERRIDE", "The selected product has no active adjustment.")
+    drop = matches[-1]
+    candidate = state.model_copy(update={
+        "overrides": tuple(item for index, item in enumerate(state.overrides) if index != drop),
+        "scenario_scope_target_ids": (product_id,),
+        "scenario_revision": state.scenario_revision + 1,
+        "status": "HYPOTHETICAL",
+    })
+    return recalculate_scenario(candidate)
+
+
 def update_scenario_ranking(
     state: ScenarioState,
     *,
@@ -875,7 +951,11 @@ def scenario_response_view(state: ScenarioState, operation: ScenarioOperation) -
 def detect_stale_baseline(state: ScenarioState, products: Sequence[Product]) -> ScenarioState:
     """Compare current canonical calculation inputs with the immutable scenario snapshot."""
 
-    current = {str(product.id): snapshot_product(product) for product in products}
+    referenced_ids = {reference.product_id for reference in state.canonical_snapshot_refs}
+    current = {
+        str(product.id): snapshot_product(product)
+        for product in products if str(product.id) in referenced_ids
+    }
     stale = any(
         reference.product_id not in current
         or current[reference.product_id].snapshot_hash != reference.snapshot_hash

@@ -27,6 +27,8 @@ def ranking_metric(record: Any, dimension: str) -> float:
             return analysis.get(name, record.get(name, default))
         return getattr(record, name, default)
 
+    if isinstance(record, dict) and record.get("financial_status") == "INSUFFICIENT_DATA" and dimension in {"profit", "roi"}:
+        return float("-inf")  # Missing inputs rank after all known values; never treat them as measured zero.
     return {
         "recommendation": float(read("recommendation_score") or 0),
         "profit": float(read("net_margin", read("current_margin_rate")) or 0),

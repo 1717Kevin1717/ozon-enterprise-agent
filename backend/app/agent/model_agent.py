@@ -326,6 +326,17 @@ async def dual_model_agent_ask(
     repo = ProductRepository(session, company_id)
     products = await repo.list(limit=500)
     conversation = await _conversation(session, company_id, user_id, query, session_id)
+    # The catalogue read cap must not silently erase a session's verified
+    # collection members before semantic/context routing. Facts still come
+    # from the tenant-scoped repository, never from saved state JSON.
+    known_ids = {item.id for item in products}
+    saved_collection = ((conversation.state_json or {}).get("task_state") or {}).get("active_collection") or {}
+    for product_id in saved_collection.get("product_ids") or []:
+        if product_id not in known_ids:
+            product = await repo.get(product_id)
+            if product:
+                products.append(product)
+                known_ids.add(product_id)
     has_active_scenario = False
     try:
         has_active_scenario = load_scenario_state(

@@ -1,5 +1,8 @@
+import os
+import tempfile
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -39,3 +42,29 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ROOT / ".env", extra="ignore")
 
 settings = Settings()
+
+
+def require_explicit_test_database() -> None:
+    """Reject an accidental .env/default database before any engine is created."""
+    if settings.app_env.casefold() != "test":
+        return
+    raw_url = os.environ.get("DATABASE_URL")
+    if not raw_url:
+        raise RuntimeError("TEST_DATABASE_URL_REQUIRED")
+    try:
+        url = make_url(raw_url)
+    except Exception as exc:
+        raise RuntimeError("TEST_DATABASE_URL_INVALID") from exc
+    if url.drivername != "sqlite+aiosqlite":
+        raise RuntimeError("TEST_DATABASE_PATH_FORBIDDEN")
+    if url.database == ":memory:":
+        return
+    if not url.database:
+        raise RuntimeError("TEST_DATABASE_PATH_FORBIDDEN")
+    target = Path(url.database).resolve()
+    test_root = (Path(tempfile.gettempdir()) / "ozon-agent-tests").resolve()
+    if not target.is_relative_to(test_root) or target == test_root:
+        raise RuntimeError("TEST_DATABASE_PATH_FORBIDDEN")
+
+
+require_explicit_test_database()

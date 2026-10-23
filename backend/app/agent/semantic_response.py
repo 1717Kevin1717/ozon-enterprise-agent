@@ -23,7 +23,7 @@ def _money(value) -> str:
 
 
 def _rate(value) -> str:
-    return f"{float(value or 0):.2%}"
+    return "未知" if value is None else f"{float(value):.2%}"
 
 
 def _business_cost_items(calculation: dict, *, limit: int | None = None) -> list[dict]:
@@ -49,6 +49,8 @@ def _profit_answer(title: str, analysis: dict) -> str:
     net_profit = calculation.get("result", analysis.get("net_profit"))
     net_margin = calculation.get("net_margin", analysis.get("net_margin"))
     roi = calculation.get("roi", analysis.get("roi"))
+    if net_profit is None or net_margin is None or roi is None:
+        return f"{title}的成本或币种数据不足，当前无法可靠计算净利润、净利率和 ROI；请先补齐并核验输入。"
     top = _business_cost_items(calculation, limit=3)
     pressure = "、".join(COST_LABELS.get(item.get("field"), "其他成本") for item in top)
     text = f"{title}当前单件净利润约 {_money(net_profit)}，净利率约 {_rate(net_margin)}，ROI 约 {_rate(roi)}。"

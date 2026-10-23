@@ -25,6 +25,7 @@ REFERENCE = re.compile(
     r"剩下(?:的|那个|那些)?|已找到(?:的|那个|那些)?|没找到(?:的|那个|那些)?"
 )
 COLLECTION_REFERENCE = re.compile(r"候选池|候选集合|候选商品|商品池|当前(?:这些)?候选|这些候选|这批(?:商品|候选)?|这[三四五六七八九十3-9]个商品|现在这批|全(?:部商品)?库|公司商品库|企业商品库|当前(?:结果|集合)|刚才(?:那批|那些|的结果)")
+IMPORT_BATCH_REFERENCE = re.compile(r"(?:刚|本次|这次|本批|最近|上一批|上次|前一批).{0,8}(?:导入|上传|录入)|(?:导入|上传|录入).{0,8}(?:这批|本批|上一批|商品|产品|批次)|(?:导入)?批次(?:号|ID)?\s*[:：#]?\s*[0-9a-fA-F]{8}-")
 SEMANTIC_TYPES = {"provenance_fact", "calculation_explanation", "decision_explanation", "data_quality_answer", "data_quality_policy"}
 SEMANTIC_HANDOFF_TOOLS = ("get_product", "calculate_profit", "get_sales_trend")
 REFERENCE_SLOT_ALIASES = {
@@ -475,7 +476,12 @@ def _anchor_active_collection_ranking(
         return value
     if not has_collection and has_result_set and value.intent not in {"unknown", "collection_analysis"}:
         return value
-    if task_get("scenario_has_focus", False) and _scenario_rank_reference(query, value) != (None, None):
+    canonical_pair_compare = bool(
+        len(_rank_ordinals(query)) >= 2
+        and re.search(r"比较|对比|相比|区别|差异|优势", query)
+        and not re.search(r"假设|情景|模拟|调整后", query)
+    )
+    if task_get("scenario_has_focus", False) and _scenario_rank_reference(query, value) != (None, None) and not canonical_pair_compare:
         return value
     # A request for which member to prioritize and why is an explanation of
     # the existing order, even when the user does not say "first place". Keep
@@ -726,6 +732,11 @@ def _anchor_active_scenario_ordinal(
     ) if task_context is not None else lambda key, default=None: default
     ordinal, top_k = _scenario_rank_reference(query, value)
     has_rank_reference = ordinal is not None or top_k is not None
+    canonical_pair_compare = bool(
+        len(_rank_ordinals(query)) >= 2
+        and re.search(r"比较|对比|相比|区别|差异|优势", query)
+        and not re.search(r"假设|情景|模拟|调整后", query)
+    )
     scenario_focus = (
         context_task_state.conversation_focus.focus_type == "SCENARIO_RESULT"
         if context_task_state is not None else task_get("scenario_has_focus", None)
@@ -753,6 +764,7 @@ def _anchor_active_scenario_ordinal(
             or bool(re.search(r"假设|情景|模拟|调整后|假设里|情景里", query))
         )
         and has_rank_reference
+        and not canonical_pair_compare
         and not mutation
         and not _EXPLICIT_CANONICAL_COLLECTION.search(query)
     ):
@@ -915,9 +927,15 @@ def _collection_composition(query: str) -> dict | None:
         r"最值得(?:继续)?(?:研究|验证|调研).*?[\d一二两三四五六七八九十]+(?:个|款|件)?(?:商品|候选)",
         query, re.I,
     ))
-    evidence_analysis = _has_any(query, _EVIDENCE_TERMS) or bool(
+    cost_data_missing = bool(re.search(
+        r"(?:缺少|缺失|缺乏|没有).{0,8}(?:成本|采购|进货|费用|运费|币种|汇率)", query
+    ))
+    evidence_analysis = cost_data_missing or _has_any(query, _EVIDENCE_TERMS) or bool(
         ("数据" in query or "证据" in query) and _has_any(query, ("缺口", "缺失", "不足", "不完整"))
     )
+    financial_ready_requested = bool(re.search(
+        r"(?:可以|能够|能|可).{0,6}(?:计算|核算).{0,4}(?:利润|净利率|roi)", query, re.I
+    ))
     human_review_language = _has_any(query, _HUMAN_REVIEW_TERMS) or bool(
         "人工" in query and _has_any(query, ("审核", "复核", "确认", "介入", "查看"))
     )
@@ -950,7 +968,7 @@ def _collection_composition(query: str) -> dict | None:
         and (evidence_analysis or review_analysis or history_analysis or profit_diagnosis_analysis)
     ) or implicit_review_collection or relative_margin_filter or bool(
         profit_diagnosis_analysis and _has_any(query, ("候选", "这批", "当前"))
-    )
+    ) or bool(financial_ready_requested and _has_any(query, _PLURAL_SCOPE_TERMS))
     if not COLLECTION_REFERENCE.search(query) and not implicit_ranked_collection and not plural_collection_analysis:
         return None
     source = (
@@ -1015,7 +1033,12 @@ def _collection_composition(query: str) -> dict | None:
         query, ("哪些", "有没有", "存在", "筛出", "找出", "谁缺", "谁有", "谁的"),
     )
     if evidence_filter_requested:
-        filters.append({"field": "evidence_gap", "operator": "MISSING", "value": True, "reference_field": None, "reference_value_source": "BACKEND_EVIDENCE"})
+        filters.append({"field": "net_profit" if cost_data_missing else "evidence_gap",
+                        "operator": "MISSING", "value": True, "reference_field": None,
+                        "reference_value_source": "BACKEND_EVIDENCE"})
+    if financial_ready_requested:
+        filters.append({"field": "financial_status", "operator": "EQ", "value": "SUFFICIENT",
+                        "reference_field": None, "reference_value_source": "BACKEND_FINANCIAL_READINESS"})
 
     analyses = []
     if implicit_dual_selector or _has_any(query, ("比较", "对比", "区别", "差异", "是否同一批")):
@@ -1053,9 +1076,31 @@ def _collection_composition(query: str) -> dict | None:
     }
 
 
+def _explicit_insufficient_data_exclusion(query: str) -> bool:
+    """The provider cannot add a recommendation-evidence exclusion by itself.
+
+    Financial calculability is a separate backend gate: asking for products
+    whose profit can be calculated does not exclude every product awaiting
+    market or compliance evidence.
+    """
+    return bool(
+        re.search(r"排除|不要|去掉|剔除", query)
+        and re.search(r"证据不足|数据不足|不充分|INSUFFICIENT", query, re.I)
+    )
+
+
 def understand_query(query, products, selected=None, context_snapshot: ContextSnapshot | None = None):
     from app.agent.intent_engine import parse_intent
     from app.agent.scenario_state import parse_scenario_command, scenario_entity_text
+    if IMPORT_BATCH_REFERENCE.search(query):
+        parsed = semantic_policy("collection_analysis", ("recommendation", "decision", "evidence"), selected)
+        return parsed, QueryUnderstanding(
+            intent="collection_analysis", question_type="import_batch_collection",
+            collection_reference="merchant_import_batch", operation="ANALYZE_COLLECTION",
+            requested_dimensions=list(parsed.policy.requested_dimensions),
+            planned_tools=["analyze_collection"], confidence=0.95,
+            route="DETERMINISTIC_FAST_PATH", requires_context=True,
+        )
     if _has_unsupported_filter_constraint(query):
         return semantic_policy("unknown", ()), QueryUnderstanding(
             intent="unknown", question_type="unsupported_filter_clarification",
@@ -1189,7 +1234,7 @@ def understand_query(query, products, selected=None, context_snapshot: ContextSn
     if scenario_command and scenario_command.collection_scope:
         collection_reference = "current_collection"
     evidence_gap_requested = bool(re.search(r"证据缺口|缺.*(?:证据|资料|数据)|数据不足", query))
-    exclude_insufficient_data = bool(re.search(r"排除|不要|去掉|剔除", query) and re.search(r"证据不足|数据不足|不充分|INSUFFICIENT", query, re.I))
+    exclude_insufficient_data = _explicit_insufficient_data_exclusion(query)
     contextual_scenario_reference = bool(
         scenario_command
         and context_snapshot
@@ -1575,6 +1620,11 @@ def validate_semantic_plan(raw, query, selected=(), context_packet=None):
         packet_get("rule_understanding"),
         value,
     )
+    # Provider hints are advisory; a broad recommendation-evidence exclusion
+    # must be grounded in an explicit user constraint.  The backend separately
+    # excludes uncomputable financial inputs for profit/ROI ranking.
+    if value.exclude_insufficient_data and not _explicit_insufficient_data_exclusion(query):
+        value = value.model_copy(update={"exclude_insufficient_data": False})
     # A session-owned Scenario ranking plus an explicit ordinal is a stronger,
     # deterministic signal than a provider's generic/low-confidence task label.
     # Anchor it before the confidence gate so transport-fallback validation uses

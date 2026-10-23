@@ -11,20 +11,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.entity_resolution import EntityResolution, resolve_query_entities, resolution_message
 from app.agent.context import build_context_snapshot, resolve_context_reference
 from app.agent.collection_ranking import RANKING_DIMENSIONS, rank_collection
-from app.agent.query_understanding import arbitrate_entity_mentions, build_semantic_context_packet, understand_query, semantic_fallback, semantic_policy
+from app.agent.query_understanding import _rank_ordinals, arbitrate_entity_mentions, build_semantic_context_packet, understand_query, semantic_fallback, semantic_policy
 from app.agent.intent_engine import ParsedIntent, parse_intent
 from app.agent.runtime import AgentRunState
 from app.agent.scenario_state import (
-    ScenarioStateError, create_collection_scenario, create_scenario,
+    ScenarioStateError, continue_scenario_for_product, create_collection_scenario, create_scenario,
     detect_stale_baseline, detect_stale_collection_baseline,
     load_scenario_state, remove_override, reset_scenario, scenario_response_view,
-    update_scenario, update_scenario_ranking,
+    undo_scenario_product_override, update_scenario, update_scenario_ranking,
 )
 from app.agent.task_state import evolve_task_state, task_mutation_intent
 from app.agent.tool_registry import TOOL_REGISTRY
 from app.db.models import AgentRun, ConversationMessage, ConversationSession, Memory, Product, uid
+from app.services.product_import import latest_confirmed_batch
 from app.repositories.products import ProductRepository, product_view
-from app.schemas.agent import ConversationFocusState, ReferenceResolutionResult, validate_agent_answer
+from app.schemas.agent import MAX_IMPORT_COLLECTION_MEMBERS, ConversationFocusState, ReferenceResolutionResult, validate_agent_answer
 from app.services.decision_engine import analyze, recommendation_gate_status, simulate_price, to_dict
 from app.services.knowledge_base import search_documents
 from app.services.provenance import FRESHNESS_MAX_AGE_DAYS, evidence_notices, scoped_fields, snapshot_view
@@ -106,6 +107,8 @@ async def filter_products(repo: ProductRepository, role: str, **filters: Any) ->
         if not latest:
             view["analysis"] = to_dict(analyze(product))
         analysis = view.get("analysis") or {}
+        if (criteria.get("min_margin_rate") is not None or criteria.get("min_roi") is not None) and view.get("financial_status") == "INSUFFICIENT_DATA":
+            continue
         score_value = float(analysis.get("recommendation_score") or 0)
         completeness_grade = (analysis.get("evidence_completeness") or {}).get("grade")
         if criteria.get("min_score") is not None and score_value < float(criteria["min_score"]):
@@ -159,6 +162,8 @@ async def filter_products(repo: ProductRepository, role: str, **filters: Any) ->
         return mapping.get(str(criteria.get("sort_by") or "recommendation_score"), mapping["recommendation_score"])
 
     views.sort(key=sort_value, reverse=criteria.get("sort_direction", "desc") != "asc")
+    if criteria.get("sort_by") in {"margin_rate", "net_profit"}:
+        views.sort(key=lambda item: item.get("financial_status") == "INSUFFICIENT_DATA")
     displayed = views[:limit]
     return {
         "tool": "filter_products",
@@ -461,6 +466,7 @@ def plan_query(query: str, target_count: int) -> tuple[str, list[dict[str, str]]
 def _agent_product(view: dict[str, Any]) -> dict[str, Any]:
     analysis = view.get("analysis") or {}
     completeness = analysis.get("evidence_completeness") or {}
+    financial_ready = view.get("financial_status") != "INSUFFICIENT_DATA"
     margin = float(view.get("current_margin_rate") or analysis.get("net_margin") or 0)
     decision_status = recommendation_gate_status(
         compliance_status=str(view.get("compliance_status") or ""),
@@ -483,10 +489,16 @@ def _agent_product(view: dict[str, Any]) -> dict[str, Any]:
         "risk_level": str(analysis.get("risk_level") or "unknown"), "compliance_status": str(view.get("compliance_status") or "pending"),
         "lifecycle_status": str(view.get("lifecycle_status") or "candidate"),
         "current_price": float(view.get("current_price") or 0), "currency": str(view.get("currency") or "RUB"), "price_source": price_source,
-        "updated_at": view.get("updated_at"), "current_margin_rate": margin,
-        "net_profit": float(analysis.get("net_profit") or 0), "roi": float(analysis.get("roi") or 0), "missing_fields": list(analysis.get("missing_fields") or []),
+        "updated_at": view.get("updated_at"), "current_margin_rate": margin if financial_ready else None,
+        "net_profit": float(analysis.get("net_profit") or 0) if financial_ready else None,
+        "roi": float(analysis.get("roi") or 0) if financial_ready else None,
+        "financial_status": view.get("financial_status", "SUFFICIENT"),
+        "financial_missing_fields": list(view.get("financial_missing_fields") or []),
+        "missing_fields": list(analysis.get("missing_fields") or []),
         "url": str(view.get("url") or ""), "main_image_url": str(view.get("main_image_url") or ""),
-        "is_mock": bool((view.get("data_trust") or {}).get("is_mock")), "data_disclosure": str((view.get("data_trust") or {}).get("disclosure") or ""),
+        "is_mock": bool((view.get("data_trust") or {}).get("is_mock")),
+        "source_type": str(((view.get("raw_payload") or {}).get("_merchant_import") or {}).get("source_type") or "unknown"),
+        "data_disclosure": str((view.get("data_trust") or {}).get("disclosure") or ""),
     }
 
 
@@ -494,6 +506,11 @@ def _collection_evidence_gaps(view: dict[str, Any], decision_status: str) -> lis
     """Project existing provenance and readiness into a finite gap taxonomy."""
     analysis = view.get("analysis") or {}
     gaps: list[dict[str, str]] = []
+    if view.get("financial_status") == "INSUFFICIENT_DATA":
+        for field in view.get("financial_missing_fields") or []:
+            gaps.append({"code": "MISSING", "field": str(field), "dimension": "profit",
+                         "reason": "财务计算输入缺失，不能可靠计算利润。",
+                         "next_action": "由商家补录可信数值、币种与来源时间。"})
     for item in analysis.get("missing_data") or []:
         gaps.append({
             "code": "MISSING", "field": str(item.get("missing") or ""),
@@ -558,6 +575,8 @@ def _collection_strengths_and_risks(view: dict[str, Any]) -> tuple[list[str], li
 
 def _collection_metric_value(view: dict[str, Any], field: str):
     analysis = view.get("analysis") or {}
+    if field in {"net_profit", "net_margin", "roi"} and view.get("financial_status") == "INSUFFICIENT_DATA":
+        return None
     return {
         "recommendation_score": float(analysis.get("recommendation_score") or 0),
         "net_profit": float(analysis.get("net_profit") or 0),
@@ -590,16 +609,18 @@ def _ranking_metric_evidence(product: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ranking_metric_delta(first: dict[str, Any], second: dict[str, Any]) -> dict[str, float]:
-    return {
+    result = {
         "recommendation_score": first["score"] - second["score"],
-        "net_profit": first["net_profit"] - second["net_profit"],
-        "net_margin_percentage_points": (first["current_margin_rate"] - second["current_margin_rate"]) * 100,
-        "roi_percentage_points": (first["roi"] - second["roi"]) * 100,
         "profit_score": first["profit_score"] - second["profit_score"],
         "demand_score": first["demand_score"] - second["demand_score"],
         "competition_score": first["competition_score"] - second["competition_score"],
         "compliance_score": first["compliance_score"] - second["compliance_score"],
     }
+    if first["net_profit"] is not None and second["net_profit"] is not None:
+        result["net_profit"] = first["net_profit"] - second["net_profit"]
+        result["net_margin_percentage_points"] = (first["current_margin_rate"] - second["current_margin_rate"]) * 100
+        result["roi_percentage_points"] = (first["roi"] - second["roi"]) * 100
+    return result
 
 
 def _ranking_analysis_contract(
@@ -657,11 +678,11 @@ def _ranking_analysis_contract(
 
 def _ranking_evidence_text(candidate: dict[str, Any]) -> str:
     metrics = candidate.get("metric_evidence") or {}
+    financial_text = (f"净利润 {float(metrics['net_profit']):.2f} {metrics.get('currency') or 'RUB'}，"
+                      f"净利率 {float(metrics['net_margin']):.1%}，ROI {float(metrics['roi']):.1%}，") if metrics.get("net_profit") is not None else "利润与 ROI 证据不足，"
     return (
         f"推荐度 {float(metrics.get('recommendation_score') or 0):.1f}，"
-        f"净利润 {float(metrics.get('net_profit') or 0):.2f} {metrics.get('currency') or 'RUB'}，"
-        f"净利率 {float(metrics.get('net_margin') or 0):.1%}，"
-        f"ROI {float(metrics.get('roi') or 0):.1%}，"
+        f"{financial_text}"
         f"风险 {metrics.get('risk_level') or 'unknown'}"
     )
 
@@ -670,18 +691,16 @@ def _ranking_delta_text(candidate: dict[str, Any]) -> str:
     deltas = (candidate.get("comparison_to_next") or {}).get("metric_deltas") or {}
     if not deltas:
         return ""
-    return (
-        f"净利润差 {float(deltas.get('net_profit') or 0):+.2f} RUB，"
-        f"净利率差 {float(deltas.get('net_margin_percentage_points') or 0):+.1f} 个百分点，"
-        f"ROI 差 {float(deltas.get('roi_percentage_points') or 0):+.1f} 个百分点，"
-        f"推荐度差 {float(deltas.get('recommendation_score') or 0):+.1f}"
-    )
+    financial_text = (f"净利润差 {deltas['net_profit']:+.2f} RUB，"
+                      f"净利率差 {deltas['net_margin_percentage_points']:+.1f} 个百分点，"
+                      f"ROI 差 {deltas['roi_percentage_points']:+.1f} 个百分点，") if "net_profit" in deltas else "利润差证据不足，"
+    return financial_text + f"推荐度差 {float(deltas.get('recommendation_score') or 0):+.1f}"
 
 
 def _apply_collection_filters(views: list[dict[str, Any]], filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     allowed_fields = {
         "net_margin", "net_profit", "roi", "risk", "competition", "demand",
-        "compliance", "compliance_status", "evidence_gap",
+        "compliance", "compliance_status", "evidence_gap", "financial_status",
     }
     allowed_operators = {"LT", "LTE", "GT", "GTE", "EQ", "NE", "IN", "NOT_IN", "MISSING", "STALE"}
 
@@ -694,6 +713,8 @@ def _apply_collection_filters(views: list[dict[str, Any]], filters: list[dict[st
         if field == "evidence_gap":
             actual = _collection_evidence_gaps(view, product["decision_status"])
             return bool(actual) if operator == "MISSING" else False
+        if field == "financial_status":
+            return operator == "EQ" and view.get("financial_status") == criterion.get("value")
         if operator == "STALE":
             return any(
                 gap["code"] == "STALE"
@@ -701,6 +722,8 @@ def _apply_collection_filters(views: list[dict[str, Any]], filters: list[dict[st
             )
         actual = _collection_metric_value(view, field)
         expected = criterion.get("value")
+        if operator == "MISSING" and field in {"net_profit", "net_margin", "roi"}:
+            return actual is None
         if criterion.get("reference_field") == "target_margin_rate":
             expected = _collection_metric_value(view, "target_margin_rate")
         if actual is None or expected is None:
@@ -726,10 +749,7 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
     requested_ids = list(dict.fromkeys(criteria.get("product_ids") or []))
     rows: list[Product] = []
     if requested_ids:
-        for product_id in requested_ids:
-            product = await repo.get(product_id)
-            if product:
-                rows.append(product)
+        rows = await repo.get_many_in_order(requested_ids)
     else:
         rows = await repo.list(limit=500)
         if criteria["collection_type"] == "candidate_pool":
@@ -742,8 +762,14 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
             view["analysis"] = to_dict(analyze(product))
         views.append(view)
 
+    scoped_views = views
     views = _apply_collection_filters(views, list(criteria.get("filters") or []))
     member_ids = [str(item["id"]) for item in views]
+    financial_gap_query = any(
+        criterion.get("operator") == "MISSING"
+        and criterion.get("field") in {"net_profit", "net_margin", "roi"}
+        for criterion in criteria.get("filters") or []
+    )
     dimensions = list(dict.fromkeys(criteria.get("ranking_dimensions") or ["recommendation"]))
     views = rank_collection(views, dimensions, identity=lambda item: str(item.get("id") or ""))
     selector = criteria.get("selector") or {}
@@ -753,6 +779,8 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
         "recommendation_score", "net_profit", "net_margin", "roi", "risk",
         "competition", "demand", "compliance",
     }:
+        if selector_metric in {"net_profit", "net_margin", "roi"}:
+            views = [item for item in views if item.get("financial_status") != "INSUFFICIENT_DATA"]
         descending = str(selector.get("direction") or "DESC").upper() == "DESC"
         views.sort(
             key=lambda item: (_collection_metric_value(item, selector_metric), str(item.get("id") or "")),
@@ -762,11 +790,38 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
     products_by_id = {item["id"]: _agent_product(item) for item in views}
     ranked_ids = [str(item["id"]) for item in views]
     eligible_views = []
+    # Financial readiness may remove a member through an explicit filter or a
+    # metric selector before ranking starts. Keep the reason visible without
+    # reinserting that member into a profit ranking or the result set.
+    excluded_from_ranking: list[dict[str, Any]] = [
+        {
+            "product_id": str(item["id"]), "title": str(item.get("title") or ""),
+            "reason": "FINANCIAL_INPUTS_MISSING",
+            "missing_fields": list(_agent_product(item).get("financial_missing_fields") or []),
+        }
+        for item in scoped_views
+        if criteria["collection_type"] == "merchant_import_batch"
+        and not financial_gap_query
+        and any(dimension in {"profit", "roi"} for dimension in dimensions)
+        and item.get("financial_status") == "INSUFFICIENT_DATA"
+    ]
+    excluded_ids = {item["product_id"] for item in excluded_from_ranking}
     status_counts: dict[str, int] = {}
     for view in views:
         product = products_by_id[str(view["id"])]
         status = product["decision_status"]
         eligible = not criteria["require_gate_pass"] or status == "RECOMMENDED"
+        if not financial_gap_query and criteria["collection_type"] == "merchant_import_batch" and any(
+            dimension in {"profit", "roi"} for dimension in dimensions
+        ) and view.get("financial_status") == "INSUFFICIENT_DATA":
+            eligible = False
+            status = "FINANCIAL_INPUTS_MISSING"
+            if str(view["id"]) not in excluded_ids:
+                excluded_from_ranking.append({
+                    "product_id": str(view["id"]), "title": str(view.get("title") or ""),
+                    "reason": status,
+                    "missing_fields": list(product.get("financial_missing_fields") or []),
+                })
         if criteria["exclude_insufficient_data"] and status == "INSUFFICIENT_DATA":
             eligible = False
         if eligible:
@@ -785,7 +840,8 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
             }:
                 continue
             group_views = sorted(
-                eligible_views,
+                [item for item in eligible_views if item.get("financial_status") != "INSUFFICIENT_DATA"]
+                if group_metric in {"net_profit", "net_margin", "roi"} else eligible_views,
                 key=lambda item, metric=group_metric: (
                     _collection_metric_value(item, metric), str(item.get("id") or "")
                 ),
@@ -852,6 +908,9 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
     top_ids = [str(item["id"]) for item in top_views]
     collection_result = {
         "collection_type": criteria["collection_type"], "member_count": len(views),
+        "source_member_count": len(scoped_views),
+        "ranking_result_count": len(eligible_views),
+        "excluded_count": len(excluded_from_ranking),
         "eligible_count": len(eligible_views), "requested_top_k": criteria["top_k"],
         "returned_top_k": len(top_views), "shortfall": max(0, criteria["top_k"] - len(top_views)),
         "ranking_dimensions": dimensions, "require_gate_pass": criteria["require_gate_pass"],
@@ -861,7 +920,12 @@ async def analyze_collection(repo: ProductRepository, role: str, **arguments: An
         "selection_groups": selection_groups,
         "selection_comparison": selection_comparison,
         "ineligible_status_counts": status_counts,
-        "notice": "Top-K 只从通过当前后端推荐门禁的商品中产生；不足时返回更少结果，不以未达标商品补位。",
+        "excluded_from_ranking": excluded_from_ranking,
+        "notice": (
+            "导入集合保留全部已确认商品；利润或 ROI 排序仅纳入财务输入充分的商品，未达标商品不补位。本结果不是正式推荐。"
+            if criteria["collection_type"] == "merchant_import_batch" and not criteria["require_gate_pass"] else
+            "Top-K 只从通过当前后端推荐门禁的商品中产生；不足时返回更少结果，不以未达标商品补位。"
+        ),
     }
     return {
         "tool": "analyze_collection", "success": True, "data": top_views,
@@ -1029,6 +1093,16 @@ async def agent_v1_ask(
         session.add(ConversationMessage(company_id=company_id, session_id=session_id, role="user", content=query, metadata_json={"selected_product_ids": selected_product_ids or [], "selection_revision": selection_revision, "selection_bound_session_id": selection_bound_session_id}))
 
     all_products = await repo.list(limit=500)
+    # State holds identifiers only. Rehydrate its members through the tenant-scoped
+    # repository, even when the catalogue has grown beyond the ordinary read cap.
+    known_ids = {item.id for item in all_products}
+    saved_collection = ((conversation.state_json or {}).get("task_state") or {}).get("active_collection") or {}
+    for product_id in saved_collection.get("product_ids") or []:
+        if product_id not in known_ids:
+            product = await repo.get(product_id)
+            if product:
+                all_products.append(product)
+                known_ids.add(product_id)
     scenario_state = None
     scenario_load_error: ScenarioStateError | None = None
     try:
@@ -1045,6 +1119,18 @@ async def agent_v1_ask(
         has_active_scenario=scenario_state is not None,
     )
     parsed, understanding = (parsed_override, understanding_override) if understanding_override is not None else understand_query(query, all_products, selected_product_ids, context_snapshot)
+    import_batch = None
+    if understanding.collection_reference == "merchant_import_batch":
+        requested_batch = re.search(
+            r"(?:导入)?批次(?:号|ID)?\s*[:：#]?\s*"
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            query, re.I,
+        )
+        import_batch = await latest_confirmed_batch(
+            session, company_id, user_id,
+            previous=bool(re.search(r"上一批|上次|前一批", query)),
+            batch_id=requested_batch.group(1) if requested_batch else None,
+        )
     task_mutation = None if parsed.name == "scenario_analysis" else task_mutation_intent(
         query, context_snapshot.task_state, selected_product_ids or (), understanding.entity_mentions,
         understanding.analysis_requests,
@@ -1207,6 +1293,34 @@ async def agent_v1_ask(
     )
     if parsed.name == "scenario_analysis" and not entity_blocked:
         operation = understanding.operation
+        canonical_collection = context_snapshot.task_state.active_collection
+        canonical_order = list(
+            canonical_collection.ranked_product_ids or canonical_collection.top_product_ids
+            if canonical_collection else []
+        )
+        ordinal = understanding.ordinal_reference or next(iter(_rank_ordinals(query)), None)
+        ordinal_target_id = (
+            canonical_order[ordinal - 1]
+            if ordinal is not None and 0 < ordinal <= len(canonical_order) else None
+        )
+        transfer_followup = bool(
+            operation == "EXPLAIN_SCENARIO" and scenario_next_state
+            and not scenario_next_state.collection_snapshot and ordinal_target_id
+            and ordinal_target_id not in scenario_next_state.base_product_ids
+            and re.search(r"(?:呢|也|同样|一样|照此|照样|再试|继续)\s*[？?！!。.]*$", query)
+            and not re.search(r"谁|哪个|为何|为什么|多少|净利率|利润|\broi\b|风险", query, re.I)
+        )
+        target_undo = bool(
+            operation in {"RESET_SCENARIO", "REMOVE_OVERRIDE"}
+            and scenario_next_state and ordinal_target_id
+            and re.search(r"撤销|撤掉|取消|移除", query)
+        )
+        if transfer_followup:
+            operation = "UPDATE_SCENARIO"
+            understanding = understanding.model_copy(update={"operation": operation})
+        elif target_undo:
+            operation = "REMOVE_OVERRIDE"
+            understanding = understanding.model_copy(update={"operation": operation})
         mutation = {
             "field": understanding.scenario_field,
             "operation": understanding.mutation_type,
@@ -1234,17 +1348,28 @@ async def agent_v1_ask(
                         raise ScenarioStateError("MISSING_SCENARIO_TARGET", "Scenario creation requires one resolved product.")
                     scenario_next_state = create_scenario(
                         scenario_id=uid(), session_id=session_id, company_id=company_id,
-                        products=targets, override_specs=[mutation],
+                        products=targets,
+                        override_specs=[{**mutation, "target_product_ids": (targets[0].id,)}],
                         source_task_revision=context_snapshot.task_state.revision,
                         baseline_result_id=context_snapshot.task_state.conversation_focus.focus_id or None,
                         base_collection_revision=(
                             context_snapshot.task_state.active_collection.source_task_revision
                             if context_snapshot.task_state.active_collection else None
                         ),
+                        scenario_scope_target_ids=(targets[0].id,),
                     )
             else:
                 if scenario_next_state is None:
                     raise ScenarioStateError("MISSING_CONTEXT", "No active scenario exists in this session.")
+                if (
+                    operation == "EXPLAIN_SCENARIO"
+                    and understanding.ordinal_reference is not None
+                    and understanding.ordinal_reference > len(canonical_order or scenario_next_state.scenario_ordered_ids)
+                ):
+                    raise ScenarioStateError(
+                        "SCENARIO_ORDINAL_OUT_OF_SCOPE",
+                        "The referenced rank is outside the active scenario scope.",
+                    )
                 scenario_next_state = detect_stale_baseline(scenario_next_state, all_products)
                 scenario_next_state = detect_stale_collection_baseline(
                     scenario_next_state, context_snapshot.task_state.active_collection,
@@ -1256,7 +1381,17 @@ async def agent_v1_ask(
                 if explicit_ids and set(explicit_ids) != set(scenario_next_state.base_product_ids):
                     raise ScenarioStateError("SCENARIO_TARGET_MISMATCH", "Explicit product does not match the active scenario.")
                 if operation == "UPDATE_SCENARIO":
-                    if understanding.scenario_ranking_dimensions and all(value is None for value in mutation.values()):
+                    if transfer_followup:
+                        if not canonical_collection or canonical_collection.source_task_revision != scenario_next_state.base_collection_revision:
+                            raise ScenarioStateError("STALE_COLLECTION_BASELINE", "The canonical ranking changed after the prior scenario.")
+                        target_product = by_id.get(ordinal_target_id)
+                        if target_product is None:
+                            raise ScenarioStateError("MISSING_SCENARIO_TARGET", "The ranked product is unavailable in this tenant.")
+                        scenario_next_state = continue_scenario_for_product(
+                            scenario_next_state, product=target_product,
+                            expected_revision=scenario_next_state.scenario_revision,
+                        )
+                    elif understanding.scenario_ranking_dimensions and all(value is None for value in mutation.values()):
                         scenario_next_state = update_scenario_ranking(
                             scenario_next_state,
                             expected_revision=scenario_next_state.scenario_revision,
@@ -1271,15 +1406,21 @@ async def agent_v1_ask(
                             **mutation,
                         )
                 elif operation == "REMOVE_OVERRIDE":
-                    field_to_remove = understanding.scenario_field
-                    if not field_to_remove and len(scenario_next_state.overrides) == 1:
-                        field_to_remove = scenario_next_state.overrides[0].field
-                    if not field_to_remove:
-                        raise ScenarioStateError("MISSING_SCENARIO_FIELD", "Specify which scenario adjustment to undo.")
-                    scenario_next_state = remove_override(
-                        scenario_next_state, field=field_to_remove,
-                        expected_revision=scenario_next_state.scenario_revision,
-                    )
+                    if target_undo:
+                        scenario_next_state = undo_scenario_product_override(
+                            scenario_next_state, product_id=ordinal_target_id,
+                            expected_revision=scenario_next_state.scenario_revision,
+                        )
+                    else:
+                        field_to_remove = understanding.scenario_field
+                        if not field_to_remove and len(scenario_next_state.overrides) == 1:
+                            field_to_remove = scenario_next_state.overrides[0].field
+                        if not field_to_remove:
+                            raise ScenarioStateError("MISSING_SCENARIO_FIELD", "Specify which scenario adjustment to undo.")
+                        scenario_next_state = remove_override(
+                            scenario_next_state, field=field_to_remove,
+                            expected_revision=scenario_next_state.scenario_revision,
+                        )
                 elif operation == "RESET_SCENARIO":
                     scenario_next_state = reset_scenario(
                         scenario_next_state, expected_revision=scenario_next_state.scenario_revision,
@@ -1299,10 +1440,18 @@ async def agent_v1_ask(
                         display_ids = ranked_ids[:understanding.top_k]
                     else:
                         display_ids = scenario_next_state.scenario_top_k_ids
+                elif operation == "EXPLAIN_SCENARIO" and ordinal_target_id:
+                    if ordinal_target_id not in scenario_next_state.base_product_ids:
+                        raise ScenarioStateError(
+                            "SCENARIO_ORDINAL_OUT_OF_SCOPE",
+                            "The ranked product has no frozen scenario baseline.",
+                        )
+                    display_ids = (ordinal_target_id,)
                 else:
                     display_ids = (
                         scenario_next_state.scenario_top_k_ids
-                        if scenario_next_state.collection_snapshot else scenario_next_state.base_product_ids
+                        if scenario_next_state.collection_snapshot else
+                        scenario_next_state.scenario_scope_target_ids or scenario_next_state.base_product_ids
                     )
                 for product_id in display_ids:
                     derived = derived_by_id.get(product_id)
@@ -1424,13 +1573,21 @@ async def agent_v1_ask(
         ) else None
         if reference == "current_collection" and not previous_collection:
             collection_context_missing = True
+        if reference == "merchant_import_batch":
+            if not import_batch or not import_batch[1] or len(import_batch[1]) > MAX_IMPORT_COLLECTION_MEMBERS:
+                collection_context_missing = True
+            else:
+                collection_ids = [product.id for product in await repo.get_many_in_order(import_batch[1])]
+                if len(collection_ids) != len(import_batch[1]):
+                    collection_context_missing = True
         if reference == "active_result_set" and not context_snapshot.task_state.active_result_set:
             collection_context_missing = True
         if reference == "current_collection" and previous_collection:
             collection_type = previous_collection.collection_type
             reranking = understanding.operation in {"RERANK", "RERANK_COLLECTION", "REORDER", "REFINE_RANKING"}
             collection_ids = list(
-                previous_collection.top_product_ids if reranking and previous_collection.top_product_ids
+                previous_collection.product_ids if reranking and previous_collection.collection_type == "merchant_import_batch"
+                else previous_collection.top_product_ids if reranking and previous_collection.top_product_ids
                 else ordered_result.product_ids if reranking and ordered_result and ordered_result.product_ids
                 else previous_collection.product_ids
             )
@@ -1523,10 +1680,36 @@ async def agent_v1_ask(
         )
         top_k = max(1, min(20, int(top_k)))
         exclude_insufficient = understanding.exclude_insufficient_data or bool(previous_collection and previous_collection.exclude_insufficient_data)
+        # Reporting which members cannot be formally recommended is not a
+        # request to recommend the members being ranked.  In particular, an
+        # explicit metric selector must keep its financial-readiness gate even
+        # when a later clause asks for recommendation evidence gaps.
+        negative_recommendation_assessment = bool(re.search(
+            r"(?:暂时|目前|现在)?(?:不能|不宜|无法|不建议|暂不)\s*(?:正式)?\s*(?:推荐|上架)",
+            query,
+        ))
+        metric_ranking_with_negative_assessment = bool(
+            selector and negative_recommendation_assessment
+        )
+        formal_recommendation_requested = bool(
+            re.search(r"推荐|上架", query)
+            and not re.search(r"为什么|为何|原因|依据|是不是|是否", query)
+            and not metric_ranking_with_negative_assessment
+        )
         args = {
             "collection_type": collection_type, "product_ids": collection_ids,
             "top_k": top_k, "ranking_dimensions": ranking_dimensions,
-            "require_gate_pass": not plural_diagnostic, "exclude_insufficient_data": exclude_insufficient,
+            "require_gate_pass": (
+                formal_recommendation_requested or (
+                    understanding.operation == "RECOMMEND_TOP_K"
+                    and not metric_ranking_with_negative_assessment
+                ) or not (
+                    plural_diagnostic or reference == "merchant_import_batch"
+                    or (previous_collection is not None and previous_collection.collection_type == "merchant_import_batch"
+                        and not previous_collection.require_gate_pass)
+                )
+            ),
+            "exclude_insufficient_data": exclude_insufficient,
             "selector": selector or None, "filters": understanding.collection_filters,
         }
         if not collection_context_missing and not ranking_basis_missing:
@@ -1537,6 +1720,11 @@ async def agent_v1_ask(
             views = result.get("data", []) if result.get("success") else []
             if result.get("success"):
                 collection_analysis = result.get("collection_analysis") or {}
+                if import_batch and reference == "merchant_import_batch":
+                    collection_analysis["source_batch_id"] = import_batch[0]
+                elif (previous_collection and previous_collection.source_batch_id
+                      and collection_analysis.get("collection_type") == "merchant_import_batch"):
+                    collection_analysis["source_batch_id"] = previous_collection.source_batch_id
                 if previous_collection and understanding.operation in {"IDENTIFY_EVIDENCE_GAPS", "EXPLAIN_RANKING", "LOOKUP_ORDINAL_MEMBER", "COMPARE_COLLECTION_MEMBERS"}:
                     for candidate in collection_analysis.get("candidates") or []:
                         product_id = candidate.get("product_id")
@@ -1895,13 +2083,19 @@ async def agent_v1_ask(
     elif ranking_basis_missing:
         answer = "当前有商品顺序，但缺少可验证的排序依据，不能可靠解释名次。请重新排序或重新生成候选结果。"
     elif collection_context_missing:
-        answer = "当前会话中没有可引用的候选集合，请先分析候选池、企业商品库或一个已有筛选结果。"
+        answer = (
+            f"当前没有可安全引用的导入批次；单批最多支持 {MAX_IMPORT_COLLECTION_MEMBERS} 件商品完整分析。请确认批次归属，或拆分较大的批次。"
+            if understanding.collection_reference == "merchant_import_batch" else
+            "当前会话中没有可引用的候选集合，请先分析候选池、企业商品库或一个已有筛选结果。"
+        )
     elif parsed.name == "scenario_analysis" and scenario_error_code == "STALE_BASELINE":
         answer = "当前假设情景基于旧商品快照（STALE_BASELINE），商品主档的计算输入已变化。为避免混用新旧事实，本次未继续计算；请重置或明确重新建立情景。"
     elif parsed.name == "scenario_analysis" and scenario_error_code == "STALE_COLLECTION_BASELINE":
         answer = "当前假设情景基于旧候选集合（STALE_COLLECTION_BASELINE），原集合的成员、排序或版本已变化。本次没有自动迁移假设，也没有修改当前候选池；请重置或重新建立集合情景。"
     elif parsed.name == "scenario_analysis" and scenario_error_code == "MISSING_SCENARIO_TARGET":
         answer = "当前没有可引用的目标商品。请先建立候选结果或明确说出商品名称，再进行假设分析。"
+    elif parsed.name == "scenario_analysis" and scenario_error_code == "SCENARIO_ORDINAL_OUT_OF_SCOPE":
+        answer = "当前假设没有覆盖这个名次的商品；本次没有套用其他商品的假设结果。请明确是否要对该商品另建情景。"
     elif parsed.name == "scenario_analysis" and scenario_error_code:
         answer = "本次假设未通过后端校验，未修改商品主档或当前情景。请使用支持的价格、采购、广告、履约、平台、仓储、税费或退货成本字段，并提供明确数值。"
     elif parsed.name == "scenario_analysis" and simulation and products:
@@ -1983,10 +2177,18 @@ async def agent_v1_ask(
                 )
         else:
             product = products[0]
-            hypothetical = simulation["hypothetical"][0]
-            canonical = simulation["canonical"][0]
+            hypothetical = next(
+                (item for item in simulation["hypothetical"] if item["product_id"] == product["id"]),
+                None,
+            )
+            canonical = next(
+                (item for item in simulation["canonical"] if item["product_id"] == product["id"]),
+                None,
+            )
             delta = simulation["delta"].get(product["id"], {})
-            if operation == "COMPARE_SCENARIO":
+            if hypothetical is None or canonical is None:
+                answer = f"{product['title']} 的假设结果或冻结基线不完整，暂时无法可靠说明利润变化。"
+            elif operation == "COMPARE_SCENARIO":
                 comparison = next(
                     (item for item in simulation.get("comparison") or [] if item["product_id"] == product["id"]),
                     None,
@@ -2170,6 +2372,10 @@ async def agent_v1_ask(
             )
         elif not candidates:
             answer = (
+                f"原集合共有 {collection.get('source_member_count', collection.get('member_count', 0))} 个商品，"
+                f"本次有 {collection.get('ranking_result_count', 0)} 个满足分析条件；"
+                "财务输入缺失时不会以 0 利润补位，也不会据此形成正式推荐。"
+                if not collection.get("require_gate_pass", True) else
                 f"当前集合共有 {collection.get('member_count', 0)} 个商品，但没有商品通过正式推荐门禁；"
                 "因此本次不以未达标商品补足 Top-K。"
             )
@@ -2211,11 +2417,26 @@ async def agent_v1_ask(
         else:
             names = "、".join(f"{item['relative_rank']}. {item['title']}" for item in candidates)
             shortfall = int(collection.get("shortfall") or 0)
-            suffix = f"；因门禁限制少于目标 {shortfall} 个，未用未达标商品补位" if shortfall else ""
-            answer = (
-                f"当前集合共 {collection.get('member_count', 0)} 个商品，其中 {collection.get('eligible_count', 0)} 个通过正式推荐门禁。"
-                f"本次优先继续研究：{names}{suffix}。排名与证据缺口均来自后端确定性结果；推荐继续调研不等于最终上架决策。"
-            )
+            if not collection.get("require_gate_pass", True):
+                answer = (
+                    f"原集合共 {collection.get('source_member_count', collection.get('member_count', 0))} 个商品，"
+                    f"本次有 {collection.get('ranking_result_count', collection.get('eligible_count', 0))} 个满足分析或排序条件，"
+                    f"其中展示 {len(candidates)} 个：{names}。"
+                    "这是后端对当前商品范围的分析展示，不代表通过正式推荐门禁；"
+                    "财务输入不足的商品不能参与可靠利润排序。"
+                )
+            else:
+                suffix = f"；因门禁限制少于目标 {shortfall} 个，未用未达标商品补位" if shortfall else ""
+                answer = (
+                    f"当前集合共 {collection.get('member_count', 0)} 个商品，其中 {collection.get('eligible_count', 0)} 个通过正式推荐门禁。"
+                    f"本次优先继续研究：{names}{suffix}。排名与证据缺口均来自后端确定性结果；推荐继续调研不等于最终上架决策。"
+                )
+        excluded = collection.get("excluded_from_ranking") or []
+        if excluded:
+            answer += " 无法参与本次可靠利润排序：" + "、".join(
+                f"{item['title']}（缺少 {', '.join(item.get('missing_fields') or []) or '可信财务输入'}）"
+                for item in excluded
+            ) + "。"
     elif parsed.name == "selection_recommendation":
         if not products:
             answer = "当前没有符合筛选条件的候选商品。"
@@ -2226,9 +2447,13 @@ async def agent_v1_ask(
     elif parsed.name in {"profit_comparison", "product_comparison"}:
         labels = {"profit": "利润", "roi": "ROI", "demand": "需求", "competition": "竞争", "compliance": "合规", "risk": "风险", "identity": "商品身份", "price": "价格"}
         dimension = "、".join(labels.get(key, key) for key in parsed.policy.requested_dimensions)
+        comparable = [item for item in products if item.get("net_profit") is not None]
         if products and parsed.name == "profit_comparison" and re.search(r"谁.*(?:利润|赚).*(?:好|高|多)|利润.*(?:最好|最高)", query):
-            leader = max(products, key=lambda item: (item["net_profit"], item["current_margin_rate"], item["id"]))
-            answer = f"按后端当前利润计算，{leader['title']} 的单件净利润最高，为 {leader['net_profit']:.2f} {leader['currency']}；本次只比较利润与 ROI，不代表推荐上架。"
+            if comparable:
+                leader = max(comparable, key=lambda item: (item["net_profit"], item["current_margin_rate"], item["id"]))
+                answer = f"按后端当前利润计算，{leader['title']} 的单件净利润最高，为 {leader['net_profit']:.2f} {leader['currency']}；本次只比较利润与 ROI，不代表推荐上架。"
+            else:
+                answer = "这些商品的成本输入尚不充分，无法可靠比较利润；请先补齐缺失字段。"
         else:
             answer = f"已完成 {len(products)} 个明确商品的{dimension}对比；按本次请求的维度展示，不代表推荐上架。" if products else "请点名或选择至少两个不同的本企业商品后再比较。"
     elif parsed.name == "product_price":
@@ -2237,7 +2462,7 @@ async def agent_v1_ask(
         risk_label = {"low": "低", "medium": "中", "high": "高"}.get(products[0]["risk_level"], "未知")
         answer = f"{products[0]['title']} 当前风险等级为 {risk_label}（{products[0]['risk_level']}）。"
     elif simulation:
-        answer = f"售价调整为 {simulation['proposed_price']:g} RUB 后，单件净利润为 {simulation['net_profit']:.2f} RUB，净利率为 {simulation['margin_rate']:.1%}，推荐等级为 {simulation['recommendation_grade']}。"
+        answer = ("情景利润所需成本数据不足，请先补齐：" + "、".join(simulation.get("missing_fields") or [])) if simulation.get("status") == "INSUFFICIENT_DATA" else f"售价调整为 {simulation['proposed_price']:g} RUB 后，单件净利润为 {simulation['net_profit']:.2f} RUB，净利率为 {simulation['margin_rate']:.1%}，推荐等级为 {simulation['recommendation_grade']}。"
     elif data_sufficiency:
         status = data_sufficiency.get("status")
         count = int(data_sufficiency.get("snapshot_count") or 0)
@@ -2248,7 +2473,7 @@ async def agent_v1_ask(
         answer = f"企业历史中找到 {len(historical_matches)} 条相关失败记录，失败原因需结合当前证据人工复核。"
         warning_messages.extend(f"历史案例 {item.get('title', '')}：{item.get('reason', '')}" for item in historical_matches[:5])
     elif products and "profit" in parsed.policy.requested_dimensions:
-        answer = f"{products[0]['title']} 单件净利润为 {products[0]['net_profit']:.2f} RUB，净利率 {products[0]['current_margin_rate']:.1%}，ROI {products[0]['roi']:.1%}。"
+        answer = (f"{products[0]['title']} 的利润数据不足；请补齐：" + "、".join(products[0].get("financial_missing_fields") or products[0].get("missing_fields") or [])) if products[0]["net_profit"] is None else f"{products[0]['title']} 单件净利润为 {products[0]['net_profit']:.2f} RUB，净利率 {products[0]['current_margin_rate']:.1%}，ROI {products[0]['roi']:.1%}。"
     elif products:
         answer = f"{products[0]['title']} 当前动态推荐度为 {products[0]['score']:.1f}，决策状态为 {products[0]['decision_status']}；最终动作仍需人工审核。"
     else:
@@ -2302,6 +2527,18 @@ async def agent_v1_ask(
     if fact and fact.get("product_id") and evidence and evidence[0].get("fields"):
         fact["provenance"] = evidence[0]["fields"][0]
         fact["source"] = fact["provenance"]["provider"]
+    merchant_context = bool(
+        (collection_analysis and collection_analysis.get("collection_type") == "merchant_import_batch")
+        or any(product.get("source_type") == "MERCHANT_INTERNAL" for product in products)
+    )
+    if merchant_context and response_type not in {"clarification", "not_found", "error"}:
+        answer += (
+            " 以上售价与成本由商家提供或估计，不是 Ozon 实时成交价或官方成本；"
+            "假设结果只是测算，需求、竞争与合规证据不足时不构成正式推荐。"
+            if response_type == "scenario_report" else
+            " 以上商品数据由商家提供或估计，不是 Ozon 实时成交或官方成本；"
+            "市场需求、竞争与合规证据仍需核验，不能仅凭此形成正式推荐。"
+        )
     if response_type == "decision_report" and trust_notices:
         answer += " 本次结论须结合来源说明使用；演示、过期或来源不足的数据不能视为已验证的当前市场事实。"
     entities = [{"product_id": item.id, "name": item.title, "resolution_method": target_source} for item in targets if target_source != "none"]

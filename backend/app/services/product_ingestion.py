@@ -31,6 +31,7 @@ _MARKET_FIELDS = {
     "visible_lowest_competitor_price",
 }
 _INTERNAL_FIELDS = _COST_AND_REVIEW | {"latest_30d_sales", "sales_growth_rate", "sales_source", "sales_evidence"}
+_MERCHANT_CSV_FIELDS = _INTERNAL_FIELDS | {"title", "category_path", "current_price"}
 _META_FIELDS = {"external_product_id", "store_id", "raw_payload", "field_lineage", "captured_at"}
 _SOURCE_KIND = {
     DataSourceType.DEMO_MOCK: "mock",
@@ -63,7 +64,7 @@ def _validated_fields(result: AdapterResult) -> tuple[dict[str, Any], dict[str, 
         if result.source_type == DataSourceType.DEMO_MOCK else
         _SELLER_FIELDS if result.source_type == DataSourceType.OZON_SELLER else
         _MARKET_FIELDS if result.source_type == DataSourceType.AUTHORIZED_MARKET_DATA else
-        _INTERNAL_FIELDS
+        _MERCHANT_CSV_FIELDS if result.provider == "merchant_csv_import" else _INTERNAL_FIELDS
     )
     values: dict[str, Any] = {}
     statuses: dict[str, str] = {}
@@ -106,7 +107,7 @@ def _validated_fields(result: AdapterResult) -> tuple[dict[str, Any], dict[str, 
     return values, statuses, lineage
 
 
-async def ingest_product_result(repo: ProductRepository, result: AdapterResult) -> Product:
+async def ingest_product_result(repo: ProductRepository, result: AdapterResult, *, commit: bool = True) -> Product:
     """Apply only supplied, source-owned fields; absent data never becomes a zero update."""
     identity = result.identity
     if not identity or not result.source_type or identity.source_type != result.source_type:
@@ -134,8 +135,21 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
         raise ValueError("External identity does not match target product")
     if product and identity.store_id and product.store_id != identity.store_id:
         raise ValueError("Target product belongs to another store")
-    if product is None and result.source_type not in {DataSourceType.DEMO_MOCK, DataSourceType.OZON_SELLER}:
+    merchant_csv = result.source_type == DataSourceType.MERCHANT_INTERNAL and result.provider == "merchant_csv_import"
+    if product is None and result.source_type not in {DataSourceType.DEMO_MOCK, DataSourceType.OZON_SELLER} and not merchant_csv:
         raise ValueError("Internal or market signals require an existing tenant product")
+    if product is not None and merchant_csv:
+        if product.external_product_id != key:
+            raise ValueError("Merchant identity does not match target product")
+        if product.source_updated_at and result.source_updated_at:
+            old_time = product.source_updated_at.replace(tzinfo=UTC) if product.source_updated_at.tzinfo is None else product.source_updated_at
+            if result.source_updated_at < old_time:
+                raise ValueError("OLDER_SOURCE_UPDATE")
+        for name in tuple(values):
+            old_lineage = (product.field_lineage or {}).get(name) or {}
+            if isinstance(old_lineage, dict) and old_lineage.get("source_type") == "manual" and old_lineage.get("provider") == "manual_operator":
+                values.pop(name)
+                lineage.pop(name, None)
     if product is None and not {"title", "current_price"} <= values.keys():
         raise ValueError("New products require sourced title and price")
     metadata = {
@@ -154,6 +168,19 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
             # A later catalog/price sync must not erase a separately observed
             # warehouse-granular stock snapshot for this same store/product.
             raw_payload["_seller_inventory"] = existing_inventory
+    if merchant_csv:
+        previous_raw = product.raw_payload or {} if product is not None else {}
+        merged_status = dict(previous_raw.get("_merchant_field_status") or {})
+        for name in values:
+            if name in statuses:
+                merged_status[name] = statuses[name]
+        raw_payload["_merchant_field_status"] = merged_status
+        raw_payload["_merchant_import"] = {
+            "source_type": DataSourceType.MERCHANT_INTERNAL.value,
+            "last_file_sha256": result.source_reference.split(":")[1],
+            "price_kind": "merchant_estimate",
+            "currency": "RUB",
+        }
     identities = dict((product.raw_payload or {}).get("_external_identities") or {}) if product is not None else {}
     if result.source_type in {DataSourceType.DEMO_MOCK, DataSourceType.OZON_SELLER}:
         identities[result.source_type.value] = {"external_product_id": key, **metadata["identity"]}
@@ -161,6 +188,8 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
     raw_payload["_ingestion"] = metadata
     if product is not None:
         if not values:
+            return product
+        if merchant_csv and (product.raw_payload or {}).get("_merchant_import", {}).get("last_file_sha256") == raw_payload["_merchant_import"]["last_file_sha256"] and all(getattr(product, name) == value for name, value in values.items() if name in ProductPatch.model_fields):
             return product
         previous = (product.raw_payload or {}).get("_ingestion")
         comparable = {name: value for name, value in values.items() if name in ProductPatch.model_fields and name not in {"competitor_entries", "visible_lowest_competitor_price"}}
@@ -171,18 +200,22 @@ async def ingest_product_result(repo: ProductRepository, result: AdapterResult) 
             return product
         patch_values = {name: value for name, value in values.items() if name in ProductPatch.model_fields}
         patch_values["raw_payload"] = raw_payload
-        product = await repo.patch(product, ProductPatch.model_validate(patch_values), field_lineage=lineage, captured_at=result.observed_at)
+        product = await repo.patch(product, ProductPatch.model_validate(patch_values), field_lineage=lineage, captured_at=result.observed_at, commit=commit)
     else:
         create_values = {**values, "external_product_id": key, "store_id": identity.store_id,
                          "field_lineage": lineage, "raw_payload": raw_payload, "captured_at": result.observed_at}
-        product = await repo.upsert(ProductIn.model_validate(create_values))
+        product = await repo.upsert(ProductIn.model_validate(create_values), commit=commit)
     product.sync_status = ("demo_mock" if result.source_type == DataSourceType.DEMO_MOCK else
-                           "offline_fixture" if result.confidence == "synthetic" else "synced")
+                           "offline_fixture" if result.confidence == "synthetic" else
+                           "merchant_imported" if merchant_csv else "synced")
     product.last_sync_at = datetime.now(UTC).replace(tzinfo=None)
     if result.source_updated_at is not None:
         source_time = result.source_updated_at.astimezone(UTC).replace(tzinfo=None) if result.source_updated_at.tzinfo else result.source_updated_at
         product.source_updated_at = max(product.source_updated_at, source_time) if product.source_updated_at else source_time
-    await repo.session.commit()
+    if commit:
+        await repo.session.commit()
+    else:
+        await repo.session.flush()
     await repo.session.refresh(product)
     return product
 
